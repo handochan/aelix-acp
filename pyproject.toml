@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aelix-acp"
+version = "0.1.0"
+description = "ACP to Aelix RPC bridge for Aelix Studio and other ACP clients"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.11"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/handochan/aelix-acp"
+Issues = "https://github.com/handochan/aelix-acp/issues"
+
+[project.scripts]
+aelix-acp = "aelix_acp.server:main"
+
+[tool.setuptools.package-data]
+aelix_acp = ["profiles/*.md", "assets/*.gz", "assets/*.txt"]

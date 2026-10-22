@@ -1,0 +1,7 @@
+Aelix ACP
+Copyright 2026 Aelix contributors
+
+This package includes Plotly basic 3.7.0, copyright Plotly, Inc., under the MIT
+license. See src/aelix_acp/assets/PLOTLY-LICENSE.txt.
+
+The Aelix runtime is a separate project: https://github.com/handochan/aelix-ai.

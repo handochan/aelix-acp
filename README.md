@@ -1,0 +1,97 @@
+# aelix-acp
+
+AionUi 등 ACP 클라이언트를 기존 `aelix --mode rpc`에 연결하는 로컬 PoC입니다.
+Aelix 본체는 변경하지 않습니다. Python 표준 라이브러리 실행기와 명시적으로
+로드하는 Aelix 승인 브리지 확장으로 구성됩니다. Python 3.11 이상이 필요합니다.
+
+## 로컬 사용
+
+현재 컴퓨터에는 AionUi **2.2.2**와 다음 Custom Agent 두 개가 등록되어 있습니다.
+새 채팅 → **더보기**에서 선택합니다.
+
+| 항목 | 실행기 인자 | 로드되는 확장 |
+|---|---|---|
+| Aelix Coding | `--profile coding` | ACP 승인 브리지 |
+| Aelix Analytics | `--profile analytics --analytics-extension /absolute/path/to/aelix-analytics/extension/aelix_analytics.py` | ACP 승인 브리지 + Analytics |
+
+두 항목의 실행 명령은 이 체크아웃의 `bin/aelix-acp`입니다. AionUi에 등록한
+인자에는 `--state-dir /Users/handochan/dev/aelix-extensions/aelix-acp/.local/state`도
+포함되어 있습니다. 이 폴더를 지우면 ACP 세션 ID와 실제 Aelix 세션 파일의 연결이
+사라집니다. Aelix 원본 대화는 기존 `~/.aelix/sessions`에 저장됩니다.
+
+이 PoC의 프로필은 **어댑터의 실행 구성**입니다. `~/.aelix/agent/agents`에
+동명의 Aelix 프로필을 설치하거나 기존 사용자 프로필을 덮어쓰지 않습니다.
+`--no-extensions`로 자동 탐색을 끄고, 브리지와 선택한 확장 전체를 `-e`로
+명시합니다. Aelix의 내장 도구와 상태 도구는 그대로 제공됩니다.
+
+`bin/aelix-acp`는 이 컴퓨터의 uv로 설치된 Aelix Python을 사용합니다.
+다른 환경에서는 `AELIX_ACP_PYTHON`을 Python 3.11+ 실행 파일로 지정하거나,
+독립 가상환경에 이 패키지를 설치해 `aelix-acp` 진입점을 사용할 수 있습니다.
+
+```sh
+bin/aelix-acp --profile coding --aelix /absolute/path/to/aelix
+bin/aelix-acp --profile analytics \
+  --analytics-extension /absolute/path/to/aelix-analytics/extension/aelix_analytics.py
+```
+
+인증은 기존 Aelix 설정을 사용합니다. API 키를 AionUi 설정에 복사하지 않았습니다.
+모델은 Aelix 실행 시 결정되며 `--provider PROVIDER --model MODEL`로 고정할 수
+있습니다. UI에는 실제 실행 모델 하나를 표시합니다. 대화 중 모델 전환은 아직
+구현하지 않았습니다.
+
+## 현재 구현 범위
+
+- ACP v1 stdio 초기화, 세션 생성·목록·복구, 사용자·에이전트 이력 재생
+- 텍스트·추론 스트리밍과 도구 시작·결과·실패 표시, 파일 위치 전달
+- 모든 도구의 실행 전 ACP **Allow once / Reject** 승인
+- 승인 대기 중 취소 시 거부 처리, RPC abort, 자식 프로세스 종료 시 오류 반환
+- Aelix `get_commands`에서 가져오는 명령 목록
+- 텍스트, 텍스트 내장 리소스, 파일 리소스 링크 입력
+- Coding / Analytics 세션의 프로필 교차 복구 거부
+
+승인 브리지 로딩을 임시 파일의 실행별 nonce로 확인한 뒤에만 세션 생성을
+완료합니다. 브리지가 없거나 소켓이 끊기거나 승인 시간이 지나면 도구를
+차단합니다. 승인 소켓은 세션별 0700 임시 디렉터리의 0600 Unix 소켓입니다.
+이는 로컬 실행 승인 경로이며 OS 샌드박스나 악성 확장 격리를 제공하지 않습니다.
+
+AionUi가 전달하는 MCP 서버는 Aelix에 전달하지 않습니다. 비어 있지 않으면
+대화에 제한을 알립니다. Aelix 자체에 설정된 MCP 서버는 별도 설정입니다.
+이미지·오디오 입력, 동적 모델 변경, MCP 설정 동기화, 스킬/프롬프트 편집과
+Python 확장 설치·삭제·리로드 UI는 이번 구현 범위에 포함되지 않습니다.
+HTML 미리보기는 AionUi의 로컬 파일 패널 기능을 사용합니다.
+
+Analytics 원본 보고서는 상대 자산 경로 때문에 AionUi의 HTML 미리보기에서
+서식과 차트가 빠집니다. 어댑터는 성공한 `analytics_run` 결과에 대해 원본을
+보존하면서 `workspace/aion-preview/<run-id>.html`을 추가로 만들고 대화에 링크를
+제공합니다. CSS와 압축된 공식 Plotly basic 3.7.0을 포함하는 1MB 이하의 스냅샷으로,
+외부 서버가 필요 없습니다. 현재 Plotly bar/pie/scatter만 지원하며, 이 PoC의
+1MB 스냅샷 예산을 넘는 페이지나 다른 차트 형식은 원본 보고서를 사용해야 합니다.
+전체 Workspace의 탭·경로 탐색을 재현하는 기능은 아닙니다.
+
+AionUi v2.2.2 자체의 텍스트/HTML 미리보기 제한은 **기본 1MiB이며 고정 제한이
+아닙니다**. 설정 → 시스템 → 미리보기 크기 제한(MB)에서 1~100으로 변경할 수
+있고 새로 연 탭에 적용됩니다. 내부 키는 `preview.textSizeLimitMb`입니다.
+크기 설정을 높이는 것과 상대 경로 자산을 로드하는 문제는 별개입니다.
+
+기존 실행의 미리보기를 수동으로 만들 수도 있습니다.
+
+```sh
+PYTHONPATH=src python -m aelix_acp.preview /absolute/path/to/analysis-project RUN_ID
+```
+
+Plotly 자산은 MIT 라이선스이며 패키지의 `assets/PLOTLY-LICENSE.txt`에 보존합니다.
+
+## 검증
+
+```sh
+# Aelix가 설치된 Python 3.11+ 사용. Unix 소켓을 허용하는 환경에서 실행합니다.
+python -m unittest discover -s tests -v
+
+# 실제 모델 호출 및 합성 파일 쓰기를 포함합니다. 기존 Aelix 인증을 사용합니다.
+python scripts/smoke.py --profile coding
+python scripts/smoke.py --profile analytics
+```
+
+실제 실행 결과는 [로컬 PoC 검증 기록](docs/local-poc.md)에 구분하여 기록합니다.
+전체 대화 로그, 분석 프로젝트, 업데이트 전 백업은 Git에 포함되지 않는
+`.local/`에 보존합니다.
