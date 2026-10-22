@@ -16,9 +16,9 @@ MAX_FRAME_BYTES = 16 * 1024 * 1024
 
 class StdoutWriter:
     """Bounded daemon writes without blocking the loop or Python buffer locks."""
-    def __init__(self):
+    def __init__(self, fd=None):
         self.loop = asyncio.get_running_loop()
-        self.fd = sys.stdout.fileno()
+        self.fd = sys.stdout.fileno() if fd is None else fd
         if sys.platform == "win32":
             import msvcrt
             msvcrt.setmode(self.fd, os.O_BINARY)

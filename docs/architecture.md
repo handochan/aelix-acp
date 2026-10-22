@@ -47,7 +47,7 @@ Unicode, nonfinite numbers and excess requests are rejected. Stderr drains in
 chunks. Cancellation reaches native control tasks without waiting for their
 mutation lock and cancels pending dialogs.
 
-Stdout uses a bounded daemon writer on the raw descriptor. A client that stops
+Stdout and forwarded native stderr use bounded daemon writers on raw descriptors. A client that stops
 reading cannot block the event loop or Python's buffered-stdout shutdown lock.
 EOF can cancel queued replies; disconnected clients must recover through history.
 

@@ -21,6 +21,7 @@ import uuid
 
 from .wire.errors import ProtocolError, BackendError, require_object, require_string
 from .wire.process import terminate_owned
+from .wire.transport import StdoutWriter
 from .runtime.controls import SessionControls, PERMISSION_MODES
 from .runtime.policy import permission_decision
 from .runtime.store import save_preferences, load_preferences, append_event, begin_turn, finish_turn
@@ -206,14 +207,13 @@ class Session:
 
     async def read_stderr(self):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        while chunk := await self.proc.stderr.read(4096):
-            text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
-            if hasattr(sys.stderr, "buffer"):
-                sys.stderr.buffer.write(text.encode("utf-8"))
-                sys.stderr.buffer.flush()
-            else:
-                sys.stderr.write(text)
-                sys.stderr.flush()
+        writer = StdoutWriter(sys.stderr.fileno())
+        try:
+            while chunk := await self.proc.stderr.read(4096):
+                text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
+                await writer.write(text.encode("utf-8"))
+        finally:
+            writer.close()
 
     async def read_rpc(self):
         try:

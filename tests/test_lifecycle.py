@@ -99,6 +99,7 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
         print(json.dumps({"type":"response","id":request["id"],"success":True,"data":{}}),flush=True)
         for _ in range(32):
             print(json.dumps({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"x"*1024*1024}}),flush=True)
+            sys.stderr.write("x"*1024*1024); sys.stderr.flush()
         continue
 '''
         self.child.write_text(FAKE_CHILD.replace('    data=', flood + '    data='))
@@ -114,7 +115,7 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
             while self.proc.returncode is None:
                 await asyncio.sleep(0.02)
         self.assertEqual(self.proc.returncode, 0)
-        await self.proc.stdout.read()
+        await asyncio.gather(self.proc.stdout.read(), self.proc.stderr.read())
         await self.proc.wait()
         self.assertFalse(process_alive(int((self.root/'child.pid').read_text())))
 
