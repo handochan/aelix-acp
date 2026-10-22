@@ -79,10 +79,16 @@ Refresh capabilities/resources after profile/auth/resource changes.
 Enable extensions by absolute path or installed `module:factory`. Inspect
 `ready`, `loadErrors`, `requiresReload`; a successful pip exit does not imply
 a different bundled interpreter can import the package.
+For `update`, use the inventory's distribution name or omit the target to
+update recorded sources. `remove` accepts the extension entry-point name.
+Offline updates need a recorded local source or configured local index.
 
 Skills/prompts are native files. Studio can author them through its file
 editor, set `skill_paths` / `prompt_template_paths` and reload. This API
 does not provide a terminal-widget-to-web editor converter.
+
+Client MCP servers use the native namespace `acp_NAME`, with tools named
+`acp_NAME__TOOL`. Use returned tool names unchanged for tool selection.
 
 ## Agent-to-client actions
 

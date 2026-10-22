@@ -13,7 +13,6 @@ import secrets
 import os
 from pathlib import Path
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -21,6 +20,7 @@ import time
 import uuid
 
 from .wire.errors import ProtocolError, BackendError, require_object, require_string
+from .wire.process import terminate_owned
 from .runtime.controls import SessionControls, PERMISSION_MODES
 from .runtime.policy import permission_decision
 from .runtime.store import save_preferences, load_preferences, append_event, begin_turn, finish_turn
@@ -547,32 +547,21 @@ class Session:
         await asyncio.gather(*self.permission_connections, return_exceptions=True)
         for task in list(self.permissions):
             task.cancel()
-        if self.proc and self.proc.returncode is None:
-            try:
-                if sys.platform == "win32":
-                    self.proc.send_signal(signal.CTRL_BREAK_EVENT)
-                else:
-                    os.killpg(self.proc.pid, signal.SIGTERM)
-            except (OSError, ProcessLookupError):
-                with contextlib.suppress(ProcessLookupError):
-                    self.proc.terminate()
-            try:
-                await asyncio.wait_for(self.proc.wait(), 5)
-            except TimeoutError:
-                if sys.platform == "win32":
-                    killer = await asyncio.create_subprocess_exec("taskkill", "/PID", str(self.proc.pid), "/T", "/F",
-                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                    await killer.wait()
-                else:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(self.proc.pid, signal.SIGKILL)
-                with contextlib.suppress(ProcessLookupError):
-                    self.proc.kill()
-                await self.proc.wait()
         owned_tasks = [task for task in self.tasks if task is not asyncio.current_task()]
         for task in owned_tasks:
             task.cancel()
         await asyncio.gather(*owned_tasks, return_exceptions=True)
+        if self.proc and self.proc.returncode is None:
+            async def discard(stream):
+                while await stream.read(65536):
+                    pass
+            drains = [asyncio.create_task(discard(stream)) for stream in (self.proc.stdout, self.proc.stderr)]
+            try:
+                await terminate_owned(self.proc)
+            finally:
+                for task in drains:
+                    task.cancel()
+                await asyncio.gather(*drains, return_exceptions=True)
         if self.socket_server:
             self.socket_server.close()
             await self.socket_server.wait_closed()

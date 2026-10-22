@@ -7,12 +7,11 @@ import shlex
 import re
 import os
 import uuid
-import signal
 import subprocess
 import sys
-import contextlib
 
 from ..wire.errors import ProtocolError
+from ..wire.process import terminate_owned
 
 READ_ACTIONS = {"list", "verify", "discover"}
 WRITE_ACTIONS = {"install", "remove", "update"}
@@ -102,25 +101,16 @@ async def _run_extension_action(server, session, raw) -> dict:
                 chunks.append(chunk)
             code = await process.wait()
     except BaseException:
-        if process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                if sys.platform == "win32":
-                    process.send_signal(signal.CTRL_BREAK_EVENT)
-                else:
-                    os.killpg(process.pid, signal.SIGTERM)
-            try:
-                await asyncio.wait_for(process.wait(), 5)
-            except TimeoutError:
-                if sys.platform == "win32":
-                    killer = await asyncio.create_subprocess_exec("taskkill", "/PID", str(process.pid), "/T", "/F",
-                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                    await killer.wait()
-                else:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
-                with contextlib.suppress(ProcessLookupError):
-                    process.kill()
-                await process.wait()
+        # Drain output even when cancellation stopped the normal reader.
+        async def discard():
+            while await process.stdout.read(65536):
+                pass
+        drain = asyncio.create_task(discard())
+        try:
+            await terminate_owned(process)
+        finally:
+            drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
         raise
     result = {"action": action, "exitCode": code, "text": b"".join(chunks).decode("utf-8", errors="replace"),
               "requiresReload": action in WRITE_ACTIONS and code == 0}

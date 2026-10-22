@@ -94,6 +94,30 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
         await self.proc.stdout.read()
         await self.proc.wait()
 
+    async def test_disconnect_drains_a_chatty_child_before_waiting_for_exit(self):
+        flood = '''    if request["type"] == "prompt":
+        print(json.dumps({"type":"response","id":request["id"],"success":True,"data":{}}),flush=True)
+        for _ in range(32):
+            print(json.dumps({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"x"*1024*1024}}),flush=True)
+        continue
+'''
+        self.child.write_text(FAKE_CHILD.replace('    data=', flood + '    data='))
+        await self.start()
+        result = await self.request(1, 'session/new', {'cwd':str(self.root),'mcpServers':[]})
+        payload = {'jsonrpc':'2.0','id':2,'method':'session/prompt','params':{
+            'sessionId':result['result']['sessionId'],'prompt':[{'type':'text','text':'Flood'}]}}
+        self.proc.stdin.write((json.dumps(payload)+'\n').encode())
+        await self.proc.stdin.drain()
+        await asyncio.sleep(0.2)
+        self.proc.stdin.close()
+        async with asyncio.timeout(10):
+            while self.proc.returncode is None:
+                await asyncio.sleep(0.02)
+        self.assertEqual(self.proc.returncode, 0)
+        await self.proc.stdout.read()
+        await self.proc.wait()
+        self.assertFalse(process_alive(int((self.root/'child.pid').read_text())))
+
 
 if __name__ == '__main__':
     unittest.main()

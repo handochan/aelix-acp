@@ -46,3 +46,6 @@ jobs:
           version: '0.12.23'
       - run: uv sync --project .native-core --all-packages --python 3.12 --locked
       - run: python scripts/test_native.py --core .native-core --check-ref
+      - run: uv build --wheel --out-dir .native-core/.local/wheels .native-core/packages/aelix-coding-agent/src/aelix_coding_agent/examples/starter
+      - name: Offline package lifecycle through ACP
+        run: python -c "import os,pathlib,subprocess,sys; root=pathlib.Path('.native-core'); cli=root/'.venv'/('Scripts/aelix.exe' if os.name=='nt' else 'bin/aelix'); wheel=next((root/'.local/wheels').glob('aelix_starter_ext-*.whl')); sys.exit(subprocess.call([sys.executable,'scripts/test_packages.py','--aelix',str(cli),'--wheel',str(wheel)]))"

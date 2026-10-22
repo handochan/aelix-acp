@@ -36,6 +36,10 @@ concurrent creation. Failure before readiness closes the candidate. EOF and
 adapter shutdown close children. POSIX process groups and Windows process-group
 and taskkill fallback provide bounded orderly cleanup. This is not a Windows
 Job Object or a universal guarantee after hard parent termination.
+On Windows without an attached console, termination falls back to the system's
+absolute taskkill path. Pipe readers drain during shutdown so child exit is
+not held open by a full output buffer. POSIX cleanup also kills remaining
+members of the owned group after its leader exits.
 
 Windows stdin uses a daemon with one-line demand credits, avoiding unbounded
 queues and blocked executor shutdown. Frames are bounded to 16 MiB; invalid
