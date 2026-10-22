@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+from support import process_alive
 from pathlib import Path
 import sys
 import tempfile
@@ -15,7 +16,7 @@ if not os.environ.get("TEST_SKIP_BRIDGE_READY"):
     Path(os.environ["AELIX_ACP_READY_FILE"]).write_text(os.environ["AELIX_ACP_NONCE"])
 for line in sys.stdin:
     request=json.loads(line)
-    data={"commands":[]} if request["type"]=="get_commands" else {}
+    data={"commands":[]} if request["type"]=="get_commands" else ({"version":1} if request["type"]=="aelix_control" else {})
     print(json.dumps({"type":"response","id":request["id"],"success":True,"data":data}),flush=True)
 '''
 
@@ -41,10 +42,13 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
         if skip_ready:
             env['TEST_SKIP_BRIDGE_READY'] = '1'
         self.proc = await asyncio.create_subprocess_exec(
-            sys.executable, '-m', 'aelix_acp.server', '--aelix', str(self.child),
+            sys.executable, '-m', 'aelix_acp.server', '--aelix', sys.executable, '--aelix-arg', str(self.child),
             '--state-dir', str(self.root / 'state'), env=env, stdin=-1, stdout=-1, stderr=-1)
 
     async def request(self, request_id, method, params):
+        if method != 'initialize' and not getattr(self, 'initialized', False):
+            await self.request('init', 'initialize', {'protocolVersion':1, 'clientCapabilities':{}})
+            self.initialized = True
         self.proc.stdin.write((json.dumps({'jsonrpc':'2.0','id':request_id,'method':method,'params':params})+'\n').encode())
         await self.proc.stdin.drain()
         while True:
@@ -59,19 +63,36 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
         result = await self.request(1, 'session/new', {'cwd':str(self.root),'mcpServers':[]})
         self.assertIn('approval bridge did not load', result['error']['message'])
         child_pid = int((self.root / 'child.pid').read_text())
-        with self.assertRaises(ProcessLookupError):
-            os.kill(child_pid, 0)
+        self.assertFalse(process_alive(child_pid))
 
     async def test_sigterm_closes_real_rpc_child(self):
         await self.start()
         result = await self.request(1, 'session/new', {'cwd':str(self.root),'mcpServers':[]})
         self.assertIn('sessionId', result['result'])
         child_pid = int((self.root / 'child.pid').read_text())
-        os.kill(child_pid, 0)
+        self.assertTrue(process_alive(child_pid))
         self.proc.terminate()
         await asyncio.wait_for(self.proc.wait(), 10)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(child_pid, 0)
+        for _ in range(100):
+            if not process_alive(child_pid):
+                break
+            await asyncio.sleep(0.05)
+        self.assertFalse(process_alive(child_pid))
+
+    async def test_unread_stdout_does_not_block_disconnect_shutdown(self):
+        await self.start()
+        await self.request('init', 'initialize', {'protocolVersion':1, 'clientCapabilities':{}})
+        payload = {'jsonrpc':'2.0','id':1,'method':'x' * 1024 * 1024,'params':{}}
+        self.proc.stdin.write((json.dumps(payload)+'\n').encode())
+        await self.proc.stdin.drain()
+        await asyncio.sleep(0.1)
+        self.proc.stdin.close()
+        async with asyncio.timeout(10):
+            while self.proc.returncode is None:
+                await asyncio.sleep(0.02)
+        self.assertEqual(self.proc.returncode, 0)
+        await self.proc.stdout.read()
+        await self.proc.wait()
 
 
 if __name__ == '__main__':

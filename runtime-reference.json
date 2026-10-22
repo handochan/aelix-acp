@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/handochan/aelix-ai",
+  "commit": "10854a2d4cfc089cdf021c3f2e251bce9f230d94",
+  "runtimeControlVersion": 1,
+  "workspaceInstallRequired": true,
+  "minimumPython": "3.11",
+  "status": "development-candidate"
+}

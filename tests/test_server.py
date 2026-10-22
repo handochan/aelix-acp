@@ -35,11 +35,11 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             return {"outcome": {"outcome": "selected", "optionId": "allow-once"}}
 
         self.server.client_request = consent
-        path = Path(self.tmp.name) / "permission.sock"
-        listener = await asyncio.start_unix_server(self.session.permission, path=str(path))
+        listener = await asyncio.start_server(self.session.permission, host="127.0.0.1", port=0)
+        address = listener.sockets[0].getsockname()
         await self.session.event({"type": "tool_execution_start", "tool_call_id": "t1",
                                   "tool_name": "write", "args": {"path": "output.html"}})
-        reader, writer = await asyncio.open_unix_connection(str(path))
+        reader, writer = await asyncio.open_connection(address[0], address[1])
         writer.write(json.dumps({"toolCallId": "t1", "name": "write", "args": {"path": "output.html"}}).encode() + b"\n")
         await writer.drain()
         receive = asyncio.create_task(reader.readline())
@@ -55,6 +55,26 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         listener.close()
         await listener.wait_closed()
 
+    async def test_permission_token_and_known_tool_identity_are_required(self):
+        self.session.permission_token = "correct-secret"
+        self.session.controls.permission_mode = "yolo"
+        await self.session.event({"type": "tool_execution_start", "toolCallId": "t1", "toolName": "write", "args": {}})
+        listener = await asyncio.start_server(self.session.permission, host="127.0.0.1", port=0)
+        address = listener.sockets[0].getsockname()
+        try:
+            for token, identifier, name in [("wrong", "t1", "write"), ("correct-secret", "unknown", "write"),
+                                             ("correct-secret", "t1", "bash"), ("correct-secret", "t1", "write")]:
+                reader, writer = await asyncio.open_connection(*address)
+                writer.write((json.dumps({"token": token, "toolCallId": identifier, "name": name, "args": {}}) + "\n").encode())
+                await writer.drain()
+                result = json.loads(await asyncio.wait_for(reader.readline(), 2))
+                self.assertEqual(result["allow"], token == "correct-secret" and identifier == "t1" and name == "write")
+                writer.close()
+                await writer.wait_closed()
+        finally:
+            listener.close()
+            await listener.wait_closed()
+
     async def test_cancelling_pending_consent_rejects_before_abort(self):
         entered = asyncio.Event()
         never = asyncio.Event()
@@ -69,9 +89,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.server.client_request = consent
         self.session.rpc = abort
-        path = Path(self.tmp.name) / "cancel.sock"
-        listener = await asyncio.start_unix_server(self.session.permission, path=str(path))
-        reader, writer = await asyncio.open_unix_connection(str(path))
+        listener = await asyncio.start_server(self.session.permission, host="127.0.0.1", port=0)
+        address = listener.sockets[0].getsockname()
+        reader, writer = await asyncio.open_connection(address[0], address[1])
         writer.write(b'{"toolCallId":"t2","name":"bash","args":{"command":"no-run"}}\n')
         await writer.drain()
         await entered.wait()
@@ -85,7 +105,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_child_eof_finishes_turn_with_error(self):
         reader = asyncio.StreamReader()
         reader.feed_eof()
-        self.session.proc = SimpleNamespace(stdout=reader)
+        self.session.proc = SimpleNamespace(stdout=reader, returncode=0)
         self.session.done = asyncio.get_running_loop().create_future()
         await self.session.read_rpc()
         self.assertTrue(self.session.done.done())
@@ -105,19 +125,18 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         await self.session.event({"type": "message_end", "message": {"error_message": "provider unavailable"}})
         self.assertEqual(self.session.failure, "provider unavailable")
 
-    async def test_mode_cannot_disable_approvals(self):
+    async def test_unknown_permission_mode_is_rejected_without_backend_mutation(self):
         self.server.sessions[self.session.id] = self.session
-        with self.assertRaisesRegex(ProtocolError, "approval-required"):
-            await self.server.dispatch("session/set_mode", {"sessionId": self.session.id, "modeId": "yolo"})
-        self.assertEqual(await self.server.dispatch("session/set_mode", {
-            "sessionId": self.session.id, "modeId": "default"}), {})
+        with self.assertRaisesRegex(ProtocolError, "Unsupported value"):
+            await self.server.dispatch("session/set_mode", {"sessionId": self.session.id, "modeId": "bypass-everything"})
+        self.assertEqual(self.session.controls.permission_mode, "default")
 
     async def test_model_selector_reports_actual_launch_model(self):
         self.server.sessions[self.session.id] = self.session
         self.session.state = {"model": {"provider": "test", "id": "model-one"}}
         models = self.session.selectors()["models"]
         self.assertEqual(models["currentModelId"], "test/model-one")
-        with self.assertRaisesRegex(ProtocolError, "at launch"):
+        with self.assertRaisesRegex(ProtocolError, "Unsupported value"):
             await self.server.dispatch("session/set_model", {"sessionId": self.session.id, "modelId": "other/model"})
 
     async def test_analytics_result_emits_a_separate_preview_link(self):
