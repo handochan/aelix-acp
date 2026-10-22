@@ -81,7 +81,7 @@ async def _run_extension_action(server, session, raw) -> dict:
         raise ProtocolError(f"/extension {action} requires a target")
     executable = getattr(server.args, "extension_manager", None) or server.args.aelix
     if action in WRITE_ACTIONS:
-        if ".app/Contents/" in str(Path(executable).resolve()):
+        if ".app/contents/" in Path(executable).resolve().as_posix().casefold():
             raise ProtocolError("Bundled app resources are read-only. Configure --extension-manager with a writable managed Aelix environment", -32004)
         await require_consent(server, session, f"{action} extension", {"arguments": arguments})
     prefix = getattr(server.args, "aelix_arg", []) if not getattr(server.args, "extension_manager", None) else []
