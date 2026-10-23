@@ -175,6 +175,7 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
             await output(await control("agents/" + operation, {"name": remainder.strip()}))
             if operation == "use":
                 await session.controls.refresh()
+                await session.sync_profile_tools()
                 session.save()
                 await session.commands()
         elif operation == "run":

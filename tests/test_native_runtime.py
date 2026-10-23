@@ -22,6 +22,7 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.model_requests = []
         self.write_path = self.root / "approved.txt"
         self.failures = 0
+        self.model_gate = None
         self.listener = await asyncio.start_server(self.model, "127.0.0.1", 0)
         port = self.listener.sockets[0].getsockname()[1]
         models = {"providers": {"fixture": {"baseUrl": f"http://127.0.0.1:{port}/v1", "api": "openai-completions",
@@ -62,6 +63,8 @@ def setup(api):
             length = int(next(line.split(":", 1)[1].strip() for line in header.split("\r\n") if line.lower().startswith("content-length:")))
             request = json.loads(await reader.readexactly(length))
             self.model_requests.append(request)
+            if self.model_gate is not None:
+                await self.model_gate.wait()
             messages = request.get("messages", [])
             last = messages[-1] if messages else {}
             content = str(last.get("content", ""))
@@ -82,6 +85,8 @@ def setup(api):
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: "
                          + str(len(body)).encode() + b"\r\n\r\n" + body)
             await writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
         finally:
             writer.close()
             with contextlib.suppress(ConnectionError):
@@ -250,6 +255,51 @@ def setup(api):
         await self.manage("extensions/action", {"action": "enable", "target": str(extension)})
         self.assertEqual(await self.prompt("INTERCEPT"), {"stopReason": "end_turn"})
         self.assertEqual(self.model_requests, [])
+
+    async def test_cancel_crossing_before_agent_start_stops_the_later_turn_task(self):
+        extension = self.root / "paused.py"
+        extension.write_text('import asyncio\nfrom pathlib import Path\nasync def pause(event, ctx):\n    Path(ctx.cwd,"paused").touch()\n    while not Path(ctx.cwd,"resume").exists(): await asyncio.sleep(0.01)\nasync def aborted(event, ctx): Path(ctx.cwd,"aborted").touch()\ndef setup(api):\n    api.on("before_agent_start",pause)\n    api.on("abort",aborted)\n', encoding="utf-8")
+        await self.manage("extensions/action", {"action": "enable", "target": str(extension)})
+        self.model_gate = asyncio.Event()
+        prompt = asyncio.create_task(self.prompt("Respond"))
+        cancelling = None
+        try:
+            async with asyncio.timeout(10):
+                while not (self.root / "paused").exists():
+                    await asyncio.sleep(0.01)
+                cancelling = asyncio.create_task(self.client.request("session/cancel", {"sessionId": self.session}))
+                while not (self.root / "aborted").exists():
+                    await asyncio.sleep(0.01)
+            (self.root / "resume").touch()
+            self.assertEqual(await asyncio.wait_for(prompt, 3), {"stopReason": "cancelled"})
+            await cancelling
+        finally:
+            self.model_gate.set()
+            (self.root / "resume").touch()
+            for task in (prompt, cancelling):
+                if task is not None and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_mcp_reconfiguration_respects_profile_filters_without_gui_selection(self):
+        import sys
+        script = self.root / "profile_mcp.py"
+        script.write_text('from mcp.server.fastmcp import FastMCP\ns=FastMCP("fixture")\n@s.tool()\ndef echo(value: str)->str:return value\ns.run()\n', encoding="utf-8")
+        servers = [{"name": "fixture", "command": sys.executable, "args": [str(script)]}]
+        await self.manage("agents/use", {"name": "--none"})
+        await self.manage("mcp/configure", {"servers": servers})
+        self.assertIn("acp_fixture__echo", (await self.manage("resources/list"))["activeTools"])
+        profiles = self.root / "agent/agents"
+        profiles.mkdir()
+        (profiles / "all.md").write_text("---\nname: all\ndescription: All\n---\nAll tools.\n", encoding="utf-8")
+        await self.manage("agents/use", {"name": "all"})
+        await self.manage("mcp/configure", {"servers": []})
+        resources = await self.manage("resources/list")
+        baseline = resources["activeTools"]
+        (profiles / "restricted.md").write_text("---\nname: restricted\ndescription: Native only\ntools: " + json.dumps(baseline) + "\n---\nNative tools only.\n", encoding="utf-8")
+        await self.manage("agents/use", {"name": "restricted"})
+        await self.manage("mcp/configure", {"servers": servers})
+        self.assertEqual(set((await self.manage("resources/list"))["activeTools"]), set(baseline))
 
     async def test_auto_edit_modes_request_approval_for_outside_and_sensitive_paths(self):
         with tempfile.TemporaryDirectory() as outside:

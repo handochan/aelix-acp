@@ -311,6 +311,8 @@ class Server:
                     await session.commands()
                 if action in {"auth/set_api_key", "auth/login", "auth/logout", "resources/reload", "settings/set", "agents/use"}:
                     await session.controls.refresh()
+                    if action == "agents/use":
+                        await session.sync_profile_tools()
                     session.save()
                     await session.update({"sessionUpdate": "config_option_update", "configOptions": session.controls.options()})
                 return result

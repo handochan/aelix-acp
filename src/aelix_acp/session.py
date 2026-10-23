@@ -198,19 +198,41 @@ class Session:
             await self.rpc("aelix_control", method="tools/set_active", params={"names": selected})
 
     async def configure_mcp(self, servers):
-        if self.active_tools is not None:
-            # The native setter rejects removal of a selected tool. Keep the
-            # user's selection, clear the live filter during the idle mutation,
-            # then restore only names still available in the new catalog.
-            await self.rpc("aelix_control", method="tools/set_active", params={"names": []})
+        before = await self.rpc("aelix_control", method="resources/list", params={})
+        active = before.get("activeTools", [])
+        available = {tool["name"] for tool in before.get("tools", [])}
+        follow_all = self.active_tools is None and set(active) == available and await self.profile_uses_all_tools()
+        desired = self.active_tools if self.active_tools is not None else active
+        # Profile selection also installs native filters. Clear the actual
+        # live filter for every idle reconfiguration, not just GUI selections.
+        await self.rpc("aelix_control", method="tools/set_active", params={"names": []})
         try:
             result = await self.rpc("aelix_control", method="mcp/configure", params={"servers": servers}, _timeout=60)
         except ProtocolError:
-            await self.restore_tools()
+            await self.rpc("aelix_control", method="tools/set_active", params={"names": active})
             raise
         self.client_mcp = servers
-        await self.restore_tools()
+        after = await self.rpc("aelix_control", method="resources/list", params={})
+        names = [tool["name"] for tool in after.get("tools", [])]
+        selected = names if follow_all else [name for name in desired if name in names]
+        await self.rpc("aelix_control", method="tools/set_active", params={"names": selected})
         return result
+
+    async def profile_uses_all_tools(self):
+        agent = self.controls.capabilities.get("activeAgent")
+        if not agent:
+            return True
+        try:
+            profile = (await self.rpc("aelix_control", method="agents/show", params={"name": agent}))["profile"]
+            return "tools" in profile and profile["tools"] is None
+        except (ProtocolError, KeyError, TypeError):
+            return False
+
+    async def sync_profile_tools(self):
+        resources = await self.rpc("aelix_control", method="resources/list", params={})
+        active = resources.get("activeTools", [])
+        available = {tool["name"] for tool in resources.get("tools", [])}
+        self.active_tools = None if set(active) == available and await self.profile_uses_all_tools() else active
 
     def save(self):
         self.server.db.execute(
@@ -599,6 +621,10 @@ class Session:
             self.state = await self.rpc("get_state")
             if not self.state.get("isStreaming", self.state.get("is_streaming", False)):
                 return
+            if self.cancelled:
+                # Native acceptance precedes before_agent_start/build_context.
+                # An earlier abort can precede the turn task's creation.
+                await self.rpc("abort", _timeout=5)
             await asyncio.sleep(0.05)
 
     async def cancel(self):
