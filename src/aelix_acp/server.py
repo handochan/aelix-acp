@@ -124,11 +124,13 @@ class Server:
             if not Path(cwd).is_dir():
                 raise ProtocolError("Session cwd must be an existing directory")
             session_file = None
+            index_snapshot = None
             if method == "session/load":
                 session_id = require_string(params.get("sessionId"), "sessionId")
                 row = self.db.execute("SELECT cwd,profile,file FROM sessions WHERE id=?", (session_id,)).fetchone()
                 if not row or row[0] != cwd or row[1] != self.args.profile:
                     raise ProtocolError("Saved session does not match this workspace and profile")
+                index_snapshot = row
                 session_file = row[2]
                 if not session_file or not Path(session_file).is_file():
                     preferences = load_preferences(self.db, session_id)
@@ -152,6 +154,7 @@ class Server:
                     self.sessions.pop(session_id, None)
                     await previous.close()
                 session = Session(self, session_id, cwd)
+                session.index_snapshot = index_snapshot
                 session.client_mcp = params.get("mcpServers", [])
                 await session.start(session_file)
                 self.sessions[session_id] = session
@@ -167,6 +170,7 @@ class Server:
                             if text:
                                 await session.update({"sessionUpdate": "user_message_chunk" if message["role"] == "user"
                                     else "agent_message_chunk", "content": {"type": "text", "text": text}})
+                await session.publish_recovery_warnings()
             except BaseException:
                 self.sessions.pop(session_id, None)
                 if session:
@@ -186,18 +190,27 @@ class Server:
             if live and live.mutation_lock.locked():
                 raise ProtocolError("Session is busy; cancel its turn before deleting", -32000)
             from .runtime.leases import acquire as acquire_lease
-            lease = None if live else acquire_lease(self.args.state_dir, session_id)
+            lease = live.lease if live and live.lease else acquire_lease(self.args.state_dir, session_id)
+            if live:
+                live.lease = None  # Hold the lease across native close and SQL deletion.
+            self.starting_ids.add(session_id)
             try:
-                if live:
-                    await live.close()
-                with self.db:
-                    self.db.execute("DELETE FROM preferences WHERE session_id=?", (session_id,))
-                    self.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
-                    self.db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
-                    self.db.execute("DELETE FROM turns WHERE session_id=?", (session_id,))
+                async with (live.mutation_lock if live else asyncio.Lock()):
+                    if live:
+                        await live.close()
+                    with self.db:
+                        self.db.execute("DELETE FROM preferences WHERE session_id=?", (session_id,))
+                        self.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+                        self.db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
+                        self.db.execute("DELETE FROM turns WHERE session_id=?", (session_id,))
+            except BaseException:
+                if live and self.sessions.get(session_id) is live:
+                    live.lease, lease = lease, None
+                raise
             finally:
                 if lease:
                     lease.close()
+                self.starting_ids.discard(session_id)
             return {}
         if method == "session/list":
             clauses, values = ["profile=?"], [self.args.profile]
@@ -283,11 +296,11 @@ class Server:
                 allowed = {"resources/list", "resources/reload", "settings/get", "settings/set", "tools/set_active", "mcp/status", "mcp/configure", "auth/status", "auth/set_api_key", "auth/login", "auth/logout", "extensions/list", "agents/list", "agents/show", "agents/use", "agents/run"}
                 if action not in allowed or action not in session.controls.capabilities.get("methods", []):
                     raise ProtocolError("Unsupported management action")
-                result = await session.rpc("aelix_control", method=action, params=arguments,
-                    _timeout=(getattr(self.args, "command_timeout", 600) or None) if action in {"auth/login", "resources/reload", "agents/run"} else 60)
                 if action == "mcp/configure":
-                    session.client_mcp = arguments["servers"]
-                    await session.restore_tools()
+                    result = await session.configure_mcp(arguments.get("servers"))
+                else:
+                    result = await session.rpc("aelix_control", method=action, params=arguments,
+                        _timeout=(getattr(self.args, "command_timeout", 600) or None) if action in {"auth/login", "resources/reload", "agents/run"} else 60)
                 if action == "tools/set_active":
                     session.active_tools = result["activeTools"]
                     session.save()
@@ -343,7 +356,9 @@ class Server:
                     future = self.pending.get(message.get("id"))
                     if future and not future.done():
                         if "error" in message:
-                            future.set_exception(ProtocolError(str(message["error"])))
+                            error = message["error"]
+                            future.set_exception(ProtocolError("Client request failed", -32603,
+                                {"kind": "client_error", "code": error.get("code") if isinstance(error, dict) else None}))
                         else:
                             result = message.get("result") or {}
                             if isinstance(result, dict):

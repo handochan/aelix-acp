@@ -47,8 +47,11 @@ HISTORY_UPDATES = {"user_message_chunk", "agent_message_chunk", "agent_thought_c
 
 def append_event(db: sqlite3.Connection, session_id: str, update: dict) -> None:
     if update.get("sessionUpdate") in HISTORY_UPDATES:
-        db.execute("INSERT INTO events(session_id,value) VALUES(?,?)",
-                   (session_id, json.dumps(update, ensure_ascii=False, allow_nan=False)))
+        # A stream must not retain the database's sole writer slot until turn
+        # completion and block other adapter processes for the model's latency.
+        with db:
+            db.execute("INSERT INTO events(session_id,value) VALUES(?,?)",
+                       (session_id, json.dumps(update, ensure_ascii=False, allow_nan=False)))
 
 
 def history(db: sqlite3.Connection, session_id: str):

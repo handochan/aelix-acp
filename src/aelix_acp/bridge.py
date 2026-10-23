@@ -25,6 +25,7 @@ async def before_tool(event, ctx):
             else:
                 reader, writer = await asyncio.open_unix_connection(path)
             provenance = None
+            write_allowed = False
             try:
                 from aelix_coding_agent.tools.provenance import builtin_provenance
                 tools = getattr(getattr(event, "context", None), "tools", [])
@@ -33,9 +34,18 @@ async def before_tool(event, ctx):
                     provenance = builtin_provenance(actual)
             except (ImportError, AttributeError, TypeError):
                 pass  # Unknown or older tool objects always require approval.
+            if provenance == "write":
+                try:
+                    # Run the native containment/sensitive-path policy in its
+                    # own interpreter. Missing compatibility means ASK.
+                    from aelix_coding_agent.builtin.permission import _is_auto_allowable_write, _path_from_args
+                    write_allowed = _is_auto_allowable_write(_path_from_args(event.args), ctx.cwd) is True
+                except (ImportError, AttributeError, TypeError, ValueError, OSError):
+                    pass
             writer.write((json.dumps({"toolCallId": event.tool_call_id,
                                       "name": event.tool_name, "args": event.args,
-                                      "token": token, "provenance": provenance}) + "\n").encode())
+                                      "token": token, "provenance": provenance,
+                                      "writeAllowed": write_allowed}) + "\n").encode())
             await writer.drain()
             answer = json.loads(await reader.readline())
         if answer.get("allow") is True:

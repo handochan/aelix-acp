@@ -49,7 +49,8 @@ async def _run_extension_action(server, session, raw) -> dict:
     action, *arguments = parts
     if action in {"enable", "disable", "reload"}:
         if action == "reload":
-            result = await session.rpc("aelix_control", method="resources/reload", params={})
+            result = await session.rpc("aelix_control", method="resources/reload", params={},
+                                       _timeout=getattr(server.args, "command_timeout", 600) or None)
             await session.controls.refresh()
             await session.restore_tools()
             session.save()

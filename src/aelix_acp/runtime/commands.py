@@ -106,7 +106,8 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         session.save()
         await output(session.state.get("sessionName") or "Unnamed session")
     elif name == "compact":
-        await output(await session.rpc("compact", **({"customInstructions": raw} if args else {})))
+        await output(await session.rpc("compact", _timeout=getattr(session.server.args, "command_timeout", 600) or None,
+                                      **({"customInstructions": raw} if args else {})))
     elif name == "export":
         await output(await session.rpc("export_html", **({"outputPath": args} if args else {})))
     elif name == "copy":

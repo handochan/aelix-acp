@@ -5,6 +5,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import ProtocolError, Server, Session
@@ -67,8 +68,12 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 reader, writer = await asyncio.open_connection(*address)
                 writer.write((json.dumps({"token": token, "toolCallId": identifier, "name": name, "args": {}}) + "\n").encode())
                 await writer.drain()
+                if token == "correct-secret" and identifier == "unknown":
+                    await asyncio.sleep(0.02)
+                    await self.session.cancel()
                 result = json.loads(await asyncio.wait_for(reader.readline(), 2))
                 self.assertEqual(result["allow"], token == "correct-secret" and identifier == "t1" and name == "write")
+                self.session.cancelled = False
                 writer.close()
                 await writer.wait_closed()
         finally:
@@ -101,6 +106,72 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         await writer.wait_closed()
         listener.close()
         await listener.wait_closed()
+
+    async def test_authenticated_bridge_may_arrive_before_the_stdout_tool_event(self):
+        self.session.permission_token = "secret"
+        self.session.controls.permission_mode = "yolo"
+        listener = await asyncio.start_server(self.session.permission, "127.0.0.1", 0)
+        reader, writer = await asyncio.open_connection(*listener.sockets[0].getsockname())
+        try:
+            writer.write(b'{"token":"secret","toolCallId":"early","name":"write","args":{}}\n')
+            await writer.drain()
+            received = asyncio.create_task(reader.readline())
+            await asyncio.sleep(0.02)
+            self.assertFalse(received.done())
+            await self.session.event({"type": "tool_execution_start", "toolCallId": "early", "toolName": "write", "args": {}})
+            self.assertEqual(json.loads(await asyncio.wait_for(received, 2)), {"allow": True})
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            listener.close()
+            await listener.wait_closed()
+
+    async def test_cancel_during_slash_preparation_never_submits_the_expanded_prompt(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = []
+        async def prepare(session, text):
+            entered.set()
+            await release.wait()
+            return True, "Expanded model prompt"
+        async def rpc(command, **kwargs):
+            calls.append(command)
+            return {}
+        self.session.rpc = rpc
+        with patch("aelix_acp.session.execute_slash", prepare):
+            task = asyncio.create_task(self.session.prompt([{"type": "text", "text": "/template"}]))
+            await entered.wait()
+            await self.session.cancel()
+            release.set()
+            self.assertEqual(await task, {"stopReason": "cancelled"})
+        self.assertNotIn("prompt", calls)
+
+    async def test_model_prompt_waits_until_native_recovery_is_idle(self):
+        states = []
+        async def rpc(command, **kwargs):
+            if command == "get_state":
+                states.append(command)
+                return {"isStreaming": len(states) < 3}
+            return {}
+        self.session.rpc = rpc
+        self.assertEqual(await self.session.prompt([{"type": "text", "text": "Respond"}]), {"stopReason": "end_turn"})
+        self.assertEqual(len(states), 3)
+
+    async def test_compaction_deadline_sends_native_abort_before_returning(self):
+        calls = []
+        session = self.session
+        class Input:
+            def write(self, raw):
+                payload = json.loads(raw)
+                calls.append(payload["type"])
+                if payload["type"] == "abort":
+                    asyncio.get_running_loop().call_soon(session.pending[payload["id"]].set_result, {})
+            async def drain(self):
+                pass
+        self.session.proc = SimpleNamespace(stdin=Input(), returncode=None)
+        with self.assertRaises(ProtocolError) as caught:
+            await self.session.rpc("compact", _timeout=0.01)
+        self.assertEqual(caught.exception.code, -32007)
+        self.assertEqual(calls, ["compact", "abort"])
 
     async def test_child_eof_finishes_turn_with_error(self):
         reader = asyncio.StreamReader()

@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import Server, Session, ProtocolError
 from aelix_acp.runtime.commands import split_command
+from aelix_acp.runtime.commands import execute
 from aelix_acp.runtime.extensions import extension_reference, run_extension_action
 from support import process_alive
 
@@ -110,6 +111,21 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
                     await run_extension_action(self.server, self.session, command)
                 process.assert_not_called()
 
+    async def test_compaction_and_extension_reload_share_the_configured_deadline(self):
+        calls = []
+        async def rpc(command, **arguments):
+            calls.append((command, arguments))
+            return {}
+        self.session.rpc = rpc
+        for timeout in (147, 0):
+            self.server.args.command_timeout = timeout
+            await execute(self.session, "/compact")
+            await run_extension_action(self.server, self.session, "reload")
+            compact = next(arguments for command, arguments in reversed(calls) if command == "compact")
+            reload = next(arguments for command, arguments in reversed(calls) if command == "aelix_control" and arguments.get("method") == "resources/reload")
+            self.assertEqual(compact["_timeout"], timeout or None)
+            self.assertEqual(reload["_timeout"], timeout or None)
+
     async def test_session_pages_do_not_duplicate_equal_timestamps(self):
         self.server.db.executemany("INSERT INTO sessions VALUES(?,?,?,?,?,?)", [
             (f"id-{i:03}", str(self.root.resolve()), "coding", None, "title", 1) for i in range(205)])
@@ -129,6 +145,44 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ProtocolError):
             await self.server.dispatch("session/list", {"cursor": "not-base64-json"})
 
+    async def test_delete_reserves_the_actor_until_its_records_are_removed(self):
+        self.server.sessions[self.session.id] = self.session
+        self.session.cwd = str(self.root.resolve())
+        self.session.save()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def close():
+            entered.set()
+            await release.wait()
+            self.server.sessions.pop(self.session.id, None)
+        self.session.close = close
+        deleting = asyncio.create_task(self.server.dispatch("session/delete", {"sessionId": self.session.id}))
+        try:
+            await entered.wait()
+            with self.assertRaisesRegex(ProtocolError, "busy"):
+                await self.server.dispatch("session/prompt", {"sessionId": self.session.id,
+                    "prompt": [{"type": "text", "text": "/help"}]})
+            with self.assertRaisesRegex(ProtocolError, "starting"):
+                await self.server.dispatch("session/load", {"sessionId": self.session.id, "cwd": self.temp.name, "mcpServers": []})
+        finally:
+            release.set()
+            await deleting
+
+    async def test_client_rpc_errors_are_backend_outcomes_not_invalid_user_parameters(self):
+        import json
+        reader = asyncio.StreamReader()
+        future = asyncio.get_running_loop().create_future()
+        self.server.pending["client-request"] = future
+        reader.feed_data((json.dumps({"jsonrpc": "2.0", "id": "client-request", "error": {
+            "code": -32601, "message": "Unsupported client action"}}) + "\n").encode())
+        reader.feed_eof()
+        async def input_reader():
+            return reader, None
+        with patch("aelix_acp.server.stdin_reader", input_reader):
+            await self.server.run()
+        error = future.exception()
+        self.assertEqual(error.code, -32603)
+        self.assertEqual(error.data, {"kind": "client_error", "code": -32601})
+
     async def test_concurrent_starts_reserve_the_process_limit(self):
         self.server.args.max_sessions = 1
         entered, release = asyncio.Event(), asyncio.Event()
@@ -142,6 +196,8 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
                 entered.set()
                 await release.wait()
             async def commands(self):
+                pass
+            async def publish_recovery_warnings(self):
                 pass
             async def close(self):
                 pass

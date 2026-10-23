@@ -107,7 +107,8 @@ class PolicyTests(unittest.TestCase):
     def test_accept_edits_does_not_implicitly_allow_shell_or_plugin_tools(self):
         for provenance in [None, "bash", "delegation"]:
             self.assertEqual(permission_decision("auto-accept-edits", provenance), "ask")
-        self.assertEqual(permission_decision("auto-accept-edits", "write"), "allow")
+        self.assertEqual(permission_decision("auto-accept-edits", "write"), "ask")
+        self.assertEqual(permission_decision("auto-accept-edits", "write", write_allowed=True), "allow")
 
     def test_default_and_unknown_modes_require_approval(self):
         for mode in ["default", "corrupt-stored-value"]:

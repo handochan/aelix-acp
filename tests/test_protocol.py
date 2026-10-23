@@ -73,3 +73,14 @@ class StoreTests(unittest.TestCase):
             append_event(self.db, "s", event)
         self.db.commit()
         self.assertEqual(list(history(self.db, "s")), events[:2])
+
+    def test_streamed_events_do_not_hold_the_writer_lock_for_another_adapter(self):
+        other = open_store(self.temp.name)
+        other.execute("PRAGMA busy_timeout=50")
+        try:
+            event = {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "stream"}}
+            append_event(self.db, "a", event)
+            self.assertIsNone(begin_turn(other, "b", "other-request"))
+            self.assertEqual(list(history(other, "a")), [event])
+        finally:
+            other.close()

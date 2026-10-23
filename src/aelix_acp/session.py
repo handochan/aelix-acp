@@ -63,12 +63,15 @@ class Session:
         self.rpc_closed = False
         self.cancelled = False
         self.tools = {}
+        self.tool_arrived = asyncio.Event()
+        self.recovery_warnings = []
         self.permissions = set()
         self.permission_connections = set()
         self.ui_tasks = set()
         self.management_task = None
         self._close_task = None
         self.lease = None
+        self.index_snapshot = None
         self.client_mcp = []  # Runtime-only: server URLs, environment and headers may contain credentials.
         self.state = {}
         self.socket_dir = None
@@ -92,7 +95,13 @@ class Session:
         self.analytics_project = Path(cwd) if (Path(cwd) / "analytics.json").is_file() else None
 
     async def start(self, session_file=None):
-        self.lease = acquire_lease(self.server.args.state_dir, self.id)
+        if self.lease is None:
+            self.lease = acquire_lease(self.server.args.state_dir, self.id)
+        if self.index_snapshot is not None:
+            current = self.server.db.execute("SELECT cwd,profile,file FROM sessions WHERE id=?", (self.id,)).fetchone()
+            if current != self.index_snapshot:
+                raise ProtocolError("Saved session changed before it could be opened; load it again", -32000)
+            self.index_snapshot = None
         self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
         os.chmod(self.socket_dir, 0o700)
         self.permission_token = secrets.token_urlsafe(32)
@@ -137,26 +146,40 @@ class Session:
         await self.controls.refresh()
         if self.controls.capabilities.get("version") != 1 and not getattr(self.server.args, "allow_legacy_runtime", False):
             raise ProtocolError("Aelix runtime control v1 is required; update Aelix, or explicitly use --allow-legacy-runtime for reduced functionality", -32004)
+        self.recovery_warnings = []
+        if self.client_mcp:
+            if "mcp/configure" not in self.controls.capabilities.get("methods", []):
+                raise ProtocolError("This Aelix runtime cannot accept client MCP servers; update its control API", -32004)
+            await self.configure_mcp(self.client_mcp)
         preferences = load_preferences(self.server.db, self.id)
         saved_agent = preferences.get("agent")
+        profile_failed = False
         if saved_agent and "agents/use" in self.controls.capabilities.get("methods", []):
-            await self.rpc("aelix_control", method="agents/use", params={"name": saved_agent})
+            try:
+                await self.rpc("aelix_control", method="agents/use", params={"name": saved_agent})
+            except BackendError:
+                await self.rpc("aelix_control", method="agents/use", params={"name": "--none"})
+                profile_failed = True
+                self.recovery_warnings.append({"kind": "agent_unavailable", "previousValue": saved_agent,
+                    "message": f"Saved agent {saved_agent} could not be applied; resumed without that profile. Select an available profile before continuing."})
             await self.controls.refresh()
         config = preferences.get("config", {})
         require_object(config, "saved session config")
         for config_id in ("model", "thinking_level", "steeringMode", "followUpMode", "autoCompactionEnabled", "autoRetryEnabled"):
             option = next((entry for entry in self.controls.options() if entry["id"] == config_id), None)
-            if config_id in config and option and config[config_id] != option["currentValue"]:
-                await self.controls.set(config_id, config[config_id], publish=False)
+            if config_id in config and (not option or config[config_id] != option["currentValue"]):
+                if not option or config[config_id] not in [entry["value"] for entry in option["options"]]:
+                    self.recovery_warnings.append({"kind": "config_unavailable", "configId": config_id,
+                        "previousValue": config[config_id], "message": f"Saved {config_id} is unavailable; using the native runtime's current selection."})
+                else:
+                    await self.controls.set(config_id, config[config_id], publish=False)
         restored = preferences.get("permission_mode", "default")
+        if profile_failed and restored != "plan":
+            restored = "default"  # Never recover a missing restricted identity into silent writes.
         if restored in {entry[0] for entry in PERMISSION_MODES}:
             if self.controls.capabilities.get("permissionModes"):
                 await self.rpc("aelix_control", method="permissions/set", params={"mode": restored})
             self.controls.permission_mode = restored
-        if self.client_mcp:
-            if "mcp/configure" not in self.controls.capabilities.get("methods", []):
-                raise ProtocolError("This Aelix runtime cannot accept client MCP servers; update its control API", -32004)
-            await self.rpc("aelix_control", method="mcp/configure", params={"servers": self.client_mcp})
         await self.restore_tools()
         metadata = getattr(self.server, "client_capabilities", {}).get("_meta", {})
         if metadata.get("aelix/clientActions") is True and "ui/enable" in self.controls.capabilities.get("methods", []):
@@ -169,6 +192,21 @@ class Session:
             available = {tool["name"] for tool in resources.get("tools", [])}
             selected = [name for name in self.active_tools if name in available]
             await self.rpc("aelix_control", method="tools/set_active", params={"names": selected})
+
+    async def configure_mcp(self, servers):
+        if self.active_tools is not None:
+            # The native setter rejects removal of a selected tool. Keep the
+            # user's selection, clear the live filter during the idle mutation,
+            # then restore only names still available in the new catalog.
+            await self.rpc("aelix_control", method="tools/set_active", params={"names": []})
+        try:
+            result = await self.rpc("aelix_control", method="mcp/configure", params={"servers": servers}, _timeout=60)
+        except ProtocolError:
+            await self.restore_tools()
+            raise
+        self.client_mcp = servers
+        await self.restore_tools()
+        return result
 
     def save(self):
         self.server.db.execute(
@@ -184,7 +222,15 @@ class Session:
         self.server.db.commit()
 
     def selectors(self):
-        return self.controls.selectors()
+        result = self.controls.selectors()
+        if self.recovery_warnings:
+            result["_meta"] = {"aelix/recoveryWarnings": self.recovery_warnings}
+        return result
+
+    async def publish_recovery_warnings(self):
+        for warning in self.recovery_warnings:
+            await self.update({"sessionUpdate": "agent_message_chunk", "content": {
+                "type": "text", "text": "Session recovery: " + warning["message"]}})
 
     async def rpc(self, command, *, _timeout=45, **kwargs):
         request_id = uuid.uuid4().hex
@@ -200,9 +246,12 @@ class Session:
             try:
                 return await asyncio.wait_for(future, _timeout)
             except TimeoutError:
-                if command == "aelix_control" and kwargs.get("method") in {"commands/run", "auth/login"}:
+                if command == "aelix_control" and kwargs.get("method") in {"commands/run", "auth/login", "resources/reload", "agents/run"}:
                     with contextlib.suppress(ProtocolError, TimeoutError):
                         await self.rpc("aelix_control", method="commands/cancel", params={}, _timeout=5)
+                elif command == "compact":
+                    with contextlib.suppress(ProtocolError, TimeoutError):
+                        await self.rpc("abort", _timeout=5)
                 raise ProtocolError(f"Aelix RPC {command} timed out", -32007, {"kind": "timeout", "command": command}) from None
         finally:
             self.pending.pop(request_id, None)
@@ -240,6 +289,7 @@ class Session:
             self.failure = f"Aelix stream failed: {exc}"
         finally:
             self.rpc_closed = True
+            self.tool_arrived.set()
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(ProtocolError("Aelix process closed its RPC stream", -32603))
@@ -253,7 +303,9 @@ class Session:
 
     async def event(self, event):
         kind = event.get("type")
-        if kind == "message_update":
+        if kind == "message_start" and (event.get("message") or {}).get("role") == "assistant":
+            self.failure = None
+        elif kind == "message_update":
             update = event.get("assistantMessageEvent") or event.get("assistant_message_event") or {}
             if update.get("type") in ("text_delta", "thinking_delta") and update.get("delta"):
                 await self.update({"sessionUpdate": "agent_thought_chunk" if update["type"] == "thinking_delta"
@@ -265,11 +317,10 @@ class Session:
             if kind == "tool_execution_start":
                 # Aelix emits execution_start before the extension consent hook.
                 call = tool_call(call_id, name, event.get("args") or {}, self.cwd, "pending")
-                if call_id not in self.tools:
-                    await self.update({"sessionUpdate": "tool_call", **call})
-                else:
-                    await self.update({"sessionUpdate": "tool_call_update", **call})
+                known = call_id in self.tools
                 self.tools[call_id] = call
+                self.tool_arrived.set()
+                await self.update({"sessionUpdate": "tool_call_update" if known else "tool_call", **call})
             else:
                 result = event.get("result") or event.get("partialResult") or event.get("partial_result") or {}
                 failed = event.get("isError", event.get("is_error", False)) or result.get("is_error", result.get("isError", False))
@@ -304,8 +355,6 @@ class Session:
             self.ui_tasks.add(task)
             task.add_done_callback(self.tasks.discard)
             task.add_done_callback(self.ui_tasks.discard)
-        elif kind == "agent_end" and self.done and not self.done.done():
-            self.done.set_result(None)
 
     async def update(self, update):
         append_event(self.server.db, self.id, update)
@@ -327,10 +376,16 @@ class Session:
                     token = request.get("token")
                     if not isinstance(token, str) or not hmac.compare_digest(token, self.permission_token):
                         return
-                    existing = self.tools.get(request.get("toolCallId"))
-                    if not existing or existing.get("title") != request.get("name"):
+                    while request.get("toolCallId") not in self.tools:
+                        self.tool_arrived.clear()
+                        if self.cancelled or self.rpc_closed:
+                            return
+                        await self.tool_arrived.wait()
+                    existing = self.tools[request["toolCallId"]]
+                    if existing.get("title") != request.get("name"):
                         return
-                decision = permission_decision(self.controls.permission_mode, request.get("provenance"))
+                decision = permission_decision(self.controls.permission_mode, request.get("provenance"),
+                                               write_allowed=request.get("writeAllowed") is True)
                 if self.controls.permission_mode == "auto" and request.get("provenance") == "bash":
                     if "permissions/evaluate" in self.controls.capabilities.get("methods", []):
                         evaluation = await self.rpc("aelix_control", method="permissions/evaluate", params={"args": request.get("args", {})})
@@ -404,11 +459,14 @@ class Session:
         if self.id in self.server.starting_ids:
             raise ProtocolError("Session is already starting", -32000)
         self.server.starting_ids.add(self.id)
+        held_lease = self.lease
+        self.lease = None
         try:
             filename = self.state.get("sessionFile")
             if filename and not Path(filename).is_file():
                 filename = None
             await self.close()
+            self.lease, held_lease = held_lease, None
             self.tasks = set()
             self._close_task = None
             self.failure = None
@@ -423,8 +481,11 @@ class Session:
             self.save()
             await self.start(filename)
             await self.commands()
+            await self.publish_recovery_warnings()
             self.server.sessions[self.id] = self
         except BaseException:
+            if held_lease is not None:
+                self.lease, held_lease = held_lease, None
             await self.close()
             raise
         finally:
@@ -504,16 +565,20 @@ class Session:
                 return {"stopReason": "end_turn"}
             if prepared is not None:
                 text = prepared
+        if self.cancelled:
+            return {"stopReason": "cancelled"}
         self.done = asyncio.get_running_loop().create_future()
-        self.failure, self.cancelled = None, False
+        self.failure = None
         self.tools.clear()
         try:
-            await self.rpc("prompt", message=text, **({"images": images} if images else {}))
             timeout = getattr(self.server.args, "turn_timeout", 600)
-            await asyncio.wait_for(asyncio.shield(self.done), timeout or None)
+            async with asyncio.timeout(timeout or None):
+                await self.rpc("prompt", message=text, **({"images": images} if images else {}))
+                if self.cancelled:
+                    await self.cancel()
+                await self.wait_until_idle()
             if self.failure and not self.cancelled:
                 raise ProtocolError(self.failure, -32603)
-            self.state = await self.rpc("get_state")
             self.save()
             return {"stopReason": "cancelled" if self.cancelled else "end_turn"}
         except TimeoutError:
@@ -523,11 +588,21 @@ class Session:
             if self.done and not self.done.done():
                 self.done.cancel()
 
+    async def wait_until_idle(self):
+        # agent_end closes one provider attempt, not the enclosing prompt's
+        # retries, overflow recovery or threshold compaction (#334 in native).
+        while True:
+            self.state = await self.rpc("get_state")
+            if not self.state.get("isStreaming", self.state.get("is_streaming", False)):
+                return
+            await asyncio.sleep(0.05)
+
     async def cancel(self):
         self.cancelled = True
+        self.tool_arrived.set()
         if self.management_task and not self.management_task.done():
             self.management_task.cancel()
-        for task in [*self.permissions, *self.ui_tasks]:
+        for task in [*self.permission_connections, *self.permissions, *self.ui_tasks]:
             task.cancel()
         if "commands/cancel" in self.controls.capabilities.get("methods", []) and self.proc and self.proc.returncode is None:
             with contextlib.suppress(ProtocolError, TimeoutError):

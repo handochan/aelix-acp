@@ -1,5 +1,6 @@
 """Real Aelix + ACP + local model endpoint; no provider credentials or internet."""
 import asyncio
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -15,10 +16,12 @@ EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
 class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="acp-native-", dir="/tmp" if os.name != "nt" else None)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         (self.root / "home").mkdir()
         (self.root / "agent").mkdir()
         self.model_requests = []
+        self.write_path = self.root / "approved.txt"
+        self.failures = 0
         self.listener = await asyncio.start_server(self.model, "127.0.0.1", 0)
         port = self.listener.sockets[0].getsockname()[1]
         models = {"providers": {"fixture": {"baseUrl": f"http://127.0.0.1:{port}/v1", "api": "openai-completions",
@@ -65,7 +68,7 @@ def setup(api):
             if last.get("role") == "user" and "WRITE_TEST" in content:
                 delta = {"role": "assistant", "tool_calls": [{"index": 0, "id": "call_" + str(len(self.model_requests)),
                     "type": "function", "function": {"name": "write", "arguments": json.dumps({
-                        "path": str(self.root / "approved.txt"), "content": "approved write"})}}]}
+                        "path": str(self.write_path), "content": "approved write"})}}]}
                 stop = "tool_calls"
             else:
                 delta, stop = {"role": "assistant", "content": "NATIVE_OK"}, "stop"
@@ -73,12 +76,16 @@ def setup(api):
                 return "data: " + json.dumps({"id": "fixture", "object": "chat.completion.chunk", "created": 0,
                     "model": request.get("model", "one"), "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
             body = (event(delta, None) + event({}, stop) + "data: [DONE]\n\n").encode()
+            if self.failures:
+                self.failures -= 1
+                body = b'data: {"error":{"message":"overloaded fixture","type":"overloaded_error"}}\n\n'
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: "
                          + str(len(body)).encode() + b"\r\n\r\n" + body)
             await writer.drain()
         finally:
             writer.close()
-            await writer.wait_closed()
+            with contextlib.suppress(ConnectionError):
+                await writer.wait_closed()
 
     async def prompt(self, text, key=None):
         return await self.client.request("session/prompt", {"sessionId": self.session,
@@ -107,6 +114,11 @@ def setup(api):
         self.client.dialog = lambda _request: {"value": "two"}
         await self.prompt("/choose")
         self.assertIn("selected:two", self.client.text())
+        await self.manage("mcp/configure", {"servers": []})
+        self.assertEqual((await self.manage("resources/list"))["activeTools"], [])
+        self.assertEqual((await self.manage("mcp/status"))["servers"], [])
+        await self.manage("mcp/configure", {"servers": [{"name": "fixture", "command": sys.executable, "args": [str(script)]}]})
+        self.assertEqual((await self.manage("resources/list"))["activeTools"], [tool_name])
 
     async def test_global_profile_selection_survives_adapter_restart(self):
         profiles = self.root / "agent/agents"
@@ -126,6 +138,10 @@ def setup(api):
         script.write_text('from mcp.server.fastmcp import FastMCP\ns=FastMCP("fixture")\n@s.tool()\ndef echo(value: str) -> str: return value\ns.run()\n')
         servers = [{"name": "fixture", "command": sys.executable, "args": [str(script)]}]
         await self.manage("mcp/configure", {"servers": servers})
+        profiles = self.root / "agent/agents"
+        profiles.mkdir()
+        (profiles / "mcp-profile.md").write_text("---\nname: mcp-profile\ndescription: MCP\ntools: [acp_fixture__echo]\n---\nUse MCP.\n", encoding="utf-8")
+        await self.manage("agents/use", {"name": "mcp-profile"})
         before = {tool["name"] for tool in (await self.manage("resources/list"))["tools"]}
         await self.manage("tools/set_active", {"names": ["acp_fixture__echo"]})
         await self.client.close()
@@ -220,6 +236,64 @@ def setup(api):
         self.assertEqual(await self.prompt("Respond briefly"), {"stopReason": "end_turn"})
         self.assertIn("NATIVE_OK", self.client.text())
         self.assertEqual(self.model_requests[-1]["model"], "two")
+
+    async def test_native_retry_settles_before_the_prompt_response(self):
+        self.failures = 1
+        self.assertEqual(await self.prompt("Respond after retry"), {"stopReason": "end_turn"})
+        self.assertEqual(len(self.model_requests), 2)
+        self.assertIn("NATIVE_OK", self.client.text())
+        self.assertEqual(await self.prompt("Respond again"), {"stopReason": "end_turn"})
+
+    async def test_native_handled_input_finishes_without_an_agent_end_event(self):
+        extension = self.root / "handled.py"
+        extension.write_text('from aelix_agent_core.harness.hooks import InputHandled\nasync def intercept(event, ctx):\n    if event.text == "INTERCEPT": return InputHandled()\ndef setup(api): api.on("input", intercept)\n', encoding="utf-8")
+        await self.manage("extensions/action", {"action": "enable", "target": str(extension)})
+        self.assertEqual(await self.prompt("INTERCEPT"), {"stopReason": "end_turn"})
+        self.assertEqual(self.model_requests, [])
+
+    async def test_auto_edit_modes_request_approval_for_outside_and_sensitive_paths(self):
+        with tempfile.TemporaryDirectory() as outside:
+            self.client.permission = "reject-once"
+            for mode in ("auto-accept-edits", "auto"):
+                await self.config("permission_mode", mode)
+                for target in (Path(outside) / "outside.txt", self.root / ".aelix/agents/test.md"):
+                    with self.subTest(mode=mode, target=str(target)):
+                        self.write_path = target
+                        self.client.requests.clear()
+                        await self.prompt("WRITE_TEST")
+                        self.assertFalse(target.exists())
+                        self.assertTrue(any(r["method"] == "session/request_permission" for r in self.client.requests))
+
+    async def test_removed_model_recovers_with_the_native_fallback(self):
+        await self.config("model", "fixture/two")
+        await self.prompt("Respond")
+        await self.client.close()
+        filename = self.root / "agent/models.json"
+        config = json.loads(filename.read_text(encoding="utf-8"))
+        provider = config["providers"].pop("fixture")
+        provider["models"] = provider["models"][:1]
+        config["providers"]["replacement"] = provider
+        filename.write_text(json.dumps(config), encoding="utf-8")
+        (self.root / "agent/settings.json").write_text(json.dumps({"defaultProvider": "replacement", "defaultModel": "one"}), encoding="utf-8")
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+        self.assertEqual(result["models"]["currentModelId"], "replacement/one")
+        self.assertTrue(result["_meta"]["aelix/recoveryWarnings"])
+
+    async def test_removed_profile_recovers_with_explicit_approval_mode(self):
+        profiles = self.root / "agent/agents"
+        profiles.mkdir()
+        profile = profiles / "reviewer.md"
+        profile.write_text("---\nname: reviewer\ndescription: Review\ninherit_extensions: true\n---\nReview carefully.\n", encoding="utf-8")
+        await self.manage("agents/use", {"name": "reviewer"})
+        await self.config("permission_mode", "auto-accept-edits")
+        await self.prompt("Respond")
+        await self.client.close()
+        profile.unlink()
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+        self.assertEqual(result["modes"]["currentModeId"], "default")
+        self.assertTrue(result["_meta"]["aelix/recoveryWarnings"])
 
     async def test_approved_write_is_real_and_denied_write_is_absent(self):
         await self.prompt("WRITE_TEST")
