@@ -151,14 +151,10 @@ class Server:
                     self.sessions.pop(session_id, None)
                     await previous.close()
                 session = Session(self, session_id, cwd)
+                session.client_mcp = params.get("mcpServers", [])
                 await session.start(session_file)
                 self.sessions[session_id] = session
                 await session.commands()
-                if params.get("mcpServers"):
-                    if "mcp/configure" not in session.controls.capabilities.get("methods", []):
-                        raise ProtocolError("This Aelix runtime cannot accept client MCP servers; update its control API", -32004)
-                    await session.rpc("aelix_control", method="mcp/configure", params={"servers": params["mcpServers"]})
-                    session.client_mcp = params["mcpServers"]
                 if method == "session/load":
                     recorded = list(history(self.db, session_id))
                     for update in recorded:

@@ -120,6 +120,21 @@ def setup(api):
         capabilities = await self.client.request("_aelix/capabilities", {"sessionId": self.session})
         self.assertEqual(capabilities["runtime"]["activeAgent"], "reviewer")
 
+    async def test_client_mcp_load_restores_tool_selection_and_inventory(self):
+        import sys
+        script = self.root / "mcp_server.py"
+        script.write_text('from mcp.server.fastmcp import FastMCP\ns=FastMCP("fixture")\n@s.tool()\ndef echo(value: str) -> str: return value\ns.run()\n')
+        servers = [{"name": "fixture", "command": sys.executable, "args": [str(script)]}]
+        await self.manage("mcp/configure", {"servers": servers})
+        before = {tool["name"] for tool in (await self.manage("resources/list"))["tools"]}
+        await self.manage("tools/set_active", {"names": ["acp_fixture__echo"]})
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": servers}, timeout=120)
+        after = await self.manage("resources/list")
+        self.assertEqual({tool["name"] for tool in after["tools"]}, before)
+        self.assertEqual(after["activeTools"], ["acp_fixture__echo"])
+
     async def test_native_subagent_runs_and_emits_progress(self):
         profiles = self.root / "agent/agents"
         profiles.mkdir()

@@ -154,6 +154,8 @@ class Session:
                 await self.rpc("aelix_control", method="permissions/set", params={"mode": restored})
             self.controls.permission_mode = restored
         if self.client_mcp:
+            if "mcp/configure" not in self.controls.capabilities.get("methods", []):
+                raise ProtocolError("This Aelix runtime cannot accept client MCP servers; update its control API", -32004)
             await self.rpc("aelix_control", method="mcp/configure", params={"servers": self.client_mcp})
         await self.restore_tools()
         metadata = getattr(self.server, "client_capabilities", {}).get("_meta", {})
