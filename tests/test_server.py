@@ -144,15 +144,16 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         source = root/'workspace/runs/fixture.html'
         source.parent.mkdir(parents=True)
         original = '<html><head></head><body>Recorded result</body></html>'
-        source.write_text(original)
+        source.write_text(original, encoding="utf-8")
         self.session.analytics_project = root
         await self.session.event({"type":"tool_execution_end", "tool_call_id":"t3", "tool_name":"analytics_run",
             "result":{"content":[{"type":"text","text":"analytics_run: ok"}],
                       "details":{"run":{"id":"fixture","status":"ok"}}}})
         preview = root/'workspace/aion-preview/fixture.html'
         self.assertTrue(preview.is_file())
-        self.assertEqual(source.read_text(), original)
-        self.assertIn(str(preview), json.dumps(self.events, ensure_ascii=False))
+        self.assertEqual(source.read_text(encoding="utf-8"), original)
+        rendered = "".join(event["params"]["update"].get("content", {}).get("text", "") for event in self.events)
+        self.assertIn(str(preview.resolve()), rendered)
 
     async def test_missing_analytics_extension_does_not_silently_become_coding(self):
         self.server.args.profile = 'analytics'
