@@ -229,10 +229,9 @@ class Session:
             return False
 
     async def sync_profile_tools(self):
-        resources = await self.rpc("aelix_control", method="resources/list", params={})
-        active = resources.get("activeTools", [])
-        available = {tool["name"] for tool in resources.get("tools", [])}
-        self.active_tools = None if set(active) == available and await self.profile_uses_all_tools() else active
+        # Only explicit GUI/slash tool choices are persistent overrides.
+        # A profile owns its live filter and must be re-evaluated after edits.
+        self.active_tools = None
 
     def save(self):
         self.server.db.execute(
@@ -624,7 +623,8 @@ class Session:
             if self.cancelled:
                 # Native acceptance precedes before_agent_start/build_context.
                 # An earlier abort can precede the turn task's creation.
-                await self.rpc("abort", _timeout=5)
+                with contextlib.suppress(ProtocolError, TimeoutError):
+                    await self.rpc("abort", _timeout=5)
             await asyncio.sleep(0.05)
 
     async def cancel(self):

@@ -257,8 +257,15 @@ def setup(api):
         self.assertEqual(self.model_requests, [])
 
     async def test_cancel_crossing_before_agent_start_stops_the_later_turn_task(self):
+        await self.cancel_startup_with_abort_hook(False)
+
+    async def test_failing_abort_hook_keeps_the_cancelled_prompt_outcome(self):
+        await self.cancel_startup_with_abort_hook(True)
+
+    async def cancel_startup_with_abort_hook(self, raises):
         extension = self.root / "paused.py"
-        extension.write_text('import asyncio\nfrom pathlib import Path\nasync def pause(event, ctx):\n    Path(ctx.cwd,"paused").touch()\n    while not Path(ctx.cwd,"resume").exists(): await asyncio.sleep(0.01)\nasync def aborted(event, ctx): Path(ctx.cwd,"aborted").touch()\ndef setup(api):\n    api.on("before_agent_start",pause)\n    api.on("abort",aborted)\n', encoding="utf-8")
+        hook = 'Path(ctx.cwd,"aborted").touch()' + ('; raise RuntimeError("failing abort hook")' if raises else '')
+        extension.write_text('import asyncio\nfrom pathlib import Path\nasync def pause(event, ctx):\n    Path(ctx.cwd,"paused").touch()\n    while not Path(ctx.cwd,"resume").exists(): await asyncio.sleep(0.01)\nasync def aborted(event, ctx): ' + hook + '\ndef setup(api):\n    api.on("before_agent_start",pause)\n    api.on("abort",aborted)\n', encoding="utf-8")
         await self.manage("extensions/action", {"action": "enable", "target": str(extension)})
         self.model_gate = asyncio.Event()
         prompt = asyncio.create_task(self.prompt("Respond"))
@@ -271,7 +278,7 @@ def setup(api):
                 while not (self.root / "aborted").exists():
                     await asyncio.sleep(0.01)
             (self.root / "resume").touch()
-            self.assertEqual(await asyncio.wait_for(prompt, 3), {"stopReason": "cancelled"})
+            self.assertEqual(await asyncio.wait_for(prompt, 10), {"stopReason": "cancelled"})
             await cancelling
         finally:
             self.model_gate.set()
@@ -300,6 +307,19 @@ def setup(api):
         await self.manage("agents/use", {"name": "restricted"})
         await self.manage("mcp/configure", {"servers": servers})
         self.assertEqual(set((await self.manage("resources/list"))["activeTools"]), set(baseline))
+
+    async def test_edited_profile_tool_restrictions_replace_its_prior_filter(self):
+        profiles = self.root / "agent/agents"
+        profiles.mkdir()
+        profile = profiles / "restricted.md"
+        profile.write_text("---\nname: restricted\ndescription: Restricted\ntools: [read, bash]\n---\nRead or bash.\n", encoding="utf-8")
+        await self.manage("agents/use", {"name": "restricted"})
+        await self.prompt("Respond")
+        await self.client.close()
+        profile.write_text("---\nname: restricted\ndescription: Restricted\ntools: [read]\n---\nRead only.\n", encoding="utf-8")
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+        self.assertEqual((await self.manage("resources/list"))["activeTools"], ["read"])
 
     async def test_auto_edit_modes_request_approval_for_outside_and_sensitive_paths(self):
         with tempfile.TemporaryDirectory() as outside:
