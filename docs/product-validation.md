@@ -13,7 +13,7 @@ directories and sessions; synthetic keys never use the user's credential store.
 python3 scripts/test_native.py --core .local/aelix-core
 ```
 
-73 tests passed, including 18 black-box tests through the actual Aelix child
+92 tests passed, including 28 black-box tests through the actual Aelix child
 and adapter JSONL transport. A local HTTP endpoint emits synthetic model SSE;
 the MCP fixture is a real local stdio process. These are real process, file,
 protocol and native service checks with synthetic model responses.
@@ -83,3 +83,19 @@ remove uses the extension entry-point name.
 The source adapter, core API and CI are reviewable work. Studio should consume
 the pinned source only after its own integration and installation gates pass.
 Do not upgrade its shipped bundle to an unpinned branch tip.
+
+## Independent review follow-up
+
+Claude Code 2.1.309 was run with `--model claude-opus-5-5 --effort xhigh`
+and read-only tools against an immutable snapshot. Its original report and
+the accepted/reproduced fix dispositions live under `docs/reviews/`.
+Review output, parent-run reproductions, synthetic integration and exact-head
+CI are separate evidence. The native core working branch was not modified
+during this follow-up; the runtime pin remains unchanged while core review proceeds.
+
+Added cases cover native path containment/sensitivity, provider-attempt retry
+versus prompt completion, handled input with no agent_end, missing model/profile
+fallback, MCP profile/selection restoration and removal, independent SQLite
+writers, early bridge requests, slash cancellation, command deadlines, deletion
+serialization and launch preferences after lease admission. Known native frame
+size/aggregate-history limits remain explicit in the review disposition.

@@ -65,7 +65,9 @@ ephemeral loopback endpoint. Requests must match a known native tool-call ID
 and name. Actual arguments after prior hooks are shown for consent. Invalid
 authentication, failure, cancellation and deadlines deny execution.
 
-Permission modes use verified native provenance, not names. Unknown and MCP
+Permission modes use verified native provenance, not names. The authenticated
+bridge also evaluates the pinned native containment/sensitive-path helper for
+file edits; unavailable compatibility falls back to client approval. Unknown and MCP
 tools never inherit built-in read/edit exemptions. Auto shell classification
 uses the native classifier. Native policy precedes client approval; full
 access removes client prompts while native guardrails remain.
@@ -90,10 +92,21 @@ are unresolved and never replayed blindly. Definitively invalid requests retain
 their structured error. Without a client key each prompt is new.
 
 Display history includes control replies, thoughts and tool updates. Stream
-events commit at boundaries; a hard kill can lose recent uncommitted chunks.
+events commit in short transactions per update; an open model stream does not
+retain SQLite's writer lock. A hard kill can still lose chunks not yet received.
 Native transcript and SQLite are not one transaction. This is not exactly-once
 external effects or automatic crash-safe task continuation. A timeout does
 not prove a tool did nothing. Protect history as sensitive user data.
+
+The native `agent_end` closes a provider attempt. ACP prompt completion instead
+waits for native `get_state.isStreaming` to become false, including retries and
+closing compaction. Missing saved model/profile choices recover with visible
+warnings; a missing restricted profile never recovers into silent write access.
+
+Known unresolved candidate limitation: native JSONL is bounded to 16 MiB too.
+An oversized aggregate event or `get_messages` response can close its actor.
+Large branch-history acceptance needs compact native lifecycle events and
+paged/bounded history; no such new core API is introduced by this adapter fix.
 
 ## Credentials, MCP and packages
 

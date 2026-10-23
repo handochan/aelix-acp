@@ -83,6 +83,11 @@ For `update`, use the inventory's distribution name or omit the target to
 update recorded sources. `remove` accepts the extension entry-point name.
 Offline updates need a recorded local source or configured local index.
 
+Create/load can return `_meta["aelix/recoveryWarnings"]`. Display these warnings
+alongside the effective selectors; warnings are also emitted as text. Missing
+model choices retain the native fallback. A failed saved profile resets its
+identity and uses explicit approval unless Plan was already selected.
+
 Skills/prompts are native files. Studio can author them through its file
 editor, set `skill_paths` / `prompt_template_paths` and reload. This API
 does not provide a terminal-widget-to-web editor converter.

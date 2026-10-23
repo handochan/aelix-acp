@@ -66,7 +66,8 @@ aelix-acp --extension installed_module:setup \
 
 권한 모드는 `default`, `plan`, `auto-accept-edits`, `auto`, `yolo`입니다.
 Plan은 출처가 확인된 내장 읽기 도구만 허용하고, 편집 자동 승인은
-확인된 내장 파일 쓰기·편집만 허용합니다. 임의 확장이 도구 이름을 `read`로
+native 정책이 허용한 프로젝트 내부의 비민감 파일 쓰기·편집만 허용합니다.
+프로젝트 밖·민감 경로는 승인을 요청합니다. 임의 확장이 도구 이름을 `read`로
 정해도 읽기 권한을 얻지 못합니다. Auto의 shell 판단은 native 분류기를 사용합니다.
 
 자동 확장 탐색을 끄고 선택한 확장과 승인 브리지를 명시적으로 로드합니다.
@@ -77,6 +78,8 @@ Plan은 출처가 확인된 내장 읽기 도구만 허용하고, 편집 자동 
 키 관리는 Aelix AuthStorage를 사용하고 API 결과·재생 이력에 키를 넣지 않습니다.
 MCP의 환경변수·헤더·URL은 설정 DB에 저장하지 않습니다. 클라이언트는
 `session/load` 시 자신의 `mcpServers`를 다시 전달해야 합니다.
+저장된 모델·프로필이 사라졌으면 native fallback과 경고로 복구합니다.
+프로필 복구가 실패하면 Plan을 유지하거나 명시적 승인 모드로 낮춥니다.
 
 서명된 `.app` 내부에는 확장 패키지를 설치하지 않습니다. 별도의 관리 환경을
 `--extension-manager`로 제공하고 사용자 승인 후 native CLI를 호출합니다.

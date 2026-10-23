@@ -1,0 +1,100 @@
+{
+  "repository": "handochan/aelix-acp",
+  "head": "5da92bd04c4d19dc496ce237a85b40786c80da6e",
+  "runId": 39896963730,
+  "url": "https://github.com/handochan/aelix-acp/actions/runs/39896963730",
+  "verifiedAtUtc": "2026-10-23 03:55:08 UTC",
+  "conclusion": "success",
+  "jobs": [
+    {
+      "id": 120229527227,
+      "name": "native (ubuntu-latest)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527412,
+      "name": "test (macos-latest, 3.11)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527479,
+      "name": "test (ubuntu-latest, 3.12)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527509,
+      "name": "test (macos-latest, 3.12)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527516,
+      "name": "native (windows-latest)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527528,
+      "name": "native (macos-latest)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527540,
+      "name": "test (macos-latest, 3.14)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527551,
+      "name": "test (macos-latest, 3.13)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527557,
+      "name": "test (ubuntu-latest, 3.11)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527558,
+      "name": "test (ubuntu-latest, 3.13)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527559,
+      "name": "test (windows-latest, 3.13)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527595,
+      "name": "test (windows-latest, 3.12)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527598,
+      "name": "test (windows-latest, 3.11)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527603,
+      "name": "test (windows-latest, 3.14)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 120229527617,
+      "name": "test (ubuntu-latest, 3.14)",
+      "status": "completed",
+      "conclusion": "success"
+    }
+  ]
+}
