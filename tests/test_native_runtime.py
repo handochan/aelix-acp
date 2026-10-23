@@ -172,8 +172,10 @@ def setup(api):
             await self.prompt("/extra")
 
     async def test_clone_creates_a_new_acp_identity_and_preserves_parent(self):
+        await self.manage("tools/set_active", {"names": ["read"]})
         await self.prompt("Respond")
         await self.prompt("/clone")
+        self.assertEqual((await self.manage("resources/list"))["activeTools"], ["read"])
         listing = await self.client.request("session/list", {"cwd": str(self.root)})
         self.assertEqual(len(listing["sessions"]), 2)
         self.assertIn(self.session, [row["sessionId"] for row in listing["sessions"]])

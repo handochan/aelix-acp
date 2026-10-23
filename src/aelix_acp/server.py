@@ -94,6 +94,7 @@ class Server:
                             filename, result.get("title") or "Aelix branch", int(time.time())))
             save_preferences(self.db, identifier, preferences)
         await session.controls.refresh()
+        await session.restore_tools()
         session.save()
         return {"sessionId": identifier, "parentSessionId": session.id}
 
