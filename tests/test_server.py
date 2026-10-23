@@ -152,7 +152,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         preview = root/'workspace/aion-preview/fixture.html'
         self.assertTrue(preview.is_file())
         self.assertEqual(source.read_text(encoding="utf-8"), original)
-        rendered = "".join(event["params"]["update"].get("content", {}).get("text", "") for event in self.events)
+        rendered = "".join(event["params"]["update"]["content"]["text"] for event in self.events
+                           if event["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
         self.assertIn(str(preview.resolve()), rendered)
 
     async def test_missing_analytics_extension_does_not_silently_become_coding(self):
