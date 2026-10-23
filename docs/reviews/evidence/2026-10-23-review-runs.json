@@ -1,0 +1,97 @@
+{
+  "nativeCommit": "10854a2d4cfc089cdf021c3f2e251bce9f230d94",
+  "runs": [
+    {
+      "name": "initial",
+      "head": "7f49cabf9433a60a84d39cef0346373a135a0026",
+      "scope": "full snapshot",
+      "cliVersion": "2.1.309",
+      "requestedModel": "claude-opus-5-5",
+      "effort": "xhigh",
+      "reportedModel": "claude-opus-5-5",
+      "models": [
+        {
+          "name": "claude-opus-5-5",
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty"
+        }
+      ],
+      "permissionMode": "plan",
+      "availableTools": [
+        "Glob",
+        "Grep",
+        "Read"
+      ],
+      "toolCalls": 77,
+      "result": "success"
+    },
+    {
+      "name": "followup",
+      "head": "f86a745c8cf9f284a1809ea69fb0bed9d73dece9",
+      "scope": "source diff",
+      "cliVersion": "2.1.309",
+      "requestedModel": "claude-opus-5-5",
+      "effort": "xhigh",
+      "reportedModel": "claude-opus-5-5",
+      "models": [
+        {
+          "name": "claude-opus-5-5",
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty"
+        }
+      ],
+      "permissionMode": "plan",
+      "availableTools": [
+        "Glob",
+        "Grep",
+        "Read"
+      ],
+      "toolCalls": 57,
+      "result": "success"
+    },
+    {
+      "name": "verification",
+      "head": "88dd47ddb34bc03bd85d12cc99ccdfb2a194cd2b",
+      "scope": "N1 N2 delta",
+      "cliVersion": "2.1.309",
+      "requestedModel": "claude-opus-5-5",
+      "effort": "xhigh",
+      "reportedModel": "claude-opus-5-5",
+      "models": [
+        {
+          "name": "claude-opus-5-5",
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty"
+        }
+      ],
+      "permissionMode": "plan",
+      "availableTools": [
+        "Glob",
+        "Grep",
+        "Read"
+      ],
+      "toolCalls": 54,
+      "result": "success"
+    },
+    {
+      "name": "closure",
+      "head": "5da92bd04c4d19dc496ce237a85b40786c80da6e",
+      "scope": "provided R1 R2 patch only",
+      "cliVersion": "2.1.309",
+      "requestedModel": "claude-opus-5-5",
+      "effort": "xhigh",
+      "reportedModel": "claude-opus-5-5",
+      "models": [
+        {
+          "name": "claude-opus-5-5",
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty"
+        }
+      ],
+      "permissionMode": "plan",
+      "availableTools": [],
+      "toolCalls": 0,
+      "result": "success"
+    }
+  ]
+}
