@@ -79,6 +79,10 @@ class Session:
         self.permission_token = None
         self.controls = SessionControls(self)
         self.mutation_lock = asyncio.Lock()
+        self.restore_launch_preferences()
+        self.analytics_project = Path(cwd) if (Path(cwd) / "analytics.json").is_file() else None
+
+    def restore_launch_preferences(self):
         preferences = load_preferences(self.server.db, self.id)
         self.active_tools = preferences.get("activeTools")
         if self.active_tools is not None and (not isinstance(self.active_tools, list) or any(not isinstance(name, str) for name in self.active_tools)):
@@ -92,7 +96,6 @@ class Session:
             raise ProtocolError("Invalid saved delegation setting")
         if not isinstance(self.extra_extensions, list) or any(not isinstance(path, str) for path in self.extra_extensions):
             raise ProtocolError("Invalid stored extension configuration")
-        self.analytics_project = Path(cwd) if (Path(cwd) / "analytics.json").is_file() else None
 
     async def start(self, session_file=None):
         if self.lease is None:
@@ -102,6 +105,7 @@ class Session:
             if current != self.index_snapshot:
                 raise ProtocolError("Saved session changed before it could be opened; load it again", -32000)
             self.index_snapshot = None
+        self.restore_launch_preferences()  # Re-read under the acquired lease, not the constructor's stale snapshot.
         self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
         os.chmod(self.socket_dir, 0o700)
         self.permission_token = secrets.token_urlsafe(32)

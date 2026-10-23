@@ -7,6 +7,11 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from aelix_acp.server import Server, Session
+from aelix_acp.runtime.store import save_preferences
 
 
 FAKE_CHILD = '''import json,os,sys
@@ -64,6 +69,23 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('approval bridge did not load', result['error']['message'])
         child_pid = int((self.root / 'child.pid').read_text())
         self.assertFalse(process_alive(child_pid))
+
+    async def test_launch_preferences_are_read_after_session_lease_admission(self):
+        self.child.write_text(FAKE_CHILD.replace('Path("child.pid")', 'Path("child.args").write_text(json.dumps(sys.argv))\nPath("child.pid")'))
+        server = Server(SimpleNamespace(state_dir=str(self.root / "state"), profile="coding",
+            aelix=sys.executable, aelix_arg=[str(self.child)], provider=None, model=None))
+        session = Session(server, "stale", str(self.root))
+        try:
+            with server.db:
+                save_preferences(server.db, "stale", {"trustProject": False, "agentsEnabled": True})
+            await session.start()
+            argv = json.loads((self.root / "child.args").read_text())
+            self.assertIn("--deny", argv)
+            self.assertIn("--agents", argv)
+            self.assertNotIn("--no-agents", argv)
+        finally:
+            await session.close()
+            server.db.close()
 
     async def test_sigterm_closes_real_rpc_child(self):
         await self.start()
