@@ -6,6 +6,9 @@ For Studio Preview/Beta work, read the README of
 [Project 9](https://github.com/users/handochan/projects/9) before choosing work.
 Exact project ID: `PVT_kwHOA-ATMs4BojoA`. This is the shared board for
 `aelix-ai`, `aelix-acp`, and `aelix-studio`; do not substitute another project.
+Read [Preview development readiness](docs/studio-preview.md) and its canonical Studio
+design links before selecting work. Keep the shared design in Studio; do not maintain
+a second independent release plan in ACP.
 
 ```sh
 gh project view 9 --owner handochan --format json --jq .readme
