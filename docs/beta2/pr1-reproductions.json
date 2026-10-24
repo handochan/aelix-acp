@@ -1,0 +1,31 @@
+{
+  "operatorDisable": {
+    "evidence": "unit execution of PR #1 function with a synthetic control response; native hook persistence follows Session.start source lines 125-126",
+    "response": {
+      "enabledExtensions": [],
+      "loadErrors": [],
+      "ready": true
+    },
+    "operatorConfigStillContainsExtension": true
+  },
+  "legacyResume": {
+    "evidence": "actual installed PR #1 and unmodified public beta.2 process, seeded persisted ACP preferences and synthetic model; not a real control-v1 migration",
+    "savedAgent": "restricted-fixture",
+    "savedTools": [],
+    "savedPermission": "yolo",
+    "resumedPermission": "yolo",
+    "actualProviderToolCount": 8,
+    "toolNames": [
+      "aelix_status",
+      "read",
+      "bash",
+      "edit",
+      "write",
+      "grep",
+      "find",
+      "ls"
+    ],
+    "successWithoutSavedRestrictions": true
+  },
+  "reviewedPrHead": "8deb482bcd53261762979cf0e6ce1302dcc821c1"
+}
