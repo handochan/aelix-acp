@@ -81,6 +81,11 @@ PYTHONPATH=src python -m aelix_acp.preview /absolute/path/to/analysis-project RU
 
 Plotly 자산은 MIT 라이선스이며 패키지의 `assets/PLOTLY-LICENSE.txt`에 보존합니다.
 
+## Preview 개발 착수
+
+공통 Preview/Beta 설계와 실행 Issue·선행 작업은 [개발 착수 안내](docs/studio-preview.md)를
+따릅니다. 이 README의 기존 PoC 기능 설명과 Preview 출시 수용 완료는 구분합니다.
+
 ## 검증
 
 ```sh
