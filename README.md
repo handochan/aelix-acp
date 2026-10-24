@@ -85,6 +85,8 @@ Plotly 자산은 MIT 라이선스이며 패키지의 `assets/PLOTLY-LICENSE.txt`
 
 공통 Preview/Beta 설계와 실행 Issue·선행 작업은 [개발 착수 안내](docs/studio-preview.md)를
 따릅니다. 이 README의 기존 PoC 기능 설명과 Preview 출시 수용 완료는 구분합니다.
+공개 native wheel의 정확한 기준과 실제 subprocess 검증·현재 PR의 재사용 판단은
+[beta.2 qualification](docs/beta2/README.md)에 기록합니다.
 
 ## 검증
 
