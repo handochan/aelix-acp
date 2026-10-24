@@ -10,7 +10,7 @@ import unittest
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from aelix_acp.server import Server, Session
+from aelix_acp.server import ProtocolError, Server, Session
 from aelix_acp.runtime.store import save_preferences
 
 
@@ -21,7 +21,7 @@ if not os.environ.get("TEST_SKIP_BRIDGE_READY"):
     Path(os.environ["AELIX_ACP_READY_FILE"]).write_text(os.environ["AELIX_ACP_NONCE"])
 for line in sys.stdin:
     request=json.loads(line)
-    data={"commands":[]} if request["type"]=="get_commands" else ({"version":1} if request["type"]=="aelix_control" else {})
+    data={"commands":[]} if request["type"]=="get_commands" else ({"version":1,"methods":[]} if request["type"]=="aelix_control" else {})
     print(json.dumps({"type":"response","id":request["id"],"success":True,"data":data}),flush=True)
 '''
 
@@ -72,7 +72,7 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_launch_preferences_are_read_after_session_lease_admission(self):
         self.child.write_text(FAKE_CHILD.replace('Path("child.pid")', 'Path("child.args").write_text(json.dumps(sys.argv))\nPath("child.pid")'))
-        server = Server(SimpleNamespace(state_dir=str(self.root / "state"), profile="coding",
+        server = Server(SimpleNamespace(state_dir=str(self.root / "state"), profile="coding", runtime_profile="control-v1",
             aelix=sys.executable, aelix_arg=[str(self.child)], provider=None, model=None))
         session = Session(server, "stale", str(self.root))
         try:
@@ -83,6 +83,67 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--deny", argv)
             self.assertIn("--agents", argv)
             self.assertNotIn("--no-agents", argv)
+        finally:
+            await session.close()
+            server.db.close()
+
+    async def test_beta2_refuses_saved_restrictions_before_starting_a_child(self):
+        server = Server(SimpleNamespace(state_dir=str(self.root / "state"), profile="coding",
+            aelix=sys.executable, aelix_arg=[str(self.child)], provider=None, model=None))
+        try:
+            for index, preference in enumerate(({"agent": "reviewer"},)):
+                session = Session(server, f"restricted-{index}", str(self.root))
+                with server.db:
+                    save_preferences(server.db, session.id, preference)
+                try:
+                    with self.assertRaisesRegex(ProtocolError, "restrictions require"):
+                        await session.start()
+                    self.assertIsNone(session.proc)
+                    self.assertFalse((self.root / "child.pid").exists())
+                finally:
+                    await session.close()
+        finally:
+            server.db.close()
+
+    async def test_beta2_refuses_to_drop_tools_when_the_bridge_is_missing(self):
+        server = Server(SimpleNamespace(state_dir=str(self.root / "state"), profile="coding",
+            aelix=sys.executable, aelix_arg=[str(self.child)], provider=None, model=None))
+        session = Session(server, "tools", str(self.root))
+        try:
+            with server.db:
+                save_preferences(server.db, session.id, {"activeTools": []})
+            with self.assertRaisesRegex(ProtocolError, "Saved restrictions require"):
+                await session.start()
+        finally:
+            await session.close()
+            server.db.close()
+
+    async def test_control_v1_refuses_to_drop_preview_resource_selections(self):
+        server = Server(SimpleNamespace(state_dir=str(self.root / "state"), profile="coding", runtime_profile="control-v1",
+            aelix=sys.executable, aelix_arg=[str(self.child)], provider=None, model=None))
+        session = Session(server, "preview-selection", str(self.root))
+        try:
+            with server.db:
+                save_preferences(server.db, session.id, {"previewResources": {"inheritSkills": False}})
+            with self.assertRaisesRegex(ProtocolError, "explicit migration"):
+                await session.start()
+            self.assertIsNone(session.proc)
+        finally:
+            await session.close()
+            server.db.close()
+
+    async def test_beta2_recovers_full_access_and_delegation_with_visible_safe_defaults(self):
+        server = Server(SimpleNamespace(state_dir=str(self.root / "state"), profile="coding",
+            aelix=sys.executable, aelix_arg=[str(self.child)], provider=None, model=None))
+        session = Session(server, "preview-recovery", str(self.root))
+        try:
+            with server.db:
+                save_preferences(server.db, session.id, {"agentsEnabled": True, "permission_mode": "yolo"})
+            await session.start()
+            self.assertFalse(session.agents_enabled)
+            self.assertEqual(session.controls.permission_mode, "default")
+            self.assertEqual({warning["kind"] for warning in session.recovery_warnings},
+                             {"delegation_unavailable", "permission_mode_unavailable"})
         finally:
             await session.close()
             server.db.close()

@@ -1,5 +1,44 @@
 # Productization evidence — 2026-10-23
 
+## Actual provider and browser follow-up — 2026-10-24
+
+Installed ACP + the public beta.2 wheels passed **16 real Anthropic checks**,
+including actual Haiku/Sonnet turns, approved/denied file effects, reasoning,
+managed resources/profiles, stream cancellation and memory after ACP restart.
+The existing Studio browser renderer also passed model selection, actual
+messages, approval/denial, Stop and history restoration after reload.
+The [live validation record](live-validation.md) links source/artifact evidence,
+the screenshot and the original collector failures with their corrections.
+This establishes scoped macOS browser/native acceptance; OAuth, public WebUI
+authentication, other providers, packaged OS builds and release CI remain separate.
+
+## Current Preview strengthening — 2026-10-24
+
+The fixed final source passed **126 tests, zero skipped**, including **22**
+public beta.2 subprocess tests and **28** control-v1 subprocess tests. Native
+model responses are synthetic/local; process, file, permission and native API
+effects are real. Ruff, actionlint and diff checks passed. The installed wheel
+matches the runtime package source/assets; audited native source hashes match
+the original public-wheel investigation.
+
+The unchanged Studio AionCore host accepted that installed wheel, exposed real
+model choices and confirmed both fixture/two selection and a runtime setting
+as `observed`. This host probe makes no provider turn and does not establish
+renderer, packaged-app, team-model or OAuth acceptance. No Studio source was
+modified. No remote CI has run for this uncommitted working change.
+Exact source/wheel hashes, versions and remaining acceptance are recorded in
+[the strengthening evidence](reviews/evidence/2026-10-24-beta2-strengthening.json).
+
+## Historical native-control evidence
+
+The original native-control candidate evidence below is historical. The
+subsequent beta.2 preview work adds a separate public-wheel path and repins
+the control-v1 candidate to corrected native main `3a841059`. See
+[beta.2 preview](beta2-preview.md) for the current contract and
+[2026-10-24 strengthening evidence](reviews/evidence/2026-10-24-beta2-strengthening.json)
+for post-integration results, public-wheel provenance and limitations; no full native-suite result below
+is reattributed to the newer commit.
+
 Candidate: aelix-acp 0.2.0a1 + native runtime-control v1, exact source recorded
 in `runtime-reference.json`. This is a development candidate for Studio
 integration, not a release/packaged-app acceptance certificate.

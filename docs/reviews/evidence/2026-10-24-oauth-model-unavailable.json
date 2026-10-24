@@ -1,0 +1,19 @@
+{
+  "schema": "aelix-acp.oauth-live/1",
+  "provider": "openai-codex",
+  "credentialMode": "existing OAuth access only; no refresh token copied",
+  "apiKeySupplied": false,
+  "checks": [
+    {
+      "name": "oauth_authenticated_native_registry",
+      "status": "passed"
+    }
+  ],
+  "passed": false,
+  "failure": {
+    "type": "RuntimeError",
+    "message": "{\"code\": -32603, \"message\": \"OpenAI Codex request failed (400): {\\\"detail\\\":\\\"The 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT account.\\\",\\\"error\\\":{\\\"type\\\":\\\"invalid_request_error\\\",\\\"code\\\":\\\"model_not_found\\\",\\\"message\\\":\\\"The 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT account.\\\"}}\"}"
+  },
+  "seconds": 0.98,
+  "freshAuthorizationAndRealRefreshTested": false
+}

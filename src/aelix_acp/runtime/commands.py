@@ -5,6 +5,7 @@ import json
 import shlex
 
 from ..wire.errors import ProtocolError
+from .preview import methods as preview_methods
 
 BUILTINS = {
     "help": "List commands and runtime support",
@@ -48,6 +49,33 @@ BUILTINS = {
 ALIASES = {"rename": "name", "exit": "quit"}
 CLIENT_ACTIONS = {"clear", "login", "logout", "trust", "agents", "statusline", "hotkeys", "expand", "import"}
 
+CLASSIC_COMMANDS = {"help", "model", "thinking", "permissions", "mode", "follow-up", "compact",
+                    "cost", "stats", "session", "context", "name", "export", "copy", "tree", "quit"}
+CONTROL_COMMANDS = {"settings": "settings/get", "scoped-models": "settings/get",
+                    "tools": "resources/list", "skills": "resources/list", "hooks": "resources/list",
+                    "mcp": "mcp/status", "reload": "resources/reload", "extension": "extensions/list",
+                    "agents": "agents/list", "fork": "sessions/branch", "clone": "sessions/branch",
+                    "login": "auth/login", "logout": "auth/logout", "trust": "permissions/set"}
+
+
+def available_commands(session, dynamic=()):
+    """Publish only commands that the current runtime and client can actually serve."""
+    methods = set(session.controls.capabilities.get("methods", [])) | preview_methods(session)
+    names = CLASSIC_COMMANDS | {name for name, method in CONTROL_COMMANDS.items() if method in methods}
+    if preview_methods(session):
+        names -= {"hooks", "scoped-models"}
+    metadata = getattr(session.server, "client_capabilities", {}).get("_meta") or {}
+    if metadata.get("aelix/clientActions") is True:
+        names |= {"new", "resume", "clear", "statusline", "hotkeys", "expand", "import"}
+    catalog = [{"name": name, "description": description} for name, description in BUILTINS.items() if name in names]
+    if not session.controls.model_switching:
+        next(entry for entry in catalog if entry["name"] == "model")["description"] = "Show the current model; change launch settings and restart to select another"
+    if "commands/run" in methods:
+        catalog.extend({"name": command["name"], "description": command.get("description") or command["name"]}
+                       for command in dynamic if command.get("name") not in BUILTINS)
+    catalog.extend(command for command in getattr(session, "preview_commands", []) if command.get("name") not in BUILTINS)
+    return catalog
+
 
 def split_command(text: str) -> tuple[str, str] | None:
     # Leading whitespace and ordinary prose do not turn into control messages.
@@ -73,25 +101,39 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         return False, None
     name, raw = parsed
     args = raw.strip()
+    if preview_methods(session) and name in {"hooks", "scoped-models"}:
+        raise ProtocolError(f"/{name} requires native control v1", -32004)
+    required = CONTROL_COMMANDS.get(name)
+    if required and required not in set(session.controls.capabilities.get("methods", [])) | preview_methods(session):
+        raise ProtocolError(f"/{name} needs Aelix runtime control v1 ({required})", -32004,
+                            {"kind": "runtime_capability_required", "capability": required})
 
     async def output(value):
         rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
         await session.update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": rendered}})
 
     async def control(method, params=None):
+        if method in preview_methods(session):
+            from .preview import manage
+            return await manage(session, method, params or {})
         if method not in session.controls.capabilities.get("methods", []):
-            raise ProtocolError(f"/{name} needs Aelix runtime control v1 ({method}); update the Aelix runtime", -32004)
+            raise ProtocolError(f"/{name} needs Aelix runtime control v1 ({method})", -32004,
+                                {"kind": "runtime_capability_required", "capability": method})
         timeout = getattr(session.server.args, "command_timeout", 600) or None
         return await session.rpc("aelix_control", method=method, params=params or {}, _timeout=timeout)
 
     if name == "help":
-        await output("\n".join(f"/{command} — {description}" for command, description in BUILTINS.items()))
+        await output("\n".join(f"/{entry['name']} — {entry['description']}" for entry in available_commands(session)))
     elif name in {"model", "thinking", "permissions", "mode", "follow-up"}:
         option_id = {"model": "model", "thinking": "thinking_level", "permissions": "permission_mode",
                      "mode": "steeringMode", "follow-up": "followUpMode"}[name]
         if args:
             await session.controls.set(option_id, args)
-        await output(next((option for option in session.controls.options() if option["id"] == option_id), {}))
+        if name == "model" and not session.controls.model_switching:
+            from .controls import sanitize_model
+            await output({"currentModel": sanitize_model(session.state.get("model") or {}), "switching": False})
+        else:
+            await output(next((option for option in session.controls.options() if option["id"] == option_id), {}))
     elif name in {"cost", "stats", "context"}:
         await output(await session.rpc("get_session_stats"))
     elif name == "session":
@@ -149,7 +191,7 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
             await output(result)
         else:
             resources = await control("resources/list")
-            await output(resources.get(name, []))
+            await output(resources if name == "skills" and preview_methods(session) else resources.get(name, []))
     elif name == "settings":
         if not args:
             await output(await control("settings/get"))
@@ -197,6 +239,13 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
     else:
         # Extension commands, prompt templates and skills share Aelix's own
         # dispatch/expansion implementation. Never ask an LLM to emulate them.
+        if getattr(session, "compat", None) is not None and name in {c["name"] for c in session.preview_commands}:
+            result = await session.compat.call("commands/expand", {"text": text})
+            if result.get("outcome") == "prompt":
+                return True, result["prompt"]
+            raise ProtocolError(f"Unknown resource command: /{name}", -32601)
+        if "commands/run" not in session.controls.capabilities.get("methods", []) and name not in getattr(session, "native_commands", set()):
+            raise ProtocolError(f"Unknown slash command: /{name}", -32601, {"kind": "unknown_command", "command": name})
         result = await control("commands/run", {"text": text})
         for message in result.get("messages", []):
             await output(message["text"])

@@ -1,0 +1,105 @@
+{
+  "schema": "aelix-acp.preview-validation/1",
+  "date": "2026-10-23",
+  "timezone": "Asia/Seoul",
+  "host": "macOS arm64; CPython 3.12.13",
+  "source": {
+    "baseCommit": "8deb482bcd53261762979cf0e6ce1302dcc821c1",
+    "status": "uncommitted working change",
+    "sourceStable": true,
+    "fileSha256": {
+      ".github/workflows/test.yml": "77aff5b326a279f334c7f9e7c950da196decef17abcdae9f02c805539b1556e3",
+      "runtime-reference.json": "b0c58512352bfe60884794a68d51e37a2e856a3868a6d30b0825107934867327",
+      "scripts/probe_studio.py": "87a97260416c50abff5b50ed3e6c09884f1c010f79b228dce7b14e6483a89a25",
+      "scripts/test_beta2.py": "94dd01f10766f977daac6509695171f2108b6b437c3e8c23de2dcafe46b808cd",
+      "src/aelix_acp/bridge.py": "c37ac5779a462288d9cdf608d52266490043078d2a6ccacefc8337009530927c",
+      "src/aelix_acp/runtime/commands.py": "b91a1de6ac6b402af874f3b86c9c29e1519fd85e9fafd227aa57455337d45bf4",
+      "src/aelix_acp/runtime/controls.py": "d388691e3ee3295fdbca319162c2be14ed5bf85fd4722daf642c66911f25aa14",
+      "src/aelix_acp/server.py": "63258b35b1df9f8afa0c868cea58f67e3f8f656eab7cac6e67cab22ca6a369d4",
+      "src/aelix_acp/session.py": "49bfb0ffddccad2fd9f479e300ce3e8b1c84742f2a13514a2ec88147d2e017ca",
+      "tests/runtime_fixture.py": "b3201679fc8daa9d406c1c8eba6edbf301f06e67a1c2a4b5a4933241f040688d",
+      "tests/support.py": "4c8bfade5e9e8086e165a77ff8704edaa17d6a70dc10be489c7f7f1f8b9cff84",
+      "tests/test_beta2_runtime.py": "9794afbdc51d9c7e0be2f72932c02650956274eee9b1d05f3babac9b6c8bca9b",
+      "tests/test_controls.py": "4833a00b733b9a8e7965faf76fbcaf029cd373f24f3d90ac664e7fcc3b8f9e3c",
+      "tests/test_lifecycle.py": "c3305753d7b2ca08eee09abb1e2f1739e7907105520b37ffeecdae8220054b2e",
+      "tests/test_management.py": "e84c9e9224e94cbb0e4462f8b3f5fb9a8583d6c1dd6b0c5b568e92fab7610f89",
+      "tests/test_native_runtime.py": "55587f0f9ab557c4dc22bc07c9a6d2b596d87ae3e3f67d1296e788249b7f6f7e",
+      "tests/test_server.py": "7d55a4cd49c87c08b70f6262c40e5cb935cea3d44c4456e1b66d17d4813c8a53"
+    }
+  },
+  "preview": {
+    "runtimeProfile": "beta2",
+    "distributions": {
+      "aelix": {
+        "version": "0.1.0b2",
+        "sourceInstall": false
+      },
+      "aelix-ai": {
+        "version": "0.1.0b2",
+        "sourceInstall": false
+      },
+      "aelix-agent-core": {
+        "version": "0.1.0b2",
+        "sourceInstall": false
+      },
+      "aelix-coding-agent": {
+        "version": "0.1.0b2",
+        "sourceInstall": false
+      },
+      "openai": {
+        "version": "1.109.1",
+        "sourceInstall": false
+      }
+    }
+  },
+  "candidate": {
+    "runtimeProfile": "control-v1",
+    "commit": "3a841059ea518a0d849b912eb7ffd7d85bb87bcc",
+    "status": "native main candidate; not a released beta.3 wheel"
+  },
+  "checks": {
+    "combined": {
+      "passed": 112,
+      "skipped": 0,
+      "seconds": 38.34
+    },
+    "beta2BlackBox": 14,
+    "controlV1BlackBox": 28,
+    "wheelMatchesSource": true,
+    "wheelSha256": "25acae334c39555f2b53b47e392dad2010ea7fed5eb5ed9a9d91fcd6af3cf185",
+    "ruff": "passed",
+    "actionlint": "passed",
+    "diffCheck": "passed",
+    "offlineCandidateExtensionLifecycle": "passed"
+  },
+  "studio": {
+    "baseCommit": "3a8763cfd56acd52024b4a0634acaca7cedb48e4",
+    "backend": "AionCore v0.2.2; unchanged",
+    "probe": {
+      "evidence": "unchanged local AionCore + installed ACP wheel + published beta.2; no model turn",
+      "standardSession": true,
+      "configOptions": [
+        "permission_mode",
+        "thinking_level",
+        "steeringMode",
+        "followUpMode",
+        "autoCompactionEnabled",
+        "autoRetryEnabled"
+      ],
+      "settingConfirmation": "observed",
+      "modelSelector": "read-only",
+      "teamSession": true,
+      "teamCanBeDisabledByMetadata": true
+    },
+    "studioFilesModifiedByThisTask": false
+  },
+  "notRun": [
+    "remote CI for this change",
+    "released beta.3 wheel upgrade",
+    "real provider/OAuth",
+    "Studio renderer acceptance with beta.2",
+    "Analytics extension on this beta.2 environment",
+    "model-backed team delegation",
+    "Windows/Linux packaged or clean-machine acceptance"
+  ]
+}

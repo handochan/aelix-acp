@@ -1,5 +1,12 @@
 # Studio integration contract v1
 
+This document describes the explicit `--runtime-profile control-v1` candidate.
+The default beta.2 preview has a smaller standard-ACP surface; follow
+[beta.2 preview](beta2-preview.md) and
+[Studio minimum changes](studio-minimum-changes.md) for preview packaging.
+Preview also exposes `adapterMethods` and its separately documented resource/
+profile actions; do not require native version-1 capabilities for those actions.
+
 Handoff for the separate `aelix-studio` project. This is an API contract,
 not evidence that its UI is connected. Bundle the ACP version and exact
 native workspace commit from `runtime-reference.json` together. Older public

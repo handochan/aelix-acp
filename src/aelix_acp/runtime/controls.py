@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import contextlib
 
-from ..wire.errors import ProtocolError
+from ..wire.errors import BackendError, ProtocolError
 
 PERMISSION_MODES = (
     ("default", "Ask", "Request approval before every tool"),
@@ -15,18 +15,23 @@ PERMISSION_MODES = (
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
+def runtime_profile(session) -> str:
+    """Keep the published beta.2 path independent of unreleased native controls."""
+    return getattr(session.server.args, "runtime_profile", "beta2")
+
+
 def model_key(model: dict) -> str:
     return f"{model.get('provider', '')}/{model.get('id', '')}"
 
 
 def sanitize_model(model: dict) -> dict:
     # RPC Model records may contain provider HTTP headers. Never send those to a UI.
-    keys = ("id", "provider", "name", "reasoning", "thinkingLevelMap", "input", "contextWindow", "maxTokens")
+    keys = ("id", "provider", "name", "reasoning", "thinkingLevelMap", "supportedThinkingLevels", "input", "contextWindow", "maxTokens")
     return {key: model[key] for key in keys if key in model}
 
 
 def thinking_levels(model: dict, capabilities: dict) -> list[str]:
-    levels = capabilities.get("thinkingLevels")
+    levels = capabilities.get("thinkingLevels") or model.get("supportedThinkingLevels")
     if isinstance(levels, list) and levels and all(level in THINKING_LEVELS for level in levels):
         return levels
     if not model.get("reasoning"):
@@ -43,22 +48,46 @@ class SessionControls:
         self.models: list[dict] = []
         self.capabilities: dict = {}
         self.permission_mode = "default"
+        self.model_switching = False
+        self.extension_models = False
 
     async def refresh(self) -> None:
         self.session.state = await self.session.rpc("get_state")
+        self.extension_models = False
         try:
             catalog = await self.session.rpc("get_available_models")
             self.models = [sanitize_model(m) for m in catalog.get("models", []) if isinstance(m, dict)]
-        except ProtocolError:
-            # Older RPC fixtures/runtimes can still expose their actual launch model.
+            self.model_switching = True
+        except BackendError:
+            # The published beta.2 CLI does not bind ModelRegistry to its RPC
+            # dispatcher. Display its actual model, without advertising a setter.
             self.models = []
+            self.model_switching = False
+            if getattr(self.session, "compat", None) is not None:
+                catalog = await self.session.compat.call("models/list")
+                self.models = [sanitize_model(m) for m in catalog.get("models", []) if isinstance(m, dict)]
+                self.model_switching = True
+                self.extension_models = True
         current = sanitize_model(self.session.state.get("model") or {})
         if current.get("id") and not any(model_key(m) == model_key(current) for m in self.models):
             self.models.insert(0, current)
-        try:
-            self.capabilities = await self.session.rpc("aelix_control", method="capabilities", params={})
-        except ProtocolError:
-            self.capabilities = {}
+        self.capabilities = {}
+        if runtime_profile(self.session) == "control-v1":
+            try:
+                self.capabilities = await self.session.rpc("aelix_control", method="capabilities", params={})
+            except BackendError:
+                raise ProtocolError("This runtime does not implement control v1; use the beta2 profile", -32004,
+                                    {"kind": "runtime_capability_required", "capability": "control-v1"}) from None
+            if self.capabilities.get("version") != 1 or not isinstance(self.capabilities.get("methods"), list):
+                raise ProtocolError("This runtime does not implement control v1; use the beta2 profile", -32004,
+                                    {"kind": "runtime_capability_required", "capability": "control-v1"})
+
+    def permission_modes(self):
+        """Advertise advanced postures only when the native runtime can enforce them."""
+        if "permissions/set" not in self.capabilities.get("methods", []):
+            return PERMISSION_MODES[:1]
+        supported = self.capabilities.get("permissionModes", [])
+        return tuple(entry for entry in PERMISSION_MODES if entry[0] in supported) or PERMISSION_MODES[:1]
 
     def options(self) -> list[dict]:
         state = self.session.state
@@ -66,17 +95,19 @@ class SessionControls:
             "id": "permission_mode", "name": "Permissions", "category": "mode", "type": "select",
             "currentValue": self.permission_mode,
             "options": [{"value": value, "name": name, "description": description}
-                        for value, name, description in PERMISSION_MODES],
+                        for value, name, description in self.permission_modes()],
         }]
         current = state.get("model") or {}
         if current.get("id"):
-            options.append({
-                "id": "model", "name": "Model", "category": "model", "type": "select",
-                "currentValue": model_key(current),
-                "options": [{"value": model_key(m), "name": m.get("name") or m["id"],
-                             "description": m.get("provider", "")} for m in self.models or [current]],
-            })
-            levels = thinking_levels(current, self.capabilities)
+            if self.model_switching:
+                options.append({
+                    "id": "model", "name": "Model", "category": "model", "type": "select",
+                    "currentValue": model_key(current),
+                    "options": [{"value": model_key(m), "name": m.get("name") or m["id"],
+                                 "description": m.get("provider", "")} for m in self.models or [current]],
+                })
+            known = next((m for m in self.models if model_key(m) == model_key(current)), current)
+            levels = thinking_levels(known, self.capabilities)
             actual_level = state.get("thinkingLevel", state.get("thinking_level", "off"))
             if actual_level not in levels:
                 levels = [actual_level, *levels]
@@ -102,16 +133,19 @@ class SessionControls:
         result = {"configOptions": self.options(), "modes": {
             "currentModeId": self.permission_mode,
             "availableModes": [{"id": value, "name": name, "description": description}
-                               for value, name, description in PERMISSION_MODES],
+                               for value, name, description in self.permission_modes()],
         }}
         current = state.get("model") or {}
         if current.get("id"):
             result["models"] = {"currentModelId": model_key(current), "availableModels": [
                 {"modelId": model_key(m), "name": m.get("name") or m["id"], "description": m.get("provider", "")}
-                for m in self.models or [current]]}
+                for m in (self.models or [current]) if self.model_switching]}
         return result
 
     async def set(self, config_id: str, value: str, *, publish=True) -> dict:
+        if config_id == "model" and not self.model_switching:
+            raise ProtocolError("The current Aelix RPC does not expose its model registry; change the launch model and restart", -32004,
+                                {"kind": "runtime_capability_required", "capability": "model_registry"})
         option = next((option for option in self.options() if option["id"] == config_id), None)
         if not isinstance(config_id, str) or not isinstance(value, str) or not option or value not in [entry["value"] for entry in option["options"]]:
             raise ProtocolError(f"Unsupported value for {config_id}")
@@ -139,7 +173,14 @@ class SessionControls:
                 await self.session.update({"sessionUpdate": "current_mode_update", "currentModeId": value})
         elif config_id == "model":
             model = next(m for m in self.models if model_key(m) == value)
-            await self.session.rpc("set_model", provider=model["provider"], modelId=model["id"])
+            if self.extension_models:
+                await self.session.compat.call("models/set", {"model": value})
+                levels = thinking_levels(model, {})
+                current = self.session.state.get("thinkingLevel", "off")
+                if current not in levels:
+                    await self.session.rpc("set_thinking_level", level=levels[0])
+            else:
+                await self.session.rpc("set_model", provider=model["provider"], modelId=model["id"])
         elif config_id == "thinking_level":
             await self.session.rpc("set_thinking_level", level=value)
         else:

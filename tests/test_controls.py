@@ -7,6 +7,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import Server, Session, ProtocolError
+from aelix_acp.wire.errors import BackendError
 from aelix_acp.runtime.controls import thinking_levels
 from aelix_acp.runtime.policy import permission_decision
 
@@ -14,7 +15,7 @@ from aelix_acp.runtime.policy import permission_decision
 class ControlsTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.server = Server(SimpleNamespace(state_dir=self.temp.name, profile="coding"))
+        self.server = Server(SimpleNamespace(state_dir=self.temp.name, profile="coding", runtime_profile="control-v1"))
         self.session = Session(self.server, "session", self.temp.name)
         self.server.sessions[self.session.id] = self.session
         self.updates, self.calls = [], []
@@ -32,7 +33,8 @@ class ControlsTests(unittest.IsolatedAsyncioTestCase):
             if command == "get_available_models":
                 return {"models": [self.state["model"], {"provider": "p", "id": "two", "reasoning": False}]}
             if command == "aelix_control":
-                return {"version": 1}
+                return {"version": 1, "methods": ["permissions/set"],
+                        "permissionModes": ["default", "plan", "auto-accept-edits", "auto", "yolo"]}
             if command == "set_model":
                 self.state["model"] = {"provider": kwargs["provider"], "id": kwargs["modelId"], "reasoning": False}
                 self.state["thinkingLevel"] = "off"
@@ -97,6 +99,36 @@ class ControlsTests(unittest.IsolatedAsyncioTestCase):
             await self.session.controls.set("permission_mode", "yolo")
         self.assertEqual(self.session.controls.permission_mode, "default")
         self.session.done.cancel()
+
+    async def test_beta2_does_not_probe_or_advertise_native_controls(self):
+        self.server.args.runtime_profile = "beta2"
+        self.calls.clear()
+        await self.session.controls.refresh()
+        self.assertNotIn("aelix_control", [command for command, _arguments in self.calls])
+        self.assertEqual(self.session.controls.permission_modes()[0][0], "default")
+        self.assertEqual(len(self.session.controls.permission_modes()), 1)
+
+    async def test_missing_registry_preserves_current_model_without_a_false_selector(self):
+        original = self.session.rpc
+        async def unbound_registry(command, **arguments):
+            if command == "get_available_models":
+                raise BackendError("no ModelRegistry configured", command)
+            return await original(command, **arguments)
+        self.session.rpc = unbound_registry
+        await self.session.controls.refresh()
+        self.assertNotIn("model", {option["id"] for option in self.session.controls.options()})
+        self.assertEqual(self.session.selectors()["models"]["currentModelId"], "p/one/with/slashes")
+
+    async def test_model_catalog_timeout_is_not_silently_treated_as_legacy_support(self):
+        original = self.session.rpc
+        async def timeout(command, **arguments):
+            if command == "get_available_models":
+                raise ProtocolError("RPC deadline", -32007)
+            return await original(command, **arguments)
+        self.session.rpc = timeout
+        with self.assertRaises(ProtocolError) as error:
+            await self.session.controls.refresh()
+        self.assertEqual(error.exception.code, -32007)
 
 
 class PolicyTests(unittest.TestCase):

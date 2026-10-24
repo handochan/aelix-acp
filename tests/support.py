@@ -19,12 +19,19 @@ class AcpClient:
         self.dialog = None
 
     @classmethod
-    async def start(cls, root, aelix, *, extensions=(), capabilities=None, prefix=(), adapter_args=()):
+    async def start(cls, root, aelix, *, extensions=(), capabilities=None, prefix=(), adapter_args=(), runtime_profile="control-v1"):
         source = str(Path(__file__).resolve().parents[1] / "src")
         env = {key: os.environ[key] for key in ["PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"] if key in os.environ}
         env.update(HOME=str(root / "home"), USERPROFILE=str(root / "home"), PYTHONPATH=source,
-                   AELIX_CODING_AGENT_DIR=str(root / "agent"), AELIX_SETTINGS_PATH=str(root / "agent/settings.json"))
+                   AELIX_CODING_AGENT_DIR=str(root / "agent"), AELIX_SETTINGS_PATH=str(root / "agent/settings.json"),
+                   AELIX_AUTH_PATH=str(root / "agent/auth.json"))
         argv = [sys.executable, "-m", "aelix_acp.server", "--aelix", str(aelix), "--state-dir", str(root / "state")]
+        installed = os.environ.get("AELIX_ACP_TEST_INSTALLED_CLI")
+        if installed:
+            env.pop("PYTHONPATH", None)
+            argv = [installed, "--aelix", str(aelix), "--state-dir", str(root / "state")]
+        if runtime_profile is not None:
+            argv.extend(["--runtime-profile", runtime_profile])
         argv.extend(adapter_args)
         argv.extend("--aelix-arg=" + arg for arg in prefix)
         for extension in extensions:
@@ -32,7 +39,7 @@ class AcpClient:
         process = await asyncio.create_subprocess_exec(*argv, cwd=str(root), env=env, stdin=-1, stdout=-1, stderr=-1)
         client = cls(process)
         client.tasks = [asyncio.create_task(client.read()), asyncio.create_task(client.read_errors())]
-        await client.request("initialize", {"protocolVersion": 1, "clientCapabilities": capabilities or {}})
+        client.initialized = await client.request("initialize", {"protocolVersion": 1, "clientCapabilities": capabilities or {}})
         return client
 
     async def send(self, value):

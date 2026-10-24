@@ -1,0 +1,41 @@
+{
+  "schema": "aelix-acp.studio-real-provider/1",
+  "provider": "anthropic",
+  "syntheticEndpoint": false,
+  "checks": [
+    {
+      "name": "unchanged_studio_real_authenticated_catalog",
+      "status": "passed"
+    },
+    {
+      "name": "studio_backend_actual_haiku_turn",
+      "status": "passed"
+    },
+    {
+      "name": "studio_backend_actual_sonnet_turn",
+      "status": "passed"
+    },
+    {
+      "name": "studio_native_transcript_records_real_model_usage",
+      "status": "passed"
+    }
+  ],
+  "passed": true,
+  "authScope": "loopback-only isolated --local test host; not public WebUI auth acceptance",
+  "nativeTranscriptLocations": [
+    {
+      "insideIsolatedRoot": true,
+      "exists": true
+    },
+    {
+      "insideIsolatedRoot": true,
+      "exists": true
+    }
+  ],
+  "nativeModels": [
+    "claude-haiku-4-5",
+    "claude-sonnet-4-5"
+  ],
+  "nativeOutputTokens": 21,
+  "seconds": 7.55
+}

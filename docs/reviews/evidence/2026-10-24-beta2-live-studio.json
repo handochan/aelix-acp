@@ -1,0 +1,75 @@
+{
+  "schema": "aelix-acp.studio-real-provider/2",
+  "date": "2026-10-24",
+  "completedAt": "2026-10-24T16:01:03.311327+09:00",
+  "passed": true,
+  "provider": "anthropic",
+  "models": [
+    "claude-haiku-4-5",
+    "claude-sonnet-4-5"
+  ],
+  "syntheticEndpoint": false,
+  "scope": "Unchanged AionCore binary and prebuilt Studio browser renderer; loopback isolated test data",
+  "studioRepositoryHead": "3a8763cfd56acd52024b4a0634acaca7cedb48e4",
+  "artifactSha256": {
+    "backend": "04404864ca622159ffcc79ef9cb468e82fc820b91f16d565c5a5efdb0b0c4cb1",
+    "rendererIndex": "e6275d5b57b2704c79973626f3acc9a79236b47921e8bb420d689f1bc7ba65a4",
+    "rendererEntry": "f58363a7e711c7e19f31458b55891a50cdf9f5bc04ed5a34e4276331772499fb"
+  },
+  "browser": {
+    "passed": true,
+    "actualBrowserInteraction": true,
+    "checks": [
+      "real registry model picker and successful Haiku selection toast",
+      "UI_REAL_OK received after browser send",
+      "permission card waits before file creation",
+      "Allow once creates exact approved file",
+      "Reject leaves denied file absent",
+      "Stop button ends active provider stream",
+      "subsequent UI_AFTER_CANCEL_OK response",
+      "page reload restores actual transcript"
+    ],
+    "selectedModel": "anthropic/claude-haiku-4-5",
+    "screenshot": "2026-10-24-beta2-live-studio.jpg"
+  },
+  "hostChecks": [
+    {
+      "name": "unchanged_studio_real_authenticated_catalog",
+      "status": "passed"
+    },
+    {
+      "name": "studio_backend_actual_haiku_turn",
+      "status": "passed"
+    },
+    {
+      "name": "studio_backend_actual_sonnet_turn",
+      "status": "passed"
+    },
+    {
+      "name": "studio_native_transcript_records_real_model_usage",
+      "status": "passed"
+    }
+  ],
+  "nativeModels": [
+    "claude-haiku-4-5",
+    "claude-sonnet-4-5"
+  ],
+  "nativeOutputTokens": 21,
+  "evidenceRuns": {
+    "browserAndFileEffects": "2026-10-24-beta2-live-studio-ui-attempt.json",
+    "separateHostAndNativeUsage": "2026-10-24-beta2-live-studio-native.json"
+  },
+  "collectorCorrection": "Original post-UI usage collector assumed a directory; follow-up used authoritative ACP index paths, verified both models and positive output usage inside the isolated root. Original failed collector result retained.",
+  "cleanup": {
+    "temporaryHostStopped": true,
+    "temporaryBrowserTabClosed": true,
+    "isolatedDataRemoved": true
+  },
+  "notEstablished": [
+    "public WebUI authentication: this loopback fixture used --local plus a temporary fixture account",
+    "OAuth",
+    "packaged desktop or clean-machine acceptance",
+    "other providers",
+    "Studio dedicated tool/skill/profile management screens"
+  ]
+}

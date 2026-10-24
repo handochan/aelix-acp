@@ -1,0 +1,22 @@
+{
+  "publicBeta2": true,
+  "models": [
+    "fixture/one",
+    "fixture/two"
+  ],
+  "accepted": true,
+  "sameProcess": true,
+  "sameAcpSession": true,
+  "actualModelRequests": [
+    "one",
+    "two"
+  ],
+  "priorTurnPreserved": true,
+  "nativeFilesUnchanged": true,
+  "implementation": "ephemeral extension using public ctx.model_registry and api.set_model; authenticated loopback proof only",
+  "schema": "aelix-acp.registry-extension-probe/1",
+  "date": "2026-10-23",
+  "runtime": "published PyPI aelix==0.1.0b2 and matching component wheels",
+  "evidenceLevel": "real native/ACP processes with a synthetic local model endpoint",
+  "productionIntegrated": false
+}

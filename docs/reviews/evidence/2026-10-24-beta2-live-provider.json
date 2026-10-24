@@ -1,0 +1,127 @@
+{
+  "schema": "aelix-acp.beta2-real-provider/1",
+  "date": "2026-10-24",
+  "runtimeProfile": "beta2",
+  "provider": "anthropic",
+  "route": "native builtin https://api.anthropic.com; no base URL override",
+  "keySource": "existing environment or explicit env file; value never recorded",
+  "oauthTested": false,
+  "syntheticModelEndpoint": false,
+  "checks": [
+    {
+      "name": "public_beta2_authenticated_model_catalog",
+      "status": "passed"
+    },
+    {
+      "name": "actual_provider_turn",
+      "status": "passed",
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5"
+    },
+    {
+      "name": "actual_second_model_turn",
+      "status": "passed",
+      "model": "claude-sonnet-4-5"
+    },
+    {
+      "name": "actual_reasoning_turn",
+      "status": "passed",
+      "level": "low"
+    },
+    {
+      "name": "actual_model_tool_approved_write",
+      "status": "passed"
+    },
+    {
+      "name": "actual_model_tool_denial_no_file",
+      "status": "passed"
+    },
+    {
+      "name": "empty_tool_selection",
+      "status": "passed"
+    },
+    {
+      "name": "actual_prompt_template_turn_after_replacement",
+      "status": "passed"
+    },
+    {
+      "name": "actual_skill_command_turn",
+      "status": "passed"
+    },
+    {
+      "name": "disabled_skill_command_rejected",
+      "status": "passed"
+    },
+    {
+      "name": "actual_extension_enable_disable_replacement",
+      "status": "passed"
+    },
+    {
+      "name": "actual_native_profile_turn_and_grant_ceiling",
+      "status": "passed"
+    },
+    {
+      "name": "actual_provider_stream_cancel",
+      "status": "passed",
+      "seconds": 0.044
+    },
+    {
+      "name": "actual_provider_turn_after_cancel",
+      "status": "passed"
+    },
+    {
+      "name": "actual_provider_memory_after_adapter_restart",
+      "status": "passed",
+      "model": "anthropic/claude-haiku-4-5"
+    },
+    {
+      "name": "native_transcript_records_both_real_models_and_usage",
+      "status": "passed"
+    }
+  ],
+  "passed": true,
+  "distributionVersions": {
+    "aelix": "0.1.0b2",
+    "aelix-ai": "0.1.0b2",
+    "aelix-agent-core": "0.1.0b2",
+    "aelix-coding-agent": "0.1.0b2",
+    "aelix-acp": "0.2.0a1",
+    "anthropic": "0.125.0"
+  },
+  "installedAdapterMatchesSource": true,
+  "actualNativeTranscript": {
+    "assistantMessages": 12,
+    "models": [
+      "claude-haiku-4-5",
+      "claude-sonnet-4-5"
+    ],
+    "inputTokens": 17525,
+    "outputTokens": 388,
+    "reportedCostUsd": 0
+  },
+  "isolatedTemporaryDataRemoved": true,
+  "seconds": 13.72,
+  "adapterSourceSha256": {
+    "src/aelix_acp/__init__.py": "bfc7619fc56337102058e27a684be97e8dfc4bfcf25953cebd5b03296fcee77e",
+    "src/aelix_acp/bridge.py": "83270637528dfaff4f24dd749f3441b455cf052d9ad5f348825fa87ce8f9057d",
+    "src/aelix_acp/bridge_controls.py": "4cae69afbbc6f4823401ca95ee2b4376080fdbf37e2b264cbf21a564e1520233",
+    "src/aelix_acp/preview.py": "b6ae954188204f66c3a28417bb31a3b57d036cd96ff8e9722f13fc7058ff8201",
+    "src/aelix_acp/runtime/__init__.py": "d4c7c67f74bdab3ec54e6ebcffd635cf401b11de8349a1830c88276ca999af4f",
+    "src/aelix_acp/runtime/commands.py": "77ffb5c1182d06ecbf73c2b641fa4cd64d89590d3b9ac415003c21663a4caf05",
+    "src/aelix_acp/runtime/compat.py": "f1f07120e2f3700b1382510a70db09b93f3bedab98280471c4d31563282facde",
+    "src/aelix_acp/runtime/controls.py": "26691629d33fa7a54656a0396ac3a49eaba0cd2986f05e9205eb3b69b4561246",
+    "src/aelix_acp/runtime/extensions.py": "65cab8d766cb20aefc7d414f53d68701e11056cde525ef9b9765bd5106af38ef",
+    "src/aelix_acp/runtime/leases.py": "aa8dc2e955cfc7ab23a1fbe77d8e68602825204b64fee3d604ee2f5853f71a0f",
+    "src/aelix_acp/runtime/policy.py": "b53c822ba936ce919436d575a527d0928409ed1bb3c42786a061f32ddbe8b453",
+    "src/aelix_acp/runtime/preview.py": "1187dda56fc6fa52ec829b39ac93ba42d01f46c8eef213d7b297d1dbeaa86916",
+    "src/aelix_acp/runtime/store.py": "0583bac43042c2caabcb4daf383950445d84472b39bfb58888354ffe74234da4",
+    "src/aelix_acp/server.py": "0ef1789860309409c4a51b729a4d5ad24d7ae615158b7ef0246de6231d7c4e4e",
+    "src/aelix_acp/session.py": "aa8033aff76f6386bf19a76cbc5f4877b5dc07f24c0dcce8aa7333ba9838467f",
+    "src/aelix_acp/wire/__init__.py": "e8284569c4e42f031d90d6b735d75be00a52771985775c2b33d5f47e6beb2488",
+    "src/aelix_acp/wire/errors.py": "63538fb3e48a10b4cc3a78c177efed909e678753a88005ca0fea8da8ff1663db",
+    "src/aelix_acp/wire/process.py": "8957aa9471f8b8daa2247ed04ef93ea1405228c912596ca658cbced5947114a0",
+    "src/aelix_acp/wire/transport.py": "d06b87c17f9c09b1c3cdec3e695c54f700810b1cfb588da71f6faa6fcbc1728d"
+  },
+  "billingVerified": false,
+  "costNote": "Native reported cost is not a billing statement and does not establish free API use."
+}

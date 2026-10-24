@@ -1,6 +1,14 @@
 # ACP runtime-control boundary
 
-Status: development candidate, 2026-10-23.
+Status: development candidate, 2026-10-24.
+
+The default `beta2` profile targets the published PyPI wheels. It uses only
+classic RPC, public extension model/tool controls and explicit approval for every tool. `control-v1` is an explicit
+beta.3 candidate profile and requires the runtime pinned in
+`runtime-reference.json`. The control-specific sections below describe that
+candidate. See [beta.2 preview](beta2-preview.md) for the actual public-wheel
+limitations and [Studio minimum changes](studio-minimum-changes.md) for host
+acceptance. No native source backport is bundled into the preview.
 
 The adapter owns ACP v1 framing, presentation, process lifetime, session indexing
 and client approval. Aelix owns models, authentication, native sessions,
@@ -8,6 +16,14 @@ settings, extension dispatch, resources, permission posture and delegation.
 Shared behavior is exposed through an additive `aelix_control` envelope;
 the original 29-command RPC roster is unchanged. The adapter does not copy
 native command handlers or the credential store.
+
+Preview adapter methods are discovered separately from native capabilities.
+Its bounded authenticated extension channel exposes public model/tool APIs and
+native profile/resource parsing, not arbitrary private harness calls. Resource
+and profile changes replace the native child while retaining ACP identity and
+transcript. Tool choices cannot exceed the initial native launch grant.
+See [Preview contract](beta2-preview.md) for frame/deadline/cancellation limits
+and the narrower managed resource snapshot inventory.
 
 ## Protocol
 

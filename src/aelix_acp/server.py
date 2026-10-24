@@ -111,16 +111,22 @@ class Server:
                 require_object(capabilities["_meta"], "clientCapabilities._meta")
             self.initialized = True
             self.client_capabilities = capabilities
+            extended = getattr(self.args, "runtime_profile", "beta2") == "control-v1"
             return {"protocolVersion": 1,
                     "agentInfo": {"name": "aelix-acp", "title": f"Aelix {self.args.profile.title()}", "version": __version__},
                     "agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True, "image": True},
-                                          "mcpCapabilities": {"http": True, "sse": True},
+                                          "mcpCapabilities": {"http": extended, "sse": extended},
                                           "sessionCapabilities": {"list": {}, "delete": {}}}, "_meta": {"aelix/control": {"version": 1, "methods": ["_aelix/capabilities", "_aelix/manage"],
-                                "clientActionCapability": "aelix/clientActions"}}, "authMethods": []}
+                                "clientActionCapability": "aelix/clientActions"},
+                                "aelix/runtimeProfile": "control-v1" if extended else "beta2",
+                                "aelix/limitations": [] if extended else ["client_mcp_servers", "advanced_permission_modes", "native_command_dispatch", "delegation"]}, "authMethods": []}
         if method in ("session/new", "session/load"):
             cwd = str(Path(require_string(params.get("cwd"), "cwd")).expanduser().resolve())
             if not isinstance(params.get("mcpServers", []), list):
                 raise ProtocolError("mcpServers must be an array")
+            if getattr(self.args, "runtime_profile", "beta2") == "beta2" and params.get("mcpServers"):
+                raise ProtocolError("Client-supplied MCP servers require runtime control v1", -32004,
+                                    {"kind": "runtime_capability_required", "capability": "mcp/configure"})
             if not Path(cwd).is_dir():
                 raise ProtocolError("Session cwd must be an existing directory")
             session_file = None
@@ -262,8 +268,12 @@ class Server:
                 result = await session.controls.set(config_id, value)
             return result if method == "session/set_config_option" else {}
         if method == "_aelix/capabilities":
+            from .runtime.preview import methods as preview_methods
             session = self.session(params)
-            return {"version": 1, "runtime": session.controls.capabilities,
+            return {"version": 1, "runtimeProfile": getattr(self.args, "runtime_profile", "beta2"),
+                    "runtime": session.controls.capabilities,
+                    "adapterMethods": sorted(preview_methods(session)),
+                    "modelSwitching": session.controls.model_switching,
                     "configOptions": session.controls.options(), "clientActionMethod": "_aelix/client_action"}
         if method == "_aelix/manage":
             session = self.session(params)
@@ -275,6 +285,9 @@ class Server:
                 if action == "sessions/close":
                     await session.close()
                     return {}
+                if getattr(self.args, "runtime_profile", "beta2") == "beta2":
+                    from .runtime.preview import manage
+                    return await manage(session, action, arguments)
                 if action == "sessions/branch":
                     return await self.branch_session(session, arguments)
                 if action == "workspace/trust":
@@ -417,12 +430,16 @@ def main():
     parser.add_argument("--command-timeout", type=float, default=600, help="Seconds per extension command; 0 disables the deadline")
     parser.add_argument("--offline", action="store_true", help="Disable extension-manager catalog/package network access")
     parser.add_argument("--turn-timeout", type=float, default=600, help="Seconds per model turn; 0 disables this deadline")
-    parser.add_argument("--allow-legacy-runtime", action="store_true", help="Allow Aelix without runtime control v1, with reduced functionality")
+    parser.add_argument("--runtime-profile", choices=["beta2", "control-v1"], default="beta2",
+                        help="beta2: published preview RPC (default); control-v1: explicitly paired beta.3 candidate")
+    parser.add_argument("--allow-legacy-runtime", action="store_true", help="Deprecated: beta2 is now the default runtime profile")
     parser.add_argument("--extension-manager", help="Writable Aelix CLI used for extension package management")
     parser.add_argument("--extension", action="append", default=[], help="Explicit trusted Aelix extension path (repeatable)")
     parser.add_argument("--provider")
     parser.add_argument("--model")
     args = parser.parse_args()
+    if args.allow_legacy_runtime and args.runtime_profile != "beta2":
+        parser.error("--allow-legacy-runtime cannot be combined with --runtime-profile control-v1")
     if args.max_sessions < 1 or args.max_sessions > 256 or any(not math.isfinite(value) or value < 0 for value in (args.turn_timeout, args.command_timeout)):
         parser.error("max-sessions must be 1..256 and timeouts must be finite and nonnegative")
     try:

@@ -1,8 +1,16 @@
 {
   "repository": "https://github.com/handochan/aelix-ai",
-  "commit": "10854a2d4cfc089cdf021c3f2e251bce9f230d94",
+  "commit": "3a841059ea518a0d849b912eb7ffd7d85bb87bcc",
   "runtimeControlVersion": 1,
   "workspaceInstallRequired": true,
   "minimumPython": "3.11",
-  "status": "development-candidate"
+  "status": "beta3-development-candidate",
+  "runtimeProfile": "control-v1",
+  "preview": {
+    "runtimeProfile": "beta2",
+    "distribution": "aelix",
+    "version": "0.1.0b2",
+    "source": "PyPI wheels only",
+    "minimumPython": "3.11"
+  }
 }

@@ -1,0 +1,36 @@
+{
+  "schema": "aelix-acp.oauth-live/1",
+  "provider": "openai-codex",
+  "credentialMode": "existing OAuth access only; no refresh token copied",
+  "apiKeySupplied": false,
+  "checks": [
+    {
+      "name": "oauth_authenticated_native_registry",
+      "status": "passed"
+    },
+    {
+      "name": "real_oauth_provider_response_without_api_key",
+      "status": "passed"
+    },
+    {
+      "name": "oauth_session_reopen_and_real_model_memory",
+      "status": "passed"
+    },
+    {
+      "name": "native_transcript_confirms_oauth_api_and_usage",
+      "status": "passed"
+    },
+    {
+      "name": "source_oauth_store_unchanged",
+      "status": "passed"
+    }
+  ],
+  "passed": true,
+  "nativeUsage": {
+    "assistantMessages": 2,
+    "api": "openai-codex-responses",
+    "outputTokens": 20
+  },
+  "seconds": 4.19,
+  "freshAuthorizationAndRealRefreshTested": false
+}

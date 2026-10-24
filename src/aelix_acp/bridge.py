@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import runpy
 from pathlib import Path
 
 from aelix_agent_core.harness.hooks import ToolCallResult
@@ -48,7 +49,11 @@ async def before_tool(event, ctx):
                                       "writeAllowed": write_allowed}) + "\n").encode())
             await writer.drain()
             answer = json.loads(await reader.readline())
-        if answer.get("allow") is True:
+        if not isinstance(answer, dict) or type(answer.get("allow")) is not bool:
+            return ToolCallResult(block=True, reason="ACP permission channel returned an invalid response")
+        if answer.get("error"):
+            return ToolCallResult(block=True, reason="ACP permission unavailable: " + str(answer["error"]))
+        if answer["allow"] is True:
             return None
         return ToolCallResult(block=True, reason="User declined this tool in the ACP client")
     except (OSError, ValueError, TimeoutError) as exc:
@@ -56,7 +61,10 @@ async def before_tool(event, ctx):
     finally:
         if writer is not None:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
 
 
 def setup(aelix):
@@ -65,5 +73,6 @@ def setup(aelix):
     nonce = os.environ.get("AELIX_ACP_NONCE")
     if not ready_file or not nonce:
         raise RuntimeError("ACP bridge must be launched by aelix-acp")
+    runpy.run_path(str(Path(__file__).with_name("bridge_controls.py")))["install"](aelix)
     Path(ready_file).write_text(nonce)
     os.chmod(ready_file, 0o600)

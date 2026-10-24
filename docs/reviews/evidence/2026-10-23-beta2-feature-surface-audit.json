@@ -1,0 +1,264 @@
+{
+  "toolBridge": {
+    "subsetActive": [
+      "read"
+    ],
+    "subsetSentToModel": [
+      "read"
+    ],
+    "emptyActive": [],
+    "emptySentToModel": [],
+    "unknownRejected": true,
+    "restored": true
+  },
+  "nativeProfileStartup": {
+    "thinking": "high",
+    "activeTools": [
+      "read"
+    ],
+    "profileSystemPromptApplied": true,
+    "selectedSkillAdvertised": true,
+    "ambientSkillExcluded": true,
+    "selectedExtensionLoaded": true,
+    "actualModel": "one",
+    "integration": "native parse_profile + profile_to_flags; passed through existing ACP native prefix arguments",
+    "directAgentFlagWithExtensions": "conflicts with current ACP --no-extensions; requires ACP launch adaptation"
+  },
+  "publicBeta2": true,
+  "evidenceLevel": "actual native and ACP processes, public APIs, synthetic local model",
+  "productionIntegrated": false,
+  "schema": "aelix-acp.beta2-feature-surface-audit/1",
+  "date": "2026-10-23",
+  "nativeDistributions": {
+    "aelix": "0.1.0b2",
+    "aelix-ai": "0.1.0b2",
+    "aelix-agent-core": "0.1.0b2",
+    "aelix-coding-agent": "0.1.0b2"
+  },
+  "sourceSha256": {
+    "aelix_coding_agent/tui/commands.py": "5cc922a49c55e69e24864ac50f9f8f121ad40155d1c3a60b31dcca128f73b4f7",
+    "aelix_coding_agent/tui/extension_manager.py": "b413613729a34c0e3240488a74e03e0c8ab0bde812cd5c6b5b7c9bce0b302e33",
+    "aelix_coding_agent/tui/settings_rows.py": "76cdc09b5d9a11e4acc2bc1d6f611a51f13af65bbc372faa1022cff151782cf1",
+    "aelix_coding_agent/extensions/api.py": "93be1de710c44976f87876ee4c5a13cc8f84092d7cfbdaab187413705dfca48f",
+    "aelix_coding_agent/extensions/command_dispatch.py": "cfc8467b83c029ee000c1027f010f382b0937b6744b47361a79c262d85dfd1fd",
+    "aelix_coding_agent/extensions/command_context.py": "ce81c426f69c81e387a63ad6b45ebca851f38340db90eb5539cc263ad45e0243",
+    "aelix_coding_agent/agents/profile.py": "d104f95cd3986d364d4820c9e55035af114280548437bd3b400751828c8da61a",
+    "aelix_coding_agent/agents/service.py": "1d975536ebbeb7e62b3bc109ee7ee7e952f686971a34b1986ce6044e66a328b5",
+    "aelix_coding_agent/agents/resolver.py": "dabca15d4f4a51114fb0b49d3f8b532f148fd9244e10d24ab437118da4e18147",
+    "aelix_coding_agent/cli/entry.py": "2a3c6102df66dcbae9ce57c5677562c4d6d1ae718b53bf8b0f37c4e22acbe2e0",
+    "aelix_coding_agent/cli/resource_commands.py": "fcb7c5a46123b3314d1de81f3f011bcf886af498cd1799ec3253d5ff8ace45f5",
+    "aelix_coding_agent/builtin/permission.py": "835289420820a78406073dc6526a9e372aa5a9f771e81191b11da307cfa9d9df",
+    "aelix_coding_agent/builtin/permission_mode.py": "0a78dd85fb96aa5a7cba2ed212f251a562e28d61306c64cbd4f092ea9ddbf79c",
+    "aelix_agent_core/harness/core.py": "8ecf063205582a219f58b5aa5ae79e39e0a9d6ef5d53972dc5af5d5e3d73a6e7"
+  },
+  "tuiBuiltinCommands": [
+    {
+      "name": "help",
+      "description": "List available commands",
+      "line": 2191
+    },
+    {
+      "name": "hotkeys",
+      "description": "Show keyboard shortcuts",
+      "line": 2192
+    },
+    {
+      "name": "model",
+      "description": "Show or switch the active model",
+      "line": 2193
+    },
+    {
+      "name": "login",
+      "description": "Sign in / add a provider API key",
+      "line": 2194
+    },
+    {
+      "name": "trust",
+      "description": "Decide project trust for this folder",
+      "line": 2195
+    },
+    {
+      "name": "logout",
+      "description": "Remove a provider's stored credentials",
+      "line": 2196
+    },
+    {
+      "name": "clear",
+      "description": "Clear the scrollback transcript",
+      "line": 2197
+    },
+    {
+      "name": "compact",
+      "description": "Compact the conversation context",
+      "line": 2198
+    },
+    {
+      "name": "cost",
+      "description": "Show session token / cost usage",
+      "line": 2199
+    },
+    {
+      "name": "stats",
+      "description": "Session usage statistics (tools, tokens, models)",
+      "line": 2200
+    },
+    {
+      "name": "session",
+      "description": "Show session info (id, cwd, name, usage)",
+      "line": 2201
+    },
+    {
+      "name": "name",
+      "description": "Show or set the session name",
+      "line": 2202
+    },
+    {
+      "name": "thinking",
+      "description": "Show, pick, or set the reasoning level",
+      "line": 2203
+    },
+    {
+      "name": "tools",
+      "description": "List registered tools",
+      "line": 2204
+    },
+    {
+      "name": "skills",
+      "description": "List loaded skills",
+      "line": 2205
+    },
+    {
+      "name": "agents",
+      "description": "List, show, switch, or delegate to agent profiles",
+      "line": 2206
+    },
+    {
+      "name": "hooks",
+      "description": "List registered hook handlers (read-only)",
+      "line": 2211
+    },
+    {
+      "name": "mcp",
+      "description": "Show MCP server status (servers, state, tool counts)",
+      "line": 2212
+    },
+    {
+      "name": "extension",
+      "description": "Manage installed extensions + MCP servers",
+      "line": 2213
+    },
+    {
+      "name": "context",
+      "description": "Show context-window usage + compaction thresholds",
+      "line": 2214
+    },
+    {
+      "name": "mode",
+      "description": "Show or set the steering mode",
+      "line": 2215
+    },
+    {
+      "name": "permissions",
+      "description": "Show or cycle the permission posture (shift+tab)",
+      "line": 2216
+    },
+    {
+      "name": "settings",
+      "description": "View and change settings (modes, theme, thinking, \u2026)",
+      "line": 2219
+    },
+    {
+      "name": "scoped-models",
+      "description": "Choose which models are enabled",
+      "line": 2220
+    },
+    {
+      "name": "statusline",
+      "description": "Configure the status line segments",
+      "line": 2223
+    },
+    {
+      "name": "expand",
+      "description": "Show the full output of a truncated tool result",
+      "line": 2224
+    },
+    {
+      "name": "export",
+      "description": "Export the transcript to HTML",
+      "line": 2225
+    },
+    {
+      "name": "copy",
+      "description": "Copy the last assistant message to the clipboard",
+      "line": 2226
+    },
+    {
+      "name": "resume",
+      "description": "Resume a previous session",
+      "line": 2227
+    },
+    {
+      "name": "new",
+      "description": "Start a fresh session",
+      "line": 2228
+    },
+    {
+      "name": "import",
+      "description": "Import a JSONL session file and swap to it",
+      "line": 2229
+    },
+    {
+      "name": "fork",
+      "description": "Fork the current session at the last user message",
+      "line": 2230
+    },
+    {
+      "name": "clone",
+      "description": "Clone the current session into a new file",
+      "line": 2231
+    },
+    {
+      "name": "tree",
+      "description": "Show the parent-session lineage",
+      "line": 2232
+    },
+    {
+      "name": "quit",
+      "description": "Exit Aelix (alias: /exit)",
+      "line": 2233
+    },
+    {
+      "name": "reload",
+      "description": "Reload extensions + resources",
+      "line": 2234
+    }
+  ],
+  "nativeProfileFields": [
+    "approval_mode",
+    "builtin_tools",
+    "context_files",
+    "description",
+    "extensions",
+    "inherit_extensions",
+    "inherit_skills",
+    "model",
+    "name",
+    "output_cap",
+    "provider",
+    "role",
+    "skills",
+    "system_prompt",
+    "thinking",
+    "timeout_ms",
+    "tools"
+  ],
+  "registryProbe": "2026-10-23-beta2-registry-extension-proof.json",
+  "notEstablished": [
+    "production integration of beta2 model/tool bridges",
+    "general extension-command context bridge",
+    "native live permission-posture control through public extension API",
+    "all combinations of profile switching",
+    "real provider or OAuth",
+    "Studio UI implementation of resource/profile management"
+  ]
+}

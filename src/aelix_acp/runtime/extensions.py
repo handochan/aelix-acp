@@ -49,6 +49,9 @@ async def _run_extension_action(server, session, raw) -> dict:
     action, *arguments = parts
     if action in {"enable", "disable", "reload"}:
         if action == "reload":
+            if getattr(session, "compat", None) is not None:
+                from .preview import manage
+                return await manage(session, "resources/reload", {})
             result = await session.rpc("aelix_control", method="resources/reload", params={},
                                        _timeout=getattr(server.args, "command_timeout", 600) or None)
             await session.controls.refresh()
@@ -59,6 +62,8 @@ async def _run_extension_action(server, session, raw) -> dict:
         if len(arguments) != 1:
             raise ProtocolError(f"/extension {action} requires one extension path or native module reference")
         reference = extension_reference(arguments[0], session.cwd)
+        if action == "disable" and getattr(session, "compat", None) is not None and reference not in session.extra_extensions:
+            raise ProtocolError("Only adapter-selected extensions can be disabled here; change the owning launch configuration or native profile")
         if action == "enable" and Path(reference).is_absolute() and not Path(reference).exists():
             raise ProtocolError("Extension source path does not exist")
         await require_consent(server, session, f"{action} extension", {"source": reference})
@@ -69,6 +74,12 @@ async def _run_extension_action(server, session, raw) -> dict:
             selected.append(reference)
         if action == "disable":
             selected = [entry for entry in selected if entry != reference]
+        if getattr(session, "compat", None) is not None:
+            # Do not report the loader's per-extension success: the public
+            # beta.2 API exposes no authoritative loader-error inventory.
+            from .preview import restart
+            await restart(session, extensions=selected)
+            return {"enabledExtensions": selected, "restarted": True, "loadState": "not_observed"}
         await session.restart(extensions=selected)
         resources = await session.rpc("aelix_control", method="resources/list", params={})
         errors = resources.get("extensionErrors", [])

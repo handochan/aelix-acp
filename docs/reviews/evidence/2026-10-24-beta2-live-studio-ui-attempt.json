@@ -1,0 +1,48 @@
+{
+  "schema": "aelix-acp.studio-real-provider/1",
+  "provider": "anthropic",
+  "syntheticEndpoint": false,
+  "checks": [
+    {
+      "name": "unchanged_studio_real_authenticated_catalog",
+      "status": "passed"
+    },
+    {
+      "name": "studio_backend_actual_haiku_turn",
+      "status": "passed"
+    },
+    {
+      "name": "studio_backend_actual_sonnet_turn",
+      "status": "passed"
+    },
+    {
+      "name": "studio_browser_actual_response_and_approved_denied_files",
+      "status": "passed"
+    }
+  ],
+  "passed": false,
+  "authScope": "loopback-only isolated --local test host; not public WebUI auth acceptance",
+  "browser": {
+    "passed": true,
+    "actualBrowserInteraction": true,
+    "checks": [
+      "real registry model picker and successful Haiku selection toast",
+      "UI_REAL_OK received after browser send",
+      "permission card waits before file creation",
+      "Allow once creates exact approved file",
+      "Reject leaves denied file absent",
+      "Stop button ends active provider stream",
+      "subsequent UI_AFTER_CANCEL_OK response",
+      "page reload restores actual transcript"
+    ],
+    "selectedModel": "anthropic/claude-haiku-4-5",
+    "screenshot": "2026-10-24-beta2-live-studio.jpg"
+  },
+  "failure": {
+    "type": "AssertionError",
+    "message": "",
+    "stage": "post-ui native transcript collection",
+    "diagnostic": "Collector assumed agent/sessions instead of using the ACP session index. Browser actions and file effects passed; native usage was independently rechecked through index paths."
+  },
+  "seconds": 461.9
+}

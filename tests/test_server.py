@@ -207,8 +207,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.session.state = {"model": {"provider": "test", "id": "model-one"}}
         models = self.session.selectors()["models"]
         self.assertEqual(models["currentModelId"], "test/model-one")
-        with self.assertRaisesRegex(ProtocolError, "Unsupported value"):
+        with self.assertRaisesRegex(ProtocolError, "model registry") as error:
             await self.server.dispatch("session/set_model", {"sessionId": self.session.id, "modelId": "other/model"})
+        self.assertEqual(error.exception.code, -32004)
 
     async def test_analytics_result_emits_a_separate_preview_link(self):
         root = Path(self.tmp.name)

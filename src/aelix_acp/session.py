@@ -22,17 +22,20 @@ import uuid
 from .wire.errors import ProtocolError, BackendError, require_object, require_string
 from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter
-from .runtime.controls import SessionControls, PERMISSION_MODES
+from .runtime.controls import SessionControls, runtime_profile
 from .runtime.policy import permission_decision
 from .runtime.store import save_preferences, load_preferences, append_event, begin_turn, finish_turn
-from .runtime.commands import BUILTINS, execute as execute_slash
+from .runtime.commands import available_commands, execute as execute_slash
 from .runtime.extensions import extension_reference
 from .runtime.leases import acquire as acquire_lease
+from .runtime.compat import ExtensionControls
+from .runtime.preview import profile_flags, resource_flags
 
 PACKAGE = Path(__file__).resolve().parent
 KINDS = {"read": "read", "grep": "search", "find": "search", "ls": "read",
          "write": "edit", "edit": "edit", "bash": "execute", "aelix_status": "read",
          "analytics_status": "read", "analytics_query": "read"}
+UNSET = object()
 
 
 
@@ -65,6 +68,8 @@ class Session:
         self.tools = {}
         self.tool_arrived = asyncio.Event()
         self.recovery_warnings = []
+        self.native_commands = set()
+        self.preview_commands = []
         self.permissions = set()
         self.permission_connections = set()
         self.ui_tasks = set()
@@ -77,6 +82,7 @@ class Session:
         self.socket_dir = None
         self.socket_server = None
         self.permission_token = None
+        self.compat = None
         self.controls = SessionControls(self)
         self.mutation_lock = asyncio.Lock()
         self.restore_launch_preferences()
@@ -84,6 +90,8 @@ class Session:
 
     def restore_launch_preferences(self):
         preferences = load_preferences(self.server.db, self.id)
+        self.preview_resources = preferences.get("previewResources", {})
+        self.preview_profile = preferences.get("previewProfile")
         self.active_tools = preferences.get("activeTools")
         if self.active_tools is not None and (not isinstance(self.active_tools, list) or any(not isinstance(name, str) for name in self.active_tools)):
             raise ProtocolError("Invalid saved tool selection")
@@ -106,6 +114,23 @@ class Session:
                 raise ProtocolError("Saved session changed before it could be opened; load it again", -32000)
             self.index_snapshot = None
         self.restore_launch_preferences()  # Re-read under the acquired lease, not the constructor's stale snapshot.
+        self.recovery_warnings = []
+        if runtime_profile(self) == "control-v1" and (self.preview_profile or self.preview_resources):
+            raise ProtocolError("Saved beta.2 resource/profile selections require explicit migration before control-v1", -32004)
+        if runtime_profile(self) == "beta2":
+            preferences = load_preferences(self.server.db, self.id)
+            if preferences.get("agent"):
+                raise ProtocolError("Saved tool/profile restrictions require the control-v1 runtime profile", -32004,
+                                    {"kind": "runtime_capability_required", "capability": "tools/set_active"})
+            if self.client_mcp:
+                raise ProtocolError("Client-supplied MCP servers require runtime control v1", -32004,
+                                    {"kind": "runtime_capability_required", "capability": "mcp/configure"})
+            if getattr(self.server.args, "enable_agents", False):
+                raise ProtocolError("ACP delegation requires the control-v1 runtime profile", -32004)
+            if self.agents_enabled:
+                self.agents_enabled = False
+                self.recovery_warnings.append({"kind": "delegation_unavailable",
+                    "message": "Saved delegation is disabled in the beta.2 preview."})
         self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
         os.chmod(self.socket_dir, 0o700)
         self.permission_token = secrets.token_urlsafe(32)
@@ -114,6 +139,9 @@ class Session:
         endpoint = json.dumps({"host": "127.0.0.1", "port": address[1], "token": self.permission_token})
         args = [self.server.args.aelix, *getattr(self.server.args, "aelix_arg", []), "--mode", "rpc", "--offline", "--no-extensions",
                 "--append-system-prompt-file", str(PACKAGE / "profiles" / f"{self.server.args.profile}.md")]
+        if runtime_profile(self) == "beta2":
+            args += profile_flags(self.preview_profile)
+            args += resource_flags(self.preview_resources, self.cwd)
         args += ["--agents" if self.agents_enabled else "--no-agents"]
         if self.trust_project is not None:
             args += ["--approve" if self.trust_project else "--deny"]
@@ -137,6 +165,14 @@ class Session:
         ready_file = Path(self.socket_dir) / "ready"
         env = dict(os.environ, AELIX_ACP_ENDPOINT=endpoint, PYTHONUNBUFFERED="1",
                    AELIX_ACP_READY_FILE=str(ready_file), AELIX_ACP_NONCE=nonce)
+        env.pop("AELIX_ACP_CONTROLS_FILE", None)
+        controls_file = Path(self.socket_dir) / "controls.json"
+        if runtime_profile(self) == "beta2":
+            env["AELIX_ACP_CONTROLS_FILE"] = str(controls_file)
+            env["AELIX_ACP_PROJECT_TRUSTED"] = str(self.trust_project is True).lower()
+            env["AELIX_ACP_SELECTED_RESOURCES"] = json.dumps({
+                "skills": [args[i + 1] for i, value in enumerate(args[:-1]) if value == "--skill"],
+                "promptTemplates": [args[i + 1] for i, value in enumerate(args[:-1]) if value == "--prompt-template"]})
         self.proc = await asyncio.create_subprocess_exec(
             *args, cwd=self.cwd, env=env, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -147,10 +183,16 @@ class Session:
         self.state = await self.rpc("get_state")
         if not ready_file.is_file() or ready_file.read_text() != nonce:
             raise ProtocolError("The tool approval bridge did not load; refusing this session", -32603)
+        self.compat = None
+        if runtime_profile(self) == "beta2" and controls_file.is_file() and not controls_file.is_symlink():
+            address = json.loads(controls_file.read_text())
+            if (address.get("version") != 1 or address.get("host") != "127.0.0.1" or address.get("nonce") != nonce or
+                    type(address.get("port")) is not int or not 0 < address["port"] < 65536):
+                raise ProtocolError("Invalid extension controls endpoint", -32603)
+            self.compat = ExtensionControls(address, self.permission_token)
+        if runtime_profile(self) == "beta2" and self.compat is None and (self.active_tools is not None or self.preview_profile or self.preview_resources):
+            raise ProtocolError("Saved restrictions require the beta.2 extension controls bridge", -32004)
         await self.controls.refresh()
-        if self.controls.capabilities.get("version") != 1 and not getattr(self.server.args, "allow_legacy_runtime", False):
-            raise ProtocolError("Aelix runtime control v1 is required; update Aelix, or explicitly use --allow-legacy-runtime for reduced functionality", -32004)
-        self.recovery_warnings = []
         if self.client_mcp:
             if "mcp/configure" not in self.controls.capabilities.get("methods", []):
                 raise ProtocolError("This Aelix runtime cannot accept client MCP servers; update its control API", -32004)
@@ -180,7 +222,11 @@ class Session:
         restored = preferences.get("permission_mode", "default")
         if profile_failed and restored != "plan":
             restored = "default"  # Never recover a missing restricted identity into silent writes.
-        if restored in {entry[0] for entry in PERMISSION_MODES}:
+        if restored not in {entry[0] for entry in self.controls.permission_modes()}:
+            self.recovery_warnings.append({"kind": "permission_mode_unavailable", "previousValue": restored,
+                "message": "The saved permission mode is unavailable; every tool now requires explicit approval."})
+            restored = "default"
+        if restored in {entry[0] for entry in self.controls.permission_modes()}:
             if self.controls.capabilities.get("permissionModes"):
                 await self.rpc("aelix_control", method="permissions/set", params={"mode": restored})
             self.controls.permission_mode = restored
@@ -191,6 +237,9 @@ class Session:
         self.save()
 
     async def restore_tools(self):
+        if self.active_tools is not None and self.compat is not None:
+            await self.compat.call("tools/set_active", {"names": self.active_tools})
+            return
         if self.active_tools is not None and "tools/set_active" in self.controls.capabilities.get("methods", []):
             resources = await self.rpc("aelix_control", method="resources/list", params={})
             available = {tool["name"] for tool in resources.get("tools", [])}
@@ -242,6 +291,7 @@ class Session:
             "config": {option["id"]: option["currentValue"] for option in self.controls.options()},
             "agent": self.controls.capabilities.get("activeAgent"),
             "activeTools": self.active_tools,
+            "previewResources": self.preview_resources, "previewProfile": self.preview_profile,
             "trustProject": self.trust_project, "agentsEnabled": self.agents_enabled,
             "backendMessageCount": self.state.get("messageCount", self.state.get("message_count", 0))})
         self.server.db.commit()
@@ -394,6 +444,7 @@ class Session:
         owner = asyncio.current_task()
         self.permission_connections.add(owner)
         allowed = False
+        channel_error = None
         try:
             async with asyncio.timeout(300):
                 request = json.loads(await reader.readline())
@@ -439,12 +490,14 @@ class Session:
                                                "toolCallId": call["toolCallId"], "status": "in_progress"})
                     finally:
                         self.permissions.discard(permission_task)
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError) as exc:
             allowed = False
+            channel_error = None if self.cancelled else type(exc).__name__
         finally:
             self.permission_connections.discard(owner)
             with contextlib.suppress(ConnectionError):
-                writer.write((json.dumps({"allow": allowed and not self.cancelled}) + "\n").encode())
+                writer.write((json.dumps({"allow": allowed and not self.cancelled,
+                                         **({"error": channel_error} if channel_error else {})}) + "\n").encode())
                 await writer.drain()
             writer.close()
             with contextlib.suppress(ConnectionError):
@@ -455,9 +508,9 @@ class Session:
         dynamic = data.get("commands", [])
         if self.server.args.profile == "analytics" and not any(c.get("name") == "analytics" for c in dynamic):
             raise ProtocolError("The Analytics extension did not register its command; refusing this profile", -32603)
-        catalog = [{"name": name, "description": description} for name, description in BUILTINS.items()]
-        catalog.extend({"name": c["name"], "description": c.get("description") or c["name"]}
-                       for c in dynamic if c.get("name") not in BUILTINS)
+        self.native_commands = {command["name"] for command in dynamic}
+        self.preview_commands = (await self.compat.call("commands/list"))["commands"] if self.compat else []
+        catalog = available_commands(self, dynamic)
         await self.update({"sessionUpdate": "available_commands_update", "availableCommands": catalog})
 
     async def handle_ui(self, event):
@@ -480,7 +533,8 @@ class Session:
             self.proc.stdin.write((json.dumps({"type": "extension_ui_response", "id": event.get("id"), **answer}) + "\n").encode())
             await self.proc.stdin.drain()
 
-    async def restart(self, *, extensions=None, trust_project=None, agents_enabled=None):
+    async def restart(self, *, extensions=None, trust_project=None, agents_enabled=None,
+                      preview_profile=UNSET, preview_resources=None, reset_config=False):
         if self.id in self.server.starting_ids:
             raise ProtocolError("Session is already starting", -32000)
         self.server.starting_ids.add(self.id)
@@ -503,7 +557,18 @@ class Session:
                 self.trust_project = trust_project
             if agents_enabled is not None:
                 self.agents_enabled = agents_enabled
+            if preview_profile is not UNSET:
+                self.preview_profile = preview_profile
+            if preview_resources is not None:
+                self.preview_resources = preview_resources
+            if reset_config:
+                self.active_tools = None
             self.save()
+            if reset_config:
+                preferences = load_preferences(self.server.db, self.id)
+                preferences["config"] = {}
+                save_preferences(self.server.db, self.id, preferences)
+                self.server.db.commit()
             await self.start(filename)
             await self.commands()
             await self.publish_recovery_warnings()
@@ -630,6 +695,8 @@ class Session:
     async def cancel(self):
         self.cancelled = True
         self.tool_arrived.set()
+        if self.compat is not None:
+            self.compat.cancel_pending()
         if self.management_task and not self.management_task.done():
             self.management_task.cancel()
         for task in [*self.permission_connections, *self.permissions, *self.ui_tasks]:
@@ -649,6 +716,8 @@ class Session:
         await asyncio.shield(self._close_task)
 
     async def _close(self):
+        if self.compat is not None:
+            self.compat.cancel_pending()
         for task in list(self.permission_connections):
             task.cancel()
         await asyncio.gather(*self.permission_connections, return_exceptions=True)

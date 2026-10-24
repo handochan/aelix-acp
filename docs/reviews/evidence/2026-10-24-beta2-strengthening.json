@@ -1,0 +1,145 @@
+{
+  "schema": "aelix-acp.beta2-strengthening/1",
+  "date": "2026-10-24",
+  "timezone": "Asia/Seoul",
+  "host": "macOS arm64; CPython 3.12.13",
+  "source": {
+    "baseCommit": "8deb482bcd53261762979cf0e6ce1302dcc821c1",
+    "status": "uncommitted working change",
+    "sourceStable": true,
+    "fileSha256": {
+      ".github/workflows/test.yml": "77aff5b326a279f334c7f9e7c950da196decef17abcdae9f02c805539b1556e3",
+      "runtime-reference.json": "b0c58512352bfe60884794a68d51e37a2e856a3868a6d30b0825107934867327",
+      "scripts/probe_studio.py": "6904e9c952bab6abf9cb653d8e16bd29d30503e05ab0c1517db58bfb37fd46e1",
+      "scripts/test_beta2.py": "94dd01f10766f977daac6509695171f2108b6b437c3e8c23de2dcafe46b808cd",
+      "src/aelix_acp/bridge.py": "83270637528dfaff4f24dd749f3441b455cf052d9ad5f348825fa87ce8f9057d",
+      "src/aelix_acp/bridge_controls.py": "4cae69afbbc6f4823401ca95ee2b4376080fdbf37e2b264cbf21a564e1520233",
+      "src/aelix_acp/runtime/commands.py": "77ffb5c1182d06ecbf73c2b641fa4cd64d89590d3b9ac415003c21663a4caf05",
+      "src/aelix_acp/runtime/compat.py": "f1f07120e2f3700b1382510a70db09b93f3bedab98280471c4d31563282facde",
+      "src/aelix_acp/runtime/controls.py": "26691629d33fa7a54656a0396ac3a49eaba0cd2986f05e9205eb3b69b4561246",
+      "src/aelix_acp/runtime/extensions.py": "65cab8d766cb20aefc7d414f53d68701e11056cde525ef9b9765bd5106af38ef",
+      "src/aelix_acp/runtime/preview.py": "1187dda56fc6fa52ec829b39ac93ba42d01f46c8eef213d7b297d1dbeaa86916",
+      "src/aelix_acp/server.py": "0ef1789860309409c4a51b729a4d5ad24d7ae615158b7ef0246de6231d7c4e4e",
+      "src/aelix_acp/session.py": "aa8033aff76f6386bf19a76cbc5f4877b5dc07f24c0dcce8aa7333ba9838467f",
+      "tests/runtime_fixture.py": "b3201679fc8daa9d406c1c8eba6edbf301f06e67a1c2a4b5a4933241f040688d",
+      "tests/support.py": "4c8bfade5e9e8086e165a77ff8704edaa17d6a70dc10be489c7f7f1f8b9cff84",
+      "tests/test_beta2_runtime.py": "5602104eedfc1ce45de23e769b11ae95332d9d1b3bffb86857475787bd672703",
+      "tests/test_controls.py": "4833a00b733b9a8e7965faf76fbcaf029cd373f24f3d90ac664e7fcc3b8f9e3c",
+      "tests/test_extension_controls.py": "7aec9498f3476831e835a9933be7ecf35ec8aec9816330328709693d7c0b12a8",
+      "tests/test_lifecycle.py": "5539e34a4dbabe3c4a821cb39c427dcb941ffc01942235631082f3c9998e5af7",
+      "tests/test_management.py": "418b08929d82b414cc14a3986da834863e85d8ad9c6dc4db1c41114dc9b12e64",
+      "tests/test_native_runtime.py": "55587f0f9ab557c4dc22bc07c9a6d2b596d87ae3e3f67d1296e788249b7f6f7e",
+      "tests/test_server.py": "7d55a4cd49c87c08b70f6262c40e5cb935cea3d44c4456e1b66d17d4813c8a53"
+    }
+  },
+  "preview": {
+    "runtimeProfile": "beta2",
+    "distributions": {
+      "aelix": {
+        "version": "0.1.0b2",
+        "sourceInstall": false
+      },
+      "aelix-ai": {
+        "version": "0.1.0b2",
+        "sourceInstall": false
+      },
+      "aelix-agent-core": {
+        "version": "0.1.0b2",
+        "sourceInstall": false
+      },
+      "aelix-coding-agent": {
+        "version": "0.1.0b2",
+        "sourceInstall": false
+      },
+      "openai": {
+        "version": "1.109.1",
+        "sourceInstall": false
+      }
+    },
+    "auditedNativeSourceUnchanged": true,
+    "auditedNativeFileSha256": {
+      "aelix_coding_agent/tui/commands.py": "5cc922a49c55e69e24864ac50f9f8f121ad40155d1c3a60b31dcca128f73b4f7",
+      "aelix_coding_agent/tui/extension_manager.py": "b413613729a34c0e3240488a74e03e0c8ab0bde812cd5c6b5b7c9bce0b302e33",
+      "aelix_coding_agent/tui/settings_rows.py": "76cdc09b5d9a11e4acc2bc1d6f611a51f13af65bbc372faa1022cff151782cf1",
+      "aelix_coding_agent/extensions/api.py": "93be1de710c44976f87876ee4c5a13cc8f84092d7cfbdaab187413705dfca48f",
+      "aelix_coding_agent/extensions/command_dispatch.py": "cfc8467b83c029ee000c1027f010f382b0937b6744b47361a79c262d85dfd1fd",
+      "aelix_coding_agent/extensions/command_context.py": "ce81c426f69c81e387a63ad6b45ebca851f38340db90eb5539cc263ad45e0243",
+      "aelix_coding_agent/agents/profile.py": "d104f95cd3986d364d4820c9e55035af114280548437bd3b400751828c8da61a",
+      "aelix_coding_agent/agents/service.py": "1d975536ebbeb7e62b3bc109ee7ee7e952f686971a34b1986ce6044e66a328b5",
+      "aelix_coding_agent/agents/resolver.py": "dabca15d4f4a51114fb0b49d3f8b532f148fd9244e10d24ab437118da4e18147",
+      "aelix_coding_agent/cli/entry.py": "2a3c6102df66dcbae9ce57c5677562c4d6d1ae718b53bf8b0f37c4e22acbe2e0",
+      "aelix_coding_agent/cli/resource_commands.py": "fcb7c5a46123b3314d1de81f3f011bcf886af498cd1799ec3253d5ff8ace45f5",
+      "aelix_coding_agent/builtin/permission.py": "835289420820a78406073dc6526a9e372aa5a9f771e81191b11da307cfa9d9df",
+      "aelix_coding_agent/builtin/permission_mode.py": "0a78dd85fb96aa5a7cba2ed212f251a562e28d61306c64cbd4f092ea9ddbf79c",
+      "aelix_agent_core/harness/core.py": "8ecf063205582a219f58b5aa5ae79e39e0a9d6ef5d53972dc5af5d5e3d73a6e7"
+    }
+  },
+  "candidate": {
+    "runtimeProfile": "control-v1",
+    "commit": "3a841059ea518a0d849b912eb7ffd7d85bb87bcc",
+    "status": "main candidate, not a released beta.3 wheel"
+  },
+  "checks": {
+    "combined": {
+      "passed": 126,
+      "skipped": 0,
+      "seconds": 53.811
+    },
+    "beta2BlackBox": 22,
+    "controlV1BlackBox": 28,
+    "wheelMatchesSource": true,
+    "wheelSha256": "6f5f296a0c0454f3cdb339288fe2e4c64b2e767f77fadd1a84adb2473c5df7f5",
+    "ruff": "passed",
+    "actionlint": "passed",
+    "diffCheck": "passed",
+    "totalVerificationSeconds": 60.41
+  },
+  "integrated": [
+    "public-native-registry model selection through standard ACP config",
+    "native model reasoning support",
+    "live tool selection including empty set and persistence",
+    "launch-grant ceiling enforcement",
+    "extension enable/disable through owned replacement",
+    "skill allowlist and managed skill/template slash expansion",
+    "native profile create/list/show/use/clear and preserved history",
+    "consent denial before effects",
+    "authenticated endpoint and native idle rejection",
+    "model-hook cancellation with original ACP error response and usable subsequent session",
+    "profile trust and changed-file fail-closed recovery",
+    "consistent replacement completion on cancellation"
+  ],
+  "studio": {
+    "baseCommit": "3a8763cfd56acd52024b4a0634acaca7cedb48e4",
+    "backend": "AionCore v0.2.2; unchanged source",
+    "probe": {
+      "evidence": "unchanged local AionCore + installed ACP wheel + published beta.2; no model turn",
+      "standardSession": true,
+      "configOptions": [
+        "permission_mode",
+        "model",
+        "thinking_level",
+        "steeringMode",
+        "followUpMode",
+        "autoCompactionEnabled",
+        "autoRetryEnabled"
+      ],
+      "settingConfirmation": "observed",
+      "modelSelector": "public-extension-bridge",
+      "modelConfirmation": "observed",
+      "selectedModel": "fixture/two",
+      "teamSession": true,
+      "teamCanBeDisabledByMetadata": true
+    },
+    "studioFilesModifiedByThisTask": false
+  },
+  "notRun": [
+    "remote CI for this change",
+    "real provider/model or OAuth",
+    "released beta.3 wheel upgrade/migration",
+    "Studio renderer management UI acceptance",
+    "model-backed team/delegation effects",
+    "Windows/Linux packaged or clean-machine acceptance",
+    "beta.2 extension package install/update/remove lifecycle",
+    "Analytics extension acceptance on beta.2"
+  ]
+}

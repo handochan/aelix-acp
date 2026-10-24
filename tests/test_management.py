@@ -18,7 +18,7 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.server = Server(SimpleNamespace(state_dir=self.temp.name, profile="coding", aelix="/fake/aelix"))
+        self.server = Server(SimpleNamespace(state_dir=self.temp.name, profile="coding", aelix="/fake/aelix", runtime_profile="control-v1"))
         self.session = Session(self.server, "session", self.temp.name)
         self.messages = []
         async def send(message):
@@ -35,6 +35,59 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["protocolVersion"], 1)
         with self.assertRaisesRegex(ProtocolError, "Already initialized"):
             await self.server.dispatch("initialize", {"protocolVersion": 1})
+
+    async def test_default_preview_reports_transport_limits_and_blocks_management(self):
+        self.server.args.runtime_profile = "beta2"
+        result = await self.server.dispatch("initialize", {"protocolVersion": 1})
+        self.assertFalse(result["agentCapabilities"]["mcpCapabilities"]["http"])
+        self.server.sessions[self.session.id] = self.session
+        for action in ("settings/set", "extensions/action", "workspace/trust", "agents/enable"):
+            with self.subTest(action=action), self.assertRaises(ProtocolError) as error:
+                await self.server.dispatch("_aelix/manage", {"sessionId": self.session.id, "action": action})
+            self.assertEqual(error.exception.code, -32004)
+
+    async def test_preview_cancel_pending_consent_never_begins_replacement(self):
+        self.server.args.runtime_profile = "beta2"
+        self.session.compat = SimpleNamespace(cancel_pending=lambda: None)
+        self.server.sessions[self.session.id] = self.session
+        entered = asyncio.Event()
+        async def consent(method, params):
+            entered.set()
+            await asyncio.Event().wait()
+        self.server.client_request = consent
+        with patch.object(self.session, "restart") as replacement:
+            task = asyncio.create_task(self.server.dispatch("_aelix/manage", {"sessionId": self.session.id,
+                "action": "resources/reload"}))
+            await asyncio.wait_for(entered.wait(), 2)
+            await self.session.cancel()
+            with self.assertRaises(ProtocolError) as caught:
+                await asyncio.wait_for(task, 2)
+            self.assertEqual(caught.exception.code, -32003)
+            replacement.assert_not_called()
+
+    async def test_preview_cancel_during_replacement_waits_for_consistent_completion(self):
+        self.server.args.runtime_profile = "beta2"
+        self.session.compat = SimpleNamespace(cancel_pending=lambda: None)
+        self.server.sessions[self.session.id] = self.session
+        entered, release, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        async def consent(method, params):
+            return {"outcome": {"outcome": "selected", "optionId": "allow-once"}}
+        async def replacement(**params):
+            entered.set()
+            await release.wait()
+            completed.set()
+        self.server.client_request = consent
+        self.session.restart = replacement
+        task = asyncio.create_task(self.server.dispatch("_aelix/manage", {"sessionId": self.session.id,
+            "action": "resources/reload"}))
+        await asyncio.wait_for(entered.wait(), 2)
+        await self.session.cancel()
+        self.assertFalse(task.done())
+        release.set()
+        with self.assertRaises(ProtocolError) as caught:
+            await asyncio.wait_for(task, 2)
+        self.assertEqual(caught.exception.code, -32003)
+        self.assertTrue(completed.is_set())
 
     async def test_malformed_client_capabilities_are_rejected(self):
         with self.assertRaises(ProtocolError):
@@ -115,6 +168,8 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         async def rpc(command, **arguments):
             calls.append((command, arguments))
+            if command == "aelix_control" and arguments.get("method") == "capabilities":
+                return {"version": 1, "methods": []}
             return {}
         self.session.rpc = rpc
         for timeout in (147, 0):
