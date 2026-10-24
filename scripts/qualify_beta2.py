@@ -22,6 +22,13 @@ from beta2_wire import isolated_environment, probe_adapter, probe_native
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def native_help(executable):
+    # Public beta.2 loads cwd .env before handling --help.
+    with tempfile.TemporaryDirectory(prefix="beta2-help-") as temporary:
+        return subprocess.check_output([str(executable), "--help"], text=True, timeout=20,
+                                       cwd=temporary, env=isolated_environment(Path(temporary)))
+
+
 def adapter_receipt(entrypoint, compare_checkout=True):
     python = entrypoint.parent / ("python.exe" if os.name == "nt" else "python")
     if not python.is_file():
@@ -72,9 +79,7 @@ def main():
         if not native.is_file() or not adapter.is_file():
             raise ValueError("Installed native and ACP entrypoints are required")
         report["installedAdapter"] = adapter_receipt(adapter)
-        with tempfile.TemporaryDirectory(prefix="beta2-help-") as temporary:
-            help_text = subprocess.check_output([str(native), "--help"], text=True, timeout=20,
-                                                env=isolated_environment(Path(temporary)))
+        help_text = native_help(native)
         for flag in manifest["cliFlags"]:
             if flag not in help_text:
                 raise ValueError("Missing public CLI flag: " + flag)

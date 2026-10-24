@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "scope": "public-wheel and synthetic-model qualification; no real-provider/host/installer acceptance",
-  "recordedAt": "2026-10-24T21:50:42.888423+00:00",
+  "recordedAt": "2026-10-24T21:54:33.483974+00:00",
   "platform": "Darwin/arm64",
   "python": "3.12.13",
   "nativeBaselineManifestSha256": "2556a257fc853381cf2ada63dc6cfd9fc1531533ed8d6819610ac0c6db971809",
@@ -14,7 +14,7 @@
   "productNativePatches": [],
   "status": "passed",
   "harnessSourceSha256": {
-    "qualify_beta2.py": "68a429132929c59b7a30060fe58096b7bd3ea1fb9d50f667467738ac3349bbfc",
+    "qualify_beta2.py": "4e502f836be23186854a4e050d4deea9098e49ad4766c22db4d12f9786c5db5a",
     "beta2_identity.py": "d70b0342b752b918c46f1afb252ec9723dec4188252995b1611241ebf3f062e4",
     "beta2_probe.py": "dfe4171bde58ffc25b64452eaa6200ba5c7634a25344b0b4d68e388dad65d963",
     "beta2_wire.py": "ad91771588f096d832c21f46f6e6f48a005b69d6f1efb4c9233beee5bd4304a8"

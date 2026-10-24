@@ -11,9 +11,27 @@ import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from beta2_identity import check_wheel, compare_payload
 from beta2_wire import isolated_environment
+from qualify_beta2 import native_help
 
 
 class WheelIdentityTests(unittest.TestCase):
+    def test_help_cannot_read_the_calling_projects_dotenv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project = root / "project"
+            project.mkdir()
+            (project / ".env").write_text("SYNTHETIC_PRIVATE_SENTINEL")
+            executable = root / "help-probe"
+            executable.write_text("#!/usr/bin/env python3\nfrom pathlib import Path\n"
+                                  "print(Path('.env').read_text() if Path('.env').exists() else 'ISOLATED_HELP')\n")
+            executable.chmod(0o700)
+            previous = Path.cwd()
+            try:
+                os.chdir(project)
+                self.assertEqual(native_help(executable).strip(), "ISOLATED_HELP")
+            finally:
+                os.chdir(previous)
+
     def test_children_do_not_inherit_user_provider_keys_or_pythonpath(self):
         with patch.dict(os.environ, {"PATH": "/fixture/bin", "ANTHROPIC_API_KEY": "sentinel",
                                      "OPENAI_API_KEY": "sentinel", "PYTHONPATH": "/private/source",
