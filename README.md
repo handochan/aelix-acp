@@ -43,7 +43,9 @@ bin/aelix-acp --profile analytics \
 
 - ACP v1 stdio 초기화, 세션 생성·목록·복구, 사용자·에이전트 이력 재생
 - 텍스트·추론 스트리밍과 도구 시작·결과·실패 표시, 파일 위치 전달
-- 모든 도구의 실행 전 ACP **Allow once / Reject** 승인
+- Ask: 모든 도구의 실행 전 ACP **Allow once / Reject** 승인
+- 로컬 개발 후보의 Yolo: client 질문 생략, native guardrail·도구 제한·승인 bridge 유지
+- idle 모드 변경 시 동일 native 이력으로 worker 재시작·설정 보존
 - 승인 대기 중 취소 시 거부 처리, RPC abort, 자식 프로세스 종료 시 오류 반환
 - Aelix `get_commands`에서 가져오는 명령 목록
 - 텍스트, 텍스트 내장 리소스, 파일 리소스 링크 입력
@@ -53,6 +55,11 @@ bin/aelix-acp --profile analytics \
 완료합니다. 브리지가 없거나 소켓이 끊기거나 승인 시간이 지나면 도구를
 차단합니다. 승인 소켓은 세션별 0700 임시 디렉터리의 0600 Unix 소켓입니다.
 이는 로컬 실행 승인 경로이며 OS 샌드박스나 악성 확장 격리를 제공하지 않습니다.
+
+ACP #5 개발 후보의 초기 모드는 `--permission-mode default|yolo`이며 저장 세션은
+기록된 모드를 복원합니다. Ask/Yolo 동작과 추가 Plan/Auto Edit/Auto의 가능성은
+[권한 검증 기록](docs/beta2/permissions.md)에 구분합니다. 실제 AionCore에서 실패한
+권한 변경 뒤 표시와 실행 정책이 달라지는 수용 blocker가 있어 제품 완료 상태는 아닙니다.
 
 AionUi가 전달하는 MCP 서버는 Aelix에 전달하지 않습니다. 비어 있지 않으면
 대화에 제한을 알립니다. Aelix 자체에 설정된 MCP 서버는 별도 설정입니다.

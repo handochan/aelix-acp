@@ -41,6 +41,9 @@ jobs:
       - name: Verify sessionless management and installed ACP contracts (no host)
         run: |
           .local/native/bin/python scripts/qualify_management.py --adapter .local/native/bin/aelix-acp --native-only --report .local/management-qualification.json
+      - name: Verify Ask/Yolo effects and audit additional native modes (no host)
+        run: |
+          .local/native/bin/python scripts/qualify_permissions.py --adapter .local/native/bin/aelix-acp --report .local/permission-qualification.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -48,4 +51,5 @@ jobs:
           path: |
             .local/qualification.json
             .local/management-qualification.json
+            .local/permission-qualification.json
           if-no-files-found: error
