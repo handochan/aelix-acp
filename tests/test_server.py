@@ -105,10 +105,14 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         await self.session.event({"type": "message_end", "message": {"error_message": "provider unavailable"}})
         self.assertEqual(self.session.failure, "provider unavailable")
 
-    async def test_mode_cannot_disable_approvals(self):
+    async def test_only_verified_permission_modes_are_exposed(self):
         self.server.sessions[self.session.id] = self.session
-        with self.assertRaisesRegex(ProtocolError, "approval-required"):
-            await self.server.dispatch("session/set_mode", {"sessionId": self.session.id, "modeId": "yolo"})
+        for mode in ("plan", "auto-accept-edits", "auto", [], "unknown"):
+            with self.assertRaisesRegex(ProtocolError, "Only Ask"):
+                await self.server.dispatch("session/set_mode", {"sessionId": self.session.id, "modeId": mode})
+        async def idle(command, **params):
+            return {"isStreaming": False}
+        self.session.rpc = idle
         self.assertEqual(await self.server.dispatch("session/set_mode", {
             "sessionId": self.session.id, "modeId": "default"}), {})
 

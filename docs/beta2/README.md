@@ -9,6 +9,10 @@ records sessionless native API probes and the actual pinned AionCore path,
 including request identity, cancellation, unsupported methods and shared-store
 limits. It does not add a production helper to this adapter.
 
+[ACP #5 permissions](permissions.md) implements the local Ask/Yolo candidate and
+audits three additional native modes. Its actual-host receipt retains a
+display/effective-state blocker instead of declaring product acceptance.
+
 ## Source and wheel identity
 
 [manifest.json](manifest.json) pins all four public `0.1.0b2` wheels by filename,
