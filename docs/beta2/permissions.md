@@ -3,8 +3,10 @@
 2026-10-25. Base ACP main `2128cc8d36afd1ae6537988f0117c5393d09b927`, four
 unmodified public native `0.1.0b2` wheels from [the fixed manifest](manifest.json),
 AionCore `v0.2.2` / `47e66d0d151123e973b3fd1e77afcb5671b3f8c5`.
-This is local candidate implementation and qualification. **ACP #5 product
-acceptance remains blocked by a host display/effective-state mismatch.**
+This is candidate implementation and qualification. **The released-host pairing
+still has a display/effective-state mismatch.** A separately identified Studio
+source-build recovery candidate passes the additional local checks below;
+reviewed host delivery remains outstanding before ACP #5 product acceptance.
 Studio #5 is owned by its separate execution session; this change edits no Studio
 code, native wheel or private control-v1 candidate.
 
@@ -154,9 +156,54 @@ active-tool selection, broken bridge, same-identity history/mode resume, forced
 downgrade failure and repeated Stop during native startup. Source regressions
 also exercise late prompt save, missing transcript, cancelled old-worker cleanup
 and notification ordering. Existing public-wheel and management qualifiers are
-rerun separately. Remote CI has not run for this unpushed candidate.
+rerun separately. The production candidate `f5d1d5a` was pushed and its
+[exact-head CI](https://github.com/handochan/aelix-acp/actions/runs/40165836359)
+passed 6/6. That CI does not run the macOS host or renderer; it does not establish
+the later recovery harness changes as remotely verified.
 
-Studio source/UI, native wheels, auth roots and shared manifests are unchanged.
-No new renderer, real-provider/OAuth, Windows/Linux host/installer, field or
-closed-network installation acceptance is claimed. Current POSIX socket and
+This ACP branch changes no Studio product source, native wheels, auth roots or
+shared manifests. Real-provider/OAuth, Windows/Linux host/installer, field and
+closed-network installation acceptance remain unrun. Current POSIX socket and
 16 MiB/aggregate-history limitations remain.
+
+## Studio #16 local recovery qualification
+
+The Studio worktree `codex/studio-16-permission-recovery` contains an explicit
+source-built AionCore candidate, its reviewed patch, source manifest, builder and
+actual Electron smoke. It changes three host source files from the same public
+upstream pin; all 1,420 original archive files are verified. Native beta.2 wheels
+remain unmodified. It is distinct from the released host baseline and is not
+silently substituted into its receipt or manifest.
+
+The [recovery receipt](permissions-recovery-qualification.json) records **20
+native effects, 11 installed ACP checks and 10 actual host checks**. The host
+reports `default` (Ask) after the forced downgrade failure, requires consent and
+does not write before approval. Its corrected mode/configuration is observed in
+SQLite through a read-only connection before the host exits. A new host OS
+process then reloads the same conversation as Ask and again requests consent
+without a write. A later explicit Yolo selection still performs the tool effect.
+The candidate binary SHA256 is
+`cc243bf7f789aa3f47dc73638a2bd96cbd14cbc55cb538f81128aad763274c03`.
+
+Another session independently reran all those cases and the Studio Electron
+smoke (**7 checks**): the existing selector and Reconnect control show the
+restored `default` permission (Korean label `기본값`), actual Allow once/Reject
+buttons render, cancellation leaves no file, and later explicit Yolo writes.
+Source tests are now **35/35**, including rejection of unidentified host bytes
+and drifted binary/patch receipts.
+
+```sh
+.local/native/bin/python -B scripts/qualify_permissions.py \
+  --adapter /absolute/path/to/installed/acp/bin/aelix-acp \
+  --host /absolute/task/recovery-host/aioncore \
+  --host-receipt /absolute/task/recovery-host/build-receipt.json \
+  --host-source-manifest /absolute/studio/scripts/studio-preview/host-recovery/source.json \
+  --report .local/permissions-recovery.json
+```
+
+Both identity arguments are required for a candidate. They bind the exact
+binary, build receipt, reviewed manifest and adjacent patch. Omitting them
+retains the released-host digest check and reproduces its known mismatch.
+The candidate receipt reports `passed_with_source_built_candidate`; it does not
+make the released host pass or complete all of Studio #16. ACP #5 remains open
+pending reviewed host integration/delivery, and Studio #5 remains separate.

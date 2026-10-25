@@ -49,3 +49,23 @@ Plan/Auto Edit/Auto modes remain an assessment, not advertised implementations.
 Real-provider/OAuth, renderer, Windows/Linux host/installer, field and remote CI
 were not accepted by this local review. Existing baseline/management and the
 new no-host CI command are checked separately.
+
+## Studio #16 recovery follow-up
+
+The reviewer independently verified the separately identified patched host:
+all 1,420 original source files, exactly three declared changes, patch/manifest/
+Cargo.lock/LICENSE/binary identities; **35/35** ACP source tests; native **20**,
+installed ACP **11**, host **10**, and actual Electron UI **7** checks. No blocking
+finding remains for this permission-recovery scope. The review required the
+final `ObservedConfigSynced` persistence event and a real visible permission
+card assertion; both fixes were reverified.
+
+SQLite Ask state is observed before full host process termination and restored
+as Ask afterward, with no unapproved write. Later explicit Yolo still executes.
+The source-built candidate is explicitly distinct from the released baseline;
+the latter's mismatch remains reproducible. Independent wire receipt SHA256:
+`79275b18a46ca2357b4cf256beb988614bbf490b660ffb03c628d0e41d31827f`.
+The new [author receipt](permissions-recovery-qualification.json) records the
+candidate identity. Source/host/renderer checks use a synthetic loopback model,
+not real-provider or installer acceptance. Reviewed host delivery and the rest
+of Studio #16 remain outstanding; neither integration Issue is marked Done.

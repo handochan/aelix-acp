@@ -14,6 +14,7 @@ from pathlib import Path
 import platform
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -254,8 +255,37 @@ async def adapter_probe(adapter, native):
             await fixture.close()
 
 
-async def host_probe(binary, adapter, native):
-    assert hashlib.sha256(binary.read_bytes()).hexdigest() == HOST_DIGEST
+def host_identity(binary, receipt_path=None, manifest_path=None):
+    """Keep released bytes and a separately reviewed source candidate distinct."""
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    actual = digest(binary)
+    if receipt_path is None and manifest_path is None:
+        assert actual == HOST_DIGEST
+        return {"kind": "released_studio4", "binarySha256": actual}
+    if receipt_path is None or manifest_path is None:
+        raise ValueError("Candidate host requires both --host-receipt and --host-source-manifest")
+    receipt = json.loads(receipt_path.read_text())
+    manifest = json.loads(manifest_path.read_text())
+    assert receipt["schema"] == "aelix-studio.host-recovery-build/1" and receipt["status"] == "built_candidate"
+    assert manifest["schema"] == "aelix-studio.host-recovery-source/1"
+    assert receipt["sourceManifestSha256"] == digest(manifest_path)
+    assert receipt["patchSha256"] == manifest["patch"]["sha256"]
+    assert digest(manifest_path.parent / manifest["patch"]["filename"]) == receipt["patchSha256"]
+    assert receipt["upstream"] == manifest["upstream"]
+    assert manifest["upstream"]["commit"] == "47e66d0d151123e973b3fd1e77afcb5671b3f8c5"
+    assert receipt["cargoLockSha256"] == manifest["cargoLockSha256"]
+    assert receipt["licenseFileSha256"] == manifest["upstreamLicenseSha256"]
+    assert receipt["releasedHostBytes"] is False and receipt["nativePatches"] == []
+    assert receipt["binarySha256"] == actual
+    return {"kind": "source_built_recovery_candidate", "binarySha256": actual,
+            "buildReceiptSha256": digest(receipt_path), "sourceManifestSha256": digest(manifest_path),
+            "patchSha256": receipt["patchSha256"], "upstreamCommit": manifest["upstream"]["commit"]}
+
+
+async def host_probe(binary, adapter, native, identity=None):
+    identity = identity or host_identity(binary)
+    candidate = identity["kind"] == "source_built_recovery_candidate"
+    assert hashlib.sha256(binary.read_bytes()).hexdigest() == identity["binarySha256"]
     with tempfile.TemporaryDirectory(prefix="permission-host-") as temporary:
         root = Path(temporary).resolve()
         fixture = ToolFixture(root)
@@ -265,8 +295,16 @@ async def host_probe(binary, adapter, native):
                    AIONUI_EXTENSIONS_PATH=str(root / "extensions"), AIONUI_EXTENSION_STATES_FILE=str(root / "extension-states.json"))
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]
-        process = await asyncio.create_subprocess_exec(binary, "--local", "--port", str(port), "--data-dir", root / "host",
-            "--managed-resources-mode", "bundled", cwd=root / "workspace", env=env, stdout=-3, stderr=-3, start_new_session=True)
+        async def start_host():
+            return await asyncio.create_subprocess_exec(binary, "--local", "--port", str(port), "--data-dir", root / "host",
+                "--managed-resources-mode", "bundled", cwd=root / "workspace", env=env, stdout=-3, stderr=-3, start_new_session=True)
+        async def stop_host():
+            if process.returncode is None:
+                process.terminate()
+                try: await asyncio.wait_for(process.wait(), 10)
+                except TimeoutError:
+                    os.killpg(process.pid, signal.SIGKILL); await process.wait()
+        process = await start_host()
         async def api(route, method="GET", body=None, expected=(200, 201, 202)):
             status, result = await asyncio.to_thread(http, port, route, method, body)
             assert status in expected, (route, status)
@@ -342,7 +380,8 @@ async def host_probe(binary, adapter, native):
             assert failed_status == 502 and failed_body.get("code") == "BAD_GATEWAY"
             (root / "fail-start").unlink()
             recovered = await api(route + "/runtime/restart", "POST")
-            assert current(recovered) == "yolo", "Pinned host display behavior changed; requalify this blocker"
+            expected_mode = "default" if candidate else "yolo"
+            assert current(recovered) == expected_mode, "Host recovery display differs from the qualified identity"
             mismatch_target = root / "workspace/post-failure-probe.txt"
             fixture.next_tool = ("write", {"path": str(mismatch_target), "content": "synthetic"})
             mismatch_turn = await api(route + "/messages", "POST", {"content": "SYNTHETIC_POST_FAILURE_EFFECT"})
@@ -351,17 +390,48 @@ async def host_probe(binary, adapter, native):
             await api(route + "/cancel", "POST", {"turn_id": mismatch_turn["turn_id"]})
             await idle(route)
             assert not mismatch_target.exists()
-            checks.append("known_host_blocker_display_yolo_but_actual_tool_still_asks")
-            return {"checksPassed": checks, "binarySha256": HOST_DIGEST, "renderer": "not run", "provider": "synthetic loopback",
-                    "failedDowngradeHttpStatus": failed_status, "displayedModeAfterFailure": "yolo",
+            checks.append("failed_downgrade_recovers_display_and_effective_ask" if candidate else
+                          "known_host_blocker_display_yolo_but_actual_tool_still_asks")
+            if candidate:
+                # Observe the real debounced SQLite write before a full process exit.
+                async with asyncio.timeout(10):
+                    while True:
+                        with sqlite3.connect(f"file:{root / 'host/aionui-backend.db'}?mode=ro", uri=True) as db:
+                            row = db.execute("SELECT session_config FROM acp_session WHERE conversation_id = ?", (conv["id"],)).fetchone()
+                        runtime = json.loads(row[0]).get("runtime", {}) if row else {}
+                        selections = runtime.get("config_selections", {})
+                        if runtime.get("current_mode_id") == "default" and selections.get("mode") != "yolo": break
+                        await asyncio.sleep(.05)
+                checks.append("recovered_ask_and_cleaned_config_observed_in_host_sqlite")
+                await stop_host()
+                process = await start_host()
+                async with asyncio.timeout(30):
+                    while True:
+                        try:
+                            await api("/api/assistants"); break
+                        except OSError: await asyncio.sleep(.05)
+                assert current(await api(route + "/runtime/ensure", "POST")) == "default"
+                fixture.next_tool = ("write", {"path": str(mismatch_target), "content": "synthetic"})
+                turn = await api(route + "/messages", "POST", {"content": "SYNTHETIC_HOST_PROCESS_RELOAD"})
+                await confirmation(route)
+                assert not mismatch_target.exists()
+                await api(route + "/cancel", "POST", {"turn_id": turn["turn_id"]})
+                await idle(route)
+                assert not mismatch_target.exists()
+                checks.append("full_host_process_restart_restores_display_and_effective_ask")
+                await api(route + "/config-options/mode", "PUT", {"value": "yolo"})
+                assert current(await api(route + "/runtime/ensure", "POST")) == "yolo"
+                fixture.next_tool = ("write", {"path": str(mismatch_target), "content": "synthetic"})
+                await api(route + "/messages", "POST", {"content": "SYNTHETIC_LATER_EXPLICIT_YOLO"})
+                await idle(route)
+                assert mismatch_target.exists() and not await api(route + "/confirmations")
+                checks.append("later_explicit_yolo_selection_still_controls_actual_effect")
+            return {"checksPassed": checks, "identity": identity, "binarySha256": identity["binarySha256"], "renderer": "not run", "provider": "synthetic loopback",
+                    "failedDowngradeHttpStatus": failed_status, "displayedModeAfterFailure": expected_mode,
                     "actualApprovalAfterFailure": "ask", "unapprovedWriteObserved": False,
-                    "acceptance": "blocked_on_host_display_effective_mismatch"}
+                    "acceptance": "passed_with_source_built_candidate" if candidate else "blocked_on_host_display_effective_mismatch"}
         finally:
-            if process.returncode is None:
-                process.terminate()
-                try: await asyncio.wait_for(process.wait(), 10)
-                except TimeoutError:
-                    os.killpg(process.pid, signal.SIGKILL); await process.wait()
+            await stop_host()
             await fixture.close()
 
 
@@ -377,13 +447,15 @@ async def run(args, report):
     report["adapter"] = await adapter_probe(args.adapter, native)
     if args.host:
         report["stage"] = "actual_host"
-        report["host"] = await host_probe(args.host, args.adapter, native)
+        identity = host_identity(args.host, args.host_receipt, args.host_source_manifest)
+        report["host"] = await host_probe(args.host, args.adapter, native, identity)
     else:
         report["host"] = {"status": "not_run", "checksPassed": [], "reason": "--host omitted (native/ACP-only CI)"}
     report["nativeAfter"] = verify(manifest, args.artifacts)
     report["adapterAfter"] = adapter_receipt(args.adapter)
     assert report["nativeBefore"] == report["nativeAfter"] and report["adapterBefore"] == report["adapterAfter"]
-    report.update(stage="complete", status="qualified_with_host_blocker" if args.host else "passed")
+    blocked = args.host and report["host"]["acceptance"] == "blocked_on_host_display_effective_mismatch"
+    report.update(stage="complete", status="qualified_with_host_blocker" if blocked else "passed")
 
 
 def main():
@@ -392,10 +464,14 @@ def main():
     parser.add_argument("--adapter", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--host", type=Path, help="Optional pinned Studio #4 AionCore binary for actual host checks")
+    parser.add_argument("--host-receipt", type=Path, help="Explicit source-built candidate build receipt (not released host bytes)")
+    parser.add_argument("--host-source-manifest", type=Path, help="Reviewed Studio recovery source manifest, with adjacent patch")
     parser.add_argument("--artifacts", type=Path, default=ROOT / ".local/beta2-wheels")
     args = parser.parse_args()
     args.adapter = args.adapter.resolve()
     if args.host: args.host = args.host.resolve()
+    if (args.host_receipt or args.host_source_manifest) and not args.host:
+        parser.error("Candidate identity requires --host")
     report = {"schema": "aelix-acp.permission-qualification/1", "status": "failed", "nativePatches": [],
               "platform": platform.system() + "/" + platform.machine(), "realProvider": False, "installer": False,
               "recordedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),

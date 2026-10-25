@@ -1,0 +1,391 @@
+{
+  "schema": "aelix-acp.permission-qualification/1",
+  "status": "passed",
+  "nativePatches": [],
+  "platform": "Darwin/arm64",
+  "realProvider": false,
+  "installer": false,
+  "recordedAt": "2026-10-25T06:35:28.241392+00:00",
+  "checkoutCommit": "f5d1d5a5f774f958b25d5c37e9c7e1f72904e92e",
+  "harnessSourceSha256": {
+    "qualify_permissions.py": "bfd2c15e0ca92e262f1c9ddcd2d9e686e80ba5d388255c3122776149b2bf3252",
+    "permission_fixture_extension.py": "c4a3a765fc20310be9f587b13395ae58fafb3bd1f9bc21f099eafa9f1a0d5f6a"
+  },
+  "stage": "complete",
+  "nativeBefore": {
+    "wheels": [
+      {
+        "distribution": "aelix",
+        "version": "0.1.0b2",
+        "sha256": "98a9201be2c84c96a1e3944bd003ba7b7346e6e0807dfbfaae3a00ef8e4994b7",
+        "wheelBytes": 21796,
+        "installedMembersVerified": 9
+      },
+      {
+        "distribution": "aelix-ai",
+        "version": "0.1.0b2",
+        "sha256": "5a8b03bdc87161ea17efd96500b13fd7627618c14b6402e9e46a20d6414f1552",
+        "wheelBytes": 392074,
+        "installedMembersVerified": 68
+      },
+      {
+        "distribution": "aelix-agent-core",
+        "version": "0.1.0b2",
+        "sha256": "f3fdabe25ed8e49aeed467a815fcfd4e5d18eedb4fb6d871649739220341b609",
+        "wheelBytes": 216721,
+        "installedMembersVerified": 42
+      },
+      {
+        "distribution": "aelix-coding-agent",
+        "version": "0.1.0b2",
+        "sha256": "60b19815c9355fa1a5d3c4f99e9d32ff53d4ad2522515038b76115273db8baf6",
+        "wheelBytes": 1361351,
+        "installedMembersVerified": 190
+      }
+    ],
+    "imports": [
+      "aelix_agent_core.harness.hooks:ToolCallResult",
+      "aelix_ai.oauth.auth_storage:AuthStorage",
+      "aelix_ai.models:get_supported_thinking_levels",
+      "aelix_coding_agent.extensions.api:ExtensionAPI",
+      "aelix_coding_agent.extensions.api:ExtensionContext",
+      "aelix_coding_agent.agents:parse_profile",
+      "aelix_coding_agent.agents:resolve_profile",
+      "aelix_coding_agent.agents:profile_to_flags",
+      "aelix_agent_core.session.jsonl_repo:JsonlSessionRepo"
+    ],
+    "environment": {
+      "uvicorn": "0.54.0",
+      "mcp": "1.30.0",
+      "starlette": "1.10.0",
+      "click": "8.5.0",
+      "packaging": "26.3",
+      "cryptography": "48.0.1",
+      "Pygments": "2.21.0",
+      "jsonschema-specifications": "2025.9.1",
+      "requests": "2.34.2",
+      "google-auth": "2.62.0",
+      "aelix-ai": "0.1.0b2",
+      "certifi": "2026.10.23",
+      "websockets": "16.1.1",
+      "jsonschema": "4.26.0",
+      "PyJWT": "2.15.1",
+      "tree-sitter-bash": "0.25.1",
+      "docstring_parser": "0.18.0",
+      "tree-sitter-powershell": "0.26.4",
+      "tenacity": "9.1.4",
+      "jiter": "0.18.0",
+      "httpcore": "1.0.9",
+      "aelix-coding-agent": "0.1.0b2",
+      "pycparser": "3.12",
+      "tqdm": "4.70.1",
+      "openai": "1.109.1",
+      "urllib3": "2.8.0",
+      "h11": "0.16.0",
+      "sniffio": "1.3.1",
+      "pydantic_core": "2.50.1",
+      "tree-sitter": "0.25.2",
+      "pyasn1": "0.6.4",
+      "mdurl": "0.1.2",
+      "python-multipart": "0.0.32",
+      "PyYAML": "6.0.3",
+      "sse-starlette": "3.5.1",
+      "truststore": "0.10.5",
+      "python-dotenv": "1.2.4",
+      "cffi": "2.1.1",
+      "anthropic": "0.125.0",
+      "aelix": "0.1.0b2",
+      "google-genai": "1.75.0",
+      "annotated-types": "0.8.0",
+      "referencing": "0.37.0",
+      "pydantic-settings": "2.16.1",
+      "markdown-it-py": "4.2.0",
+      "typing-inspection": "0.4.4",
+      "distro": "1.9.0",
+      "rpds-py": "2026.9.1",
+      "attrs": "26.1.0",
+      "pathspec": "1.1.1",
+      "httpx": "0.28.1",
+      "typing_extensions": "4.16.0",
+      "aelix-agent-core": "0.1.0b2",
+      "pillow": "11.3.0",
+      "pyasn1_modules": "0.4.2",
+      "pydantic": "2.14.1",
+      "charset-normalizer": "3.5.2",
+      "httpx-sse": "0.4.3",
+      "anyio": "4.15.1",
+      "idna": "3.20"
+    },
+    "verificationScope": "Original wheel members except installer-rewritten RECORD; not a dependency or bytecode security attestation"
+  },
+  "adapterBefore": {
+    "version": "0.1.0",
+    "packageFiles": {
+      "aelix_acp/__init__.py": "079a74c70fb815a4e2b50f4888e7a131575448ad3ebf9040649bbc59414e2ea7",
+      "aelix_acp/assets/PLOTLY-LICENSE.txt": "8c45d9eaf50c2f72dd9c7ab9ef440788ba58a3538484b5c51c1f17d5128752e7",
+      "aelix_acp/assets/plotly-basic-3.7.0.min.js.gz": "d48da1a9aa08bc3b4d60241f2a261dc325fe8d0100b1841e4fecf97d0b265705",
+      "aelix_acp/bridge.py": "8725a79120291fe8591fd7d190a9c315373ad404b909189ffefb63ce2e7110dc",
+      "aelix_acp/preview.py": "b6ae954188204f66c3a28417bb31a3b57d036cd96ff8e9722f13fc7058ff8201",
+      "aelix_acp/profiles/analytics.md": "e730852acda1bc29f58478bc803d076f650de903e3fdc2aa22ff20803adde357",
+      "aelix_acp/profiles/coding.md": "e232e70bbc0898957fc0cd187de1aba86abd9f1eef4d2b63e4fbff86a24af12a",
+      "aelix_acp/server.py": "cea11b2b7291bfb0f003ef4f62c9b30779998ae85708d901aa8c00b4b488b9f3"
+    }
+  },
+  "nativeModes": [
+    {
+      "mode": "default",
+      "cases": {
+        "inside_write": {
+          "fileEffectObserved": true
+        },
+        "outside_write": {
+          "fileEffectObserved": true
+        },
+        "shell_redirect": {
+          "fileEffectObserved": true
+        },
+        "unknown_extension_mutation": {
+          "fileEffectObserved": true
+        }
+      },
+      "scope": "stock native RPC without ACP approval bridge"
+    },
+    {
+      "mode": "yolo",
+      "cases": {
+        "inside_write": {
+          "fileEffectObserved": true
+        },
+        "outside_write": {
+          "fileEffectObserved": true
+        },
+        "shell_redirect": {
+          "fileEffectObserved": true
+        },
+        "unknown_extension_mutation": {
+          "fileEffectObserved": true
+        }
+      },
+      "scope": "stock native RPC without ACP approval bridge"
+    },
+    {
+      "mode": "plan",
+      "cases": {
+        "inside_write": {
+          "fileEffectObserved": false
+        },
+        "outside_write": {
+          "fileEffectObserved": false
+        },
+        "shell_redirect": {
+          "fileEffectObserved": false
+        },
+        "unknown_extension_mutation": {
+          "fileEffectObserved": true
+        }
+      },
+      "scope": "stock native RPC without ACP approval bridge"
+    },
+    {
+      "mode": "auto-accept-edits",
+      "cases": {
+        "inside_write": {
+          "fileEffectObserved": true
+        },
+        "outside_write": {
+          "fileEffectObserved": true
+        },
+        "shell_redirect": {
+          "fileEffectObserved": true
+        },
+        "unknown_extension_mutation": {
+          "fileEffectObserved": true
+        }
+      },
+      "scope": "stock native RPC without ACP approval bridge"
+    },
+    {
+      "mode": "auto",
+      "cases": {
+        "inside_write": {
+          "fileEffectObserved": true
+        },
+        "outside_write": {
+          "fileEffectObserved": true
+        },
+        "shell_redirect": {
+          "fileEffectObserved": true
+        },
+        "unknown_extension_mutation": {
+          "fileEffectObserved": true
+        }
+      },
+      "scope": "stock native RPC without ACP approval bridge"
+    }
+  ],
+  "adapter": {
+    "checksPassed": [
+      "standard_modes_default_to_ask",
+      "ask_actual_deny_and_allow_effects",
+      "busy_mode_and_load_refused_consent_cancel_no_write",
+      "yolo_tools_run_without_client_prompt",
+      "yolo_actual_shell_stop_reaps_process_without_late_write",
+      "native_guardrail_and_other_extension_deny_remain",
+      "yolo_bridge_channel_fault_blocks_effect",
+      "same_identity_history_and_saved_mode_restore",
+      "real_worker_failed_downgrade_stopped_and_reloads_ask",
+      "real_worker_repeated_stop_during_mode_start_cleans_up",
+      "yolo_restart_preserves_native_tool_selection"
+    ],
+    "nativePostureEvidence": "explicit argv plus actual tool behavior; no native RPC posture getter"
+  },
+  "host": {
+    "checksPassed": [
+      "actual_host_standard_mode_selector_starts_ask",
+      "actual_host_ask_denial_no_write",
+      "actual_host_yolo_selector_and_tool_effect",
+      "actual_host_restart_restores_yolo",
+      "actual_host_downgrade_ask_and_pending_consent_stop",
+      "actual_host_history_preserved_across_mode_restarts",
+      "failed_downgrade_recovers_display_and_effective_ask",
+      "recovered_ask_and_cleaned_config_observed_in_host_sqlite",
+      "full_host_process_restart_restores_display_and_effective_ask",
+      "later_explicit_yolo_selection_still_controls_actual_effect"
+    ],
+    "identity": {
+      "kind": "source_built_recovery_candidate",
+      "binarySha256": "cc243bf7f789aa3f47dc73638a2bd96cbd14cbc55cb538f81128aad763274c03",
+      "buildReceiptSha256": "d9d68715a2fc39e9459dd64fcf7eaa59c0347b41a010b0b2936bd009daa1e301",
+      "sourceManifestSha256": "22d527b64cbd32f247f1956c07dca6ff2e7fd077ba1a86962aed00e4930a4fe8",
+      "patchSha256": "1e0ef6c9664efa0675068905bf2125c6abbd9dd03b1f66b9fc124a87ccc794fd",
+      "upstreamCommit": "47e66d0d151123e973b3fd1e77afcb5671b3f8c5"
+    },
+    "binarySha256": "cc243bf7f789aa3f47dc73638a2bd96cbd14cbc55cb538f81128aad763274c03",
+    "renderer": "not run",
+    "provider": "synthetic loopback",
+    "failedDowngradeHttpStatus": 502,
+    "displayedModeAfterFailure": "default",
+    "actualApprovalAfterFailure": "ask",
+    "unapprovedWriteObserved": false,
+    "acceptance": "passed_with_source_built_candidate"
+  },
+  "nativeAfter": {
+    "wheels": [
+      {
+        "distribution": "aelix",
+        "version": "0.1.0b2",
+        "sha256": "98a9201be2c84c96a1e3944bd003ba7b7346e6e0807dfbfaae3a00ef8e4994b7",
+        "wheelBytes": 21796,
+        "installedMembersVerified": 9
+      },
+      {
+        "distribution": "aelix-ai",
+        "version": "0.1.0b2",
+        "sha256": "5a8b03bdc87161ea17efd96500b13fd7627618c14b6402e9e46a20d6414f1552",
+        "wheelBytes": 392074,
+        "installedMembersVerified": 68
+      },
+      {
+        "distribution": "aelix-agent-core",
+        "version": "0.1.0b2",
+        "sha256": "f3fdabe25ed8e49aeed467a815fcfd4e5d18eedb4fb6d871649739220341b609",
+        "wheelBytes": 216721,
+        "installedMembersVerified": 42
+      },
+      {
+        "distribution": "aelix-coding-agent",
+        "version": "0.1.0b2",
+        "sha256": "60b19815c9355fa1a5d3c4f99e9d32ff53d4ad2522515038b76115273db8baf6",
+        "wheelBytes": 1361351,
+        "installedMembersVerified": 190
+      }
+    ],
+    "imports": [
+      "aelix_agent_core.harness.hooks:ToolCallResult",
+      "aelix_ai.oauth.auth_storage:AuthStorage",
+      "aelix_ai.models:get_supported_thinking_levels",
+      "aelix_coding_agent.extensions.api:ExtensionAPI",
+      "aelix_coding_agent.extensions.api:ExtensionContext",
+      "aelix_coding_agent.agents:parse_profile",
+      "aelix_coding_agent.agents:resolve_profile",
+      "aelix_coding_agent.agents:profile_to_flags",
+      "aelix_agent_core.session.jsonl_repo:JsonlSessionRepo"
+    ],
+    "environment": {
+      "uvicorn": "0.54.0",
+      "mcp": "1.30.0",
+      "starlette": "1.10.0",
+      "click": "8.5.0",
+      "packaging": "26.3",
+      "cryptography": "48.0.1",
+      "Pygments": "2.21.0",
+      "jsonschema-specifications": "2025.9.1",
+      "requests": "2.34.2",
+      "google-auth": "2.62.0",
+      "aelix-ai": "0.1.0b2",
+      "certifi": "2026.10.23",
+      "websockets": "16.1.1",
+      "jsonschema": "4.26.0",
+      "PyJWT": "2.15.1",
+      "tree-sitter-bash": "0.25.1",
+      "docstring_parser": "0.18.0",
+      "tree-sitter-powershell": "0.26.4",
+      "tenacity": "9.1.4",
+      "jiter": "0.18.0",
+      "httpcore": "1.0.9",
+      "aelix-coding-agent": "0.1.0b2",
+      "pycparser": "3.12",
+      "tqdm": "4.70.1",
+      "openai": "1.109.1",
+      "urllib3": "2.8.0",
+      "h11": "0.16.0",
+      "sniffio": "1.3.1",
+      "pydantic_core": "2.50.1",
+      "tree-sitter": "0.25.2",
+      "pyasn1": "0.6.4",
+      "mdurl": "0.1.2",
+      "python-multipart": "0.0.32",
+      "PyYAML": "6.0.3",
+      "sse-starlette": "3.5.1",
+      "truststore": "0.10.5",
+      "python-dotenv": "1.2.4",
+      "cffi": "2.1.1",
+      "anthropic": "0.125.0",
+      "aelix": "0.1.0b2",
+      "google-genai": "1.75.0",
+      "annotated-types": "0.8.0",
+      "referencing": "0.37.0",
+      "pydantic-settings": "2.16.1",
+      "markdown-it-py": "4.2.0",
+      "typing-inspection": "0.4.4",
+      "distro": "1.9.0",
+      "rpds-py": "2026.9.1",
+      "attrs": "26.1.0",
+      "pathspec": "1.1.1",
+      "httpx": "0.28.1",
+      "typing_extensions": "4.16.0",
+      "aelix-agent-core": "0.1.0b2",
+      "pillow": "11.3.0",
+      "pyasn1_modules": "0.4.2",
+      "pydantic": "2.14.1",
+      "charset-normalizer": "3.5.2",
+      "httpx-sse": "0.4.3",
+      "anyio": "4.15.1",
+      "idna": "3.20"
+    },
+    "verificationScope": "Original wheel members except installer-rewritten RECORD; not a dependency or bytecode security attestation"
+  },
+  "adapterAfter": {
+    "version": "0.1.0",
+    "packageFiles": {
+      "aelix_acp/__init__.py": "079a74c70fb815a4e2b50f4888e7a131575448ad3ebf9040649bbc59414e2ea7",
+      "aelix_acp/assets/PLOTLY-LICENSE.txt": "8c45d9eaf50c2f72dd9c7ab9ef440788ba58a3538484b5c51c1f17d5128752e7",
+      "aelix_acp/assets/plotly-basic-3.7.0.min.js.gz": "d48da1a9aa08bc3b4d60241f2a261dc325fe8d0100b1841e4fecf97d0b265705",
+      "aelix_acp/bridge.py": "8725a79120291fe8591fd7d190a9c315373ad404b909189ffefb63ce2e7110dc",
+      "aelix_acp/preview.py": "b6ae954188204f66c3a28417bb31a3b57d036cd96ff8e9722f13fc7058ff8201",
+      "aelix_acp/profiles/analytics.md": "e730852acda1bc29f58478bc803d076f650de903e3fdc2aa22ff20803adde357",
+      "aelix_acp/profiles/coding.md": "e232e70bbc0898957fc0cd187de1aba86abd9f1eef4d2b63e4fbff86a24af12a",
+      "aelix_acp/server.py": "cea11b2b7291bfb0f003ef4f62c9b30779998ae85708d901aa8c00b4b488b9f3"
+    }
+  }
+}
