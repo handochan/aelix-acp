@@ -38,9 +38,14 @@ jobs:
       - name: Verify wheel bytes and exercise actual native and ACP processes
         run: |
           .local/native/bin/python scripts/qualify_beta2.py --adapter .local/native/bin/aelix-acp --report .local/qualification.json
+      - name: Verify sessionless management and installed ACP contracts (no host)
+        run: |
+          .local/native/bin/python scripts/qualify_management.py --adapter .local/native/bin/aelix-acp --native-only --report .local/management-qualification.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: public-beta2-python-${{ matrix.python }}
-          path: .local/qualification.json
+          path: |
+            .local/qualification.json
+            .local/management-qualification.json
           if-no-files-found: error
