@@ -28,7 +28,7 @@ class WheelIdentityTests(unittest.TestCase):
             previous = Path.cwd()
             try:
                 os.chdir(project)
-                self.assertEqual(native_help(executable).strip(), "ISOLATED_HELP")
+                self.assertEqual(native_help([sys.executable, str(executable)]).strip(), "ISOLATED_HELP")
             finally:
                 os.chdir(previous)
 
@@ -40,7 +40,7 @@ class WheelIdentityTests(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("OPENAI_API_KEY", env)
         self.assertNotIn("PYTHONPATH", env)
-        self.assertEqual(env["AELIX_AUTH_PATH"], "/fixture/root/agent/auth.json")
+        self.assertEqual(env["AELIX_AUTH_PATH"], str(Path('/fixture/root') / 'agent/auth.json'))
 
     def test_same_version_patched_payload_does_not_qualify(self):
         with tempfile.TemporaryDirectory() as directory:

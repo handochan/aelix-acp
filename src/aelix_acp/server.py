@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hmac
 import json
 import os
 from pathlib import Path
 import shutil
+import secrets
 import signal
 import sqlite3
 import sys
@@ -16,6 +18,7 @@ import time
 import uuid
 
 from . import __version__
+from .stdio import StdinReader
 
 PACKAGE = Path(__file__).resolve().parent
 KINDS = {"read": "read", "grep": "search", "find": "search", "ls": "read",
@@ -67,15 +70,26 @@ class Session:
         self.state = {}
         self.socket_dir = None
         self.socket_server = None
+        self.permission_token = None
+        self.permission_endpoint = None
+        self.worker_job = None
         self.analytics_project = Path(cwd) if (Path(cwd) / "analytics.json").is_file() else None
 
     async def start(self, session_file=None):
         self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
         os.chmod(self.socket_dir, 0o700)
         socket_path = str(Path(self.socket_dir) / "bridge.sock")
-        self.socket_server = await asyncio.start_unix_server(self.permission, path=socket_path)
-        os.chmod(socket_path, 0o600)
-        args = [self.server.args.aelix, "--mode", "rpc", "--offline", "--no-extensions",
+        self.permission_endpoint = None
+        self.permission_token = None
+        if sys.platform == "win32":
+            self.permission_token = secrets.token_urlsafe(32)
+            self.socket_server = await asyncio.start_server(self.permission, "127.0.0.1", 0, limit=65536, backlog=8)
+            port = self.socket_server.sockets[0].getsockname()[1]
+            self.permission_endpoint = f"tcp://127.0.0.1:{port}"
+        else:
+            self.socket_server = await asyncio.start_unix_server(self.permission, path=socket_path)
+            os.chmod(socket_path, 0o600)
+        args = [self.server.args.aelix, *getattr(self.server.args, "aelix_arg", []), "--mode", "rpc", "--offline", "--no-extensions",
                 "--no-agents", "--permission-mode", self.permission_mode,
                 "--append-system-prompt-file", str(PACKAGE / "profiles" / f"{self.server.args.profile}.md")]
         if self.server.args.profile == "analytics":
@@ -95,12 +109,34 @@ class Session:
             args += ["--session", session_file]
         nonce = uuid.uuid4().hex
         ready_file = Path(self.socket_dir) / "ready"
-        env = dict(os.environ, AELIX_ACP_SOCKET=socket_path, PYTHONUNBUFFERED="1",
+        env = dict(os.environ, AELIX_ACP_SOCKET=socket_path, PYTHONUNBUFFERED="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
                    AELIX_ACP_READY_FILE=str(ready_file), AELIX_ACP_NONCE=nonce)
+        for name in ("AELIX_ACP_ENDPOINT", "AELIX_ACP_PERMISSION_TOKEN"):
+            env.pop(name, None)
+        if self.permission_endpoint:
+            env.pop("AELIX_ACP_SOCKET", None)
+            env.update(AELIX_ACP_ENDPOINT=self.permission_endpoint, AELIX_ACP_PERMISSION_TOKEN=self.permission_token)
+        if sys.platform == "win32":
+            from .windows import WorkerJob
+            self.worker_job = WorkerJob()
+            # The trusted gate consumes one byte before starting ANY native
+            # bootstrap (including configured MCP startup subprocesses).
+            args = [sys.executable, "-I", "-S", "-B", str(PACKAGE / "windows.py"), *args]
         self.proc = await asyncio.create_subprocess_exec(
             *args, cwd=self.cwd, env=env, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             limit=16 * 1024 * 1024)
+        if self.worker_job:
+            # The known native RPC child receives no commands before it joins
+            # the job. Later tool/MCP descendants inherit this owned lifetime.
+            try:
+                self.worker_job.assign(self.proc.pid)
+                self.proc.stdin.write(b"\0")
+                await self.proc.stdin.drain()
+            except BaseException:
+                self.proc.kill()
+                await self.proc.wait()
+                raise
         self.tasks = [asyncio.create_task(self.read_rpc()), asyncio.create_task(self.read_stderr())]
         self.state = await self.rpc("get_state")
         if not ready_file.is_file() or ready_file.read_text() != nonce:
@@ -230,10 +266,19 @@ class Session:
     async def permission(self, reader, writer):
         allowed = False
         permission_task = asyncio.current_task()
-        self.permissions.add(permission_task)
         try:
-            async with asyncio.timeout(300):
+            if self.permission_endpoint and len(self.permissions) >= 8:
+                return
+            self.permissions.add(permission_task)
+            async with asyncio.timeout(5 if self.permission_endpoint else 300):
                 request = json.loads(await reader.readline())
+            if self.permission_endpoint:
+                supplied = request.pop("token", None) if isinstance(request, dict) else None
+                if not self.permission_token or not isinstance(supplied, str) or not hmac.compare_digest(supplied, self.permission_token):
+                    return
+            if self.cancelled:
+                return
+            async with asyncio.timeout(300):
                 call = tool_call(request["toolCallId"], request["name"], request["args"], self.cwd)
                 known = call["toolCallId"] in self.tools
                 self.tools[call["toolCallId"]] = call
@@ -314,17 +359,25 @@ class Session:
 
     async def close(self):
         self.cancelled = True
+        self.permission_token = None
         permissions = list(self.permissions)
         for task in permissions:
             task.cancel()
         await asyncio.gather(*permissions, return_exceptions=True)
         if self.proc and self.proc.returncode is None:
-            self.proc.terminate()
+            if self.worker_job:
+                self.worker_job.close()
+                self.worker_job = None
+            else:
+                self.proc.terminate()
             try:
                 await asyncio.wait_for(self.proc.wait(), 5)
             except TimeoutError:
                 self.proc.kill()
                 await self.proc.wait()
+        if self.worker_job:
+            self.worker_job.close()
+            self.worker_job = None
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
@@ -573,13 +626,11 @@ class Server:
                 print(f"[aelix-acp] {exc}", file=sys.stderr)
 
     async def run(self):
-        reader = asyncio.StreamReader(limit=16 * 1024 * 1024)
-        protocol = asyncio.StreamReaderProtocol(reader)
+        reader = StdinReader()
         loop = asyncio.get_running_loop()
-        await loop.connect_read_pipe(lambda: protocol, sys.stdin.buffer)
         run_task = asyncio.current_task()
         installed_signals = []
-        for sig in (signal.SIGTERM, signal.SIGHUP):
+        for sig in (getattr(signal, name) for name in ("SIGTERM", "SIGHUP") if hasattr(signal, name)):
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, run_task.cancel)
                 installed_signals.append(sig)
@@ -605,6 +656,7 @@ class Server:
                 self.tasks.add(task)
                 task.add_done_callback(self.tasks.discard)
         finally:
+            reader.close()
             for task in list(self.tasks):
                 if not task.cancelling():
                     task.cancel()
@@ -620,6 +672,7 @@ def main():
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--profile", choices=["coding", "analytics"], default="coding")
     parser.add_argument("--aelix", default=shutil.which("aelix") or str(Path.home() / ".local/bin/aelix"))
+    parser.add_argument("--aelix-arg", action="append", default=[], help="Literal native command prefix argument; repeat as --aelix-arg=VALUE")
     parser.add_argument("--analytics-extension", default=os.environ.get("AELIX_ANALYTICS_EXTENSION"))
     parser.add_argument("--state-dir", default=os.environ.get("AELIX_ACP_STATE_DIR", str(Path.home() / ".aelix/acp")))
     parser.add_argument("--provider")
@@ -627,8 +680,9 @@ def main():
     parser.add_argument("--permission-mode", choices=sorted(MODE_IDS), default="default",
                         help="Initial mode for new sessions; saved sessions restore their recorded mode")
     args = parser.parse_args()
-    if sys.platform == "win32":
-        parser.error("The permission bridge requires Unix sockets; use macOS or Linux.")
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="strict")
     try:
         asyncio.run(Server(args).run())
     except (KeyboardInterrupt, BrokenPipeError, asyncio.CancelledError):

@@ -11,6 +11,14 @@ from aelix_acp.server import ProtocolError, Server, Session
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def channel(self):
+        self.session.permission_token = "fixture-session-token"
+        listener = await asyncio.start_server(self.session.permission, "127.0.0.1", 0)
+        port = listener.sockets[0].getsockname()[1]
+        self.session.permission_endpoint = f"tcp://127.0.0.1:{port}"
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        return listener, reader, writer
+
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.args = SimpleNamespace(state_dir=self.tmp.name, profile="coding")
@@ -36,11 +44,10 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.server.client_request = consent
         path = Path(self.tmp.name) / "permission.sock"
-        listener = await asyncio.start_unix_server(self.session.permission, path=str(path))
+        listener, reader, writer = await self.channel()
         await self.session.event({"type": "tool_execution_start", "tool_call_id": "t1",
                                   "tool_name": "write", "args": {"path": "output.html"}})
-        reader, writer = await asyncio.open_unix_connection(str(path))
-        writer.write(json.dumps({"toolCallId": "t1", "name": "write", "args": {"path": "output.html"}}).encode() + b"\n")
+        writer.write(json.dumps({"token": self.session.permission_token, "toolCallId": "t1", "name": "write", "args": {"path": "output.html"}}).encode() + b"\n")
         await writer.drain()
         receive = asyncio.create_task(reader.readline())
         await asyncio.sleep(0.02)
@@ -70,9 +77,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.server.client_request = consent
         self.session.rpc = abort
         path = Path(self.tmp.name) / "cancel.sock"
-        listener = await asyncio.start_unix_server(self.session.permission, path=str(path))
-        reader, writer = await asyncio.open_unix_connection(str(path))
-        writer.write(b'{"toolCallId":"t2","name":"bash","args":{"command":"no-run"}}\n')
+        listener, reader, writer = await self.channel()
+        writer.write(json.dumps({"token": self.session.permission_token, "toolCallId": "t2", "name": "bash", "args": {"command": "no-run"}}).encode() + b"\n")
         await writer.drain()
         await entered.wait()
         await self.session.cancel()
