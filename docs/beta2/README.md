@@ -4,6 +4,11 @@ Issue [#6](https://github.com/handochan/aelix-acp/issues/6), 2026-10-25. This is
 repeatable native/adapter baseline, not full Studio Preview acceptance. Shared
 product requirements remain in the [Studio design](https://github.com/handochan/aelix-studio/blob/main/docs/studio-release-train/README.md).
 
+The subsequent [ACP #7 management/host wire qualification](management-contract.md)
+records sessionless native API probes and the actual pinned AionCore path,
+including request identity, cancellation, unsupported methods and shared-store
+limits. It does not add a production helper to this adapter.
+
 ## Source and wheel identity
 
 [manifest.json](manifest.json) pins all four public `0.1.0b2` wheels by filename,
