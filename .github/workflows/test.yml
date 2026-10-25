@@ -5,6 +5,7 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-15, windows-2022]
         python: ['3.11', '3.12']

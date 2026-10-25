@@ -1,5 +1,6 @@
 """Real pipe framing and authenticated loopback regressions, on every host OS."""
 import asyncio
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -112,7 +113,8 @@ class LoopbackTests(unittest.IsolatedAsyncioTestCase):
             return json.loads(await asyncio.wait_for(reader.readline(), 2))
         finally:
             writer.close()
-            await writer.wait_closed()
+            with contextlib.suppress(ConnectionError):
+                await writer.wait_closed()
 
     async def test_missing_or_wrong_token_cannot_reach_yolo_or_ui(self):
         self.session.permission_mode = 'yolo'
@@ -147,4 +149,5 @@ class LoopbackTests(unittest.IsolatedAsyncioTestCase):
         finally:
             for _reader, writer in connections:
                 writer.close()
-                await writer.wait_closed()
+                with contextlib.suppress(ConnectionError):
+                    await writer.wait_closed()
