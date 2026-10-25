@@ -24,8 +24,8 @@ class PreviewTests(unittest.TestCase):
                         '<script type="application/json" id="fig1">{"data":[]}</script>'
                         '<a href="../index.html">original</a></body></html>')
             source.write_text(original)
-            output = bundle_run(root,'fixture').read_text()
-            self.assertEqual(source.read_text(),original)
+            output = bundle_run(root,'fixture').read_text(encoding="utf-8")
+            self.assertEqual(source.read_text(encoding="utf-8"),original)
             self.assertIn('<style>body {color:navy}</style>',output)
             self.assertIn('Plotly.newPlot',output)
             self.assertLess(len(output.encode()), 1_000_000)

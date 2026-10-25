@@ -52,8 +52,8 @@ class WheelIdentityTests(unittest.TestCase):
                 archive.writestr("native.dist-info/RECORD", "installer rewrites this\n")
             installed = root / "site-packages"
             (installed / "native.dist-info").mkdir(parents=True)
-            (installed / "native.py").write_text("PUBLIC_RELEASE = True\n")
-            (installed / "native.dist-info/METADATA").write_text("Version: 0.1.0b2\n")
+            (installed / "native.py").write_bytes(b"PUBLIC_RELEASE = True\n")
+            (installed / "native.dist-info/METADATA").write_bytes(b"Version: 0.1.0b2\n")
             self.assertEqual(compare_payload(wheel, installed), 2)
             (installed / "native.py").write_text("PRIVATE_CORE_PATCH = True\n")
             with self.assertRaisesRegex(ValueError, "Installed wheel member differs"):
