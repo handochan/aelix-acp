@@ -258,6 +258,11 @@ class Session:
                  "description": "Selected at launch; configure --provider and --model to change"}]}
         return result
 
+    def operation_ack(self):
+        if self.server.operations is None:
+            return {}
+        return {'_meta': {'aelix/operationStore': self.selectors()['_meta']['aelix/operationStore']}}
+
     async def rpc(self, command, **kwargs):
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
@@ -699,7 +704,7 @@ class Server:
             await self.require_idle(session)
             if mode == session.permission_mode:
                 await session.update({"sessionUpdate": "current_mode_update", "currentModeId": mode})
-                return {}
+                return session.operation_ack()
             restarting = True
             session_file = session.state.get("sessionFile")
             if not session_file or not Path(session_file).is_file():
@@ -716,7 +721,7 @@ class Server:
             candidate.save()
             self.sessions[session.id] = candidate
             await candidate.update({"sessionUpdate": "current_mode_update", "currentModeId": mode})
-            return {}
+            return candidate.operation_ack()
         except BaseException as exc:
             downgrade_error = mode == "default" and session.permission_mode == "yolo" and getattr(exc, "code", None) != -32000
             if restarting or downgrade_error or isinstance(exc, asyncio.CancelledError):
