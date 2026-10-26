@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from aelix_acp.server import ProtocolError, Server, Session
+from aelix_acp.server import ProtocolError, Server, Session, managed_native_failure
 from aelix_acp.operations.ledger import LedgerError, META_KEY, SCHEMA
 from aelix_acp.operations.bindings import NativeBindings
 from aelix_acp.operations.lease import OwnershipError
@@ -69,6 +69,39 @@ class ManagedServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conflict.exception.code, 'operation_conflict')
         self.release.set()
         await task
+
+    async def test_native_provider_failures_keep_safe_actionable_categories(self):
+        for raw, message, kind in (
+            ('HTTP 401 authentication_error key=SYNTHETIC_SECRET', 'Provider authentication failed (401)', 'provider_authentication_failed'),
+            ('All connection attempts failed: https://SYNTHETIC_SECRET.example', 'Connection error', 'provider_connection_failed'),
+            ('unrecognized native failure SYNTHETIC_SECRET', 'Native turn failed', 'native_turn_failed'),
+            ('All connection attempts failed: http://127.0.0.1:401/v1', 'Connection error', 'provider_connection_failed'),
+            ('native error key=abc401xyz', 'Native turn failed', 'native_turn_failed'),
+        ):
+            async def rpc(command, **params):
+                self.session.failure = raw
+                self.session.done.set_result(None)
+                return {}
+            self.session.rpc = rpc
+            with self.assertRaises(ProtocolError) as failure:
+                await Session.prompt(self.session, [dict(type='text', text='synthetic')])
+            self.assertEqual(str(failure.exception), message)
+            self.assertEqual(failure.exception.data, {'kind': kind, 'automaticRetry': False})
+            self.assertNotIn('SYNTHETIC_SECRET', str(failure.exception))
+
+    async def test_keyed_wire_preserves_fixed_category_after_fresh_native_exit_barrier(self):
+        async def failed_prompt(*args, **kwargs):
+            raise managed_native_failure('Error code: 401 - SYNTHETIC_SECRET')
+        self.session.prompt = failed_prompt
+        frames = []
+        async def capture(frame):frames.append(frame)
+        self.server.send = capture
+        await self.server.handle(dict(jsonrpc='2.0', id='request-1', method='session/prompt', params=self.params))
+        error = frames[-1]['error']
+        self.assertEqual(error['message'], 'Provider authentication failed (401)')
+        self.assertEqual(error['data']['kind'], 'provider_authentication_failed')
+        self.assertEqual(error['data'][META_KEY]['state'], 'interrupted')
+        self.assertNotIn('SYNTHETIC_SECRET', json.dumps(error))
 
     async def test_distinct_busy_operation_is_not_claimed(self):
         task = asyncio.create_task(self.server.prompt(self.params))

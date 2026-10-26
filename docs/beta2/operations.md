@@ -5,6 +5,14 @@ The matching [Studio #16](https://github.com/handochan/aelix-studio/issues/16) H
 forwarding is a separate integration gate. Public beta.2 native wheels remain
 unchanged. There is no generic management proxy or native auth/config mutation.
 
+Managed native failures publish only fixed first-reply diagnostic categories:
+provider authentication failure, connection failure, or other native failure.
+Native error text, endpoints and credentials are never copied into those errors
+or the ledger. A keyed failure still closes its owned worker and requires the
+fresh lifetime barrier before recording conservative interruption/effect
+uncertainty. A later duplicate/status returns that durable bounded outcome;
+the first-reply provider diagnostic is not a persisted provider error log.
+
 ## Wire
 
 Start with `--managed-operations`. `initialize.agentCapabilities._meta["aelix/operations"]`

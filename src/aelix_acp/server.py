@@ -7,6 +7,7 @@ import contextlib
 import hmac
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import secrets
@@ -32,6 +33,11 @@ PERMISSION_MODES = (
     {"id": "yolo", "name": "Yolo", "description": "Skip client tool approval; native guardrails and tool restrictions remain active"},
 )
 MODE_IDS = frozenset(mode["id"] for mode in PERMISSION_MODES)
+MANAGED_NATIVE_FAILURES = {
+    'provider_authentication_failed': 'Provider authentication failed (401)',
+    'provider_connection_failed': 'Connection error',
+    'native_turn_failed': 'Native turn failed',
+}
 
 
 class ProtocolError(Exception):
@@ -39,6 +45,21 @@ class ProtocolError(Exception):
         super().__init__(message)
         self.code = code
         self.data = data
+
+
+def managed_native_failure(message):
+    """Keep actionable provider categories without publishing native error text."""
+    text = str(message).lower()[:4096]
+    if (re.search(r'\b(?:http(?:\s+(?:status|error))?|(?:status|error)\s+code)\s*[:=]?\s*401\b', text)
+            or any(marker in text for marker in ('authentication_error', 'invalid api key', 'invalid_api_key'))):
+        return ProtocolError('Provider authentication failed (401)', -32603,
+                             {'kind': 'provider_authentication_failed', 'automaticRetry': False})
+    if any(marker in text for marker in ('connection error', 'connection refused', 'econnrefused',
+                                        'connection_error', 'connecterror', 'all connection attempts failed')):
+        return ProtocolError('Connection error', -32603,
+                             {'kind': 'provider_connection_failed', 'automaticRetry': False})
+    return ProtocolError('Native turn failed', -32603,
+                         {'kind': 'native_turn_failed', 'automaticRetry': False})
 
 
 def tool_call(call_id, name, args, cwd, status="pending"):
@@ -438,7 +459,9 @@ class Session:
             await self.rpc("prompt", message=message)
             await asyncio.wait_for(asyncio.shield(self.done), 600)
             if self.failure:
-                raise ProtocolError('Native turn failed' if self.server.operations is not None else self.failure, -32603)
+                if self.server.operations is not None:
+                    raise managed_native_failure(self.failure)
+                raise ProtocolError(self.failure, -32603)
             self.state = await self.rpc("get_state")
             if self.server.operations is not None and (self.state.get('isStreaming') is not False
                                                         or self.state.get('isCompacting') is not False):
@@ -667,6 +690,12 @@ class Server:
                 receipt = self.operations.lookup(session.id, self.args.profile, operation)
             if isinstance(error, asyncio.CancelledError):
                 raise
+            kind = error.data.get('kind') if isinstance(error, ProtocolError) and isinstance(error.data, dict) else None
+            if kind in MANAGED_NATIVE_FAILURES and receipt and receipt['state'] in ('failed', 'interrupted'):
+                # First-reply diagnostics remain fixed and actionable. The
+                # durable outcome stays conservative and never stores raw text.
+                raise ProtocolError(MANAGED_NATIVE_FAILURES[kind], -32046,
+                                    {META_KEY: receipt, 'kind': kind, 'automaticRetry': False}) from None
             return self.operation_result(receipt)
         finally:
             session.operation = None
