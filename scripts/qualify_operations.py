@@ -104,6 +104,21 @@ async def probe():
             await bypass.close()
             checks.append('flag_off_new_history_prefix_refused_before_native_start')
 
+            previous_generation = op['generation']
+            mode_result = await peer.request('session/set_mode', sessionId=sid, modeId='yolo')
+            generation = mode_result['result']['_meta']['aelix/operationStore']['workerGeneration']
+            assert generation != previous_generation
+            repeated = await peer.request('session/set_mode', sessionId=sid, modeId='yolo')
+            assert repeated['result']['_meta']['aelix/operationStore']['workerGeneration'] == generation
+            replay = await peer.request('session/prompt', **accepted)
+            assert replay['result']['_meta'][META]['generation'] == previous_generation
+            restored = await peer.request('session/set_mode', sessionId=sid, modeId='default')
+            restored_generation = restored['result']['_meta']['aelix/operationStore']['workerGeneration']
+            assert restored_generation not in (generation, previous_generation)
+            op = dict(op, generation=restored_generation)
+            assert len(fixture.requests) == request_count
+            checks.append('mode_restart_ack_refreshes_actual_worker_fence_and_preserves_old_operation')
+
             fixture.entered.clear()
             hold_op = dict(op, id='hold-operation', turnId='turn-2')
             held = asyncio.create_task(peer.request('session/prompt', **params(sid, hold_op, 'QUALIFICATION_HOLD')))

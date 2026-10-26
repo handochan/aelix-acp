@@ -18,6 +18,10 @@ Session new/load may include `_meta["aelix/operationStore"]` with exactly `schem
 and the expected `storeId`. The response's same key adds `workerGeneration` and
 `nativeSessionId`, observed from the actual worker handshake/state. Before prompt,
 the host must persist that binding alongside the original ACP session ID.
+Successful managed session/set_mode acknowledgements carry the same metadata:
+a real worker restart changes workerGeneration, and a no-op preserves it. The
+host updates its next execution fence from that acknowledgement; completed
+operation replays still return their original worker/turn fences.
 
 `session/prompt._meta["aelix/operation"]` has exactly these fields:
 

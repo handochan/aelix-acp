@@ -87,6 +87,11 @@ class ManagedServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failure.exception.code, -32044)
         self.assertEqual(self.dispatches, 0)
 
+    async def test_mode_ack_contains_the_actual_managed_worker_generation(self):
+        ack = self.session.operation_ack()['_meta']['aelix/operationStore']
+        self.assertEqual(ack['workerGeneration'], self.session.worker_generation)
+        self.assertEqual(ack['storeId'], self.server.operations.store_id)
+
     async def test_malformed_empty_metadata_never_falls_back_to_unkeyed_execution(self):
         for meta in ([], '', False, None):
             with self.subTest(meta=meta), self.assertRaises(ProtocolError):
