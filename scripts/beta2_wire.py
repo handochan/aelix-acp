@@ -58,7 +58,7 @@ class Peer:
         while await self.process.stderr.read(8192):
             pass  # Never copy provider diagnostics or raw transcripts into the receipt.
 
-    async def request(self, operation, **params):
+    async def request(self, operation, /, **params):
         self.counter += 1
         key = str(self.counter)
         future = asyncio.get_running_loop().create_future()
