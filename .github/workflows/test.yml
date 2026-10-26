@@ -45,6 +45,9 @@ jobs:
       - name: Verify Ask/Yolo effects and audit additional native modes (no host)
         run: |
           .local/native/bin/python scripts/qualify_permissions.py --adapter .local/native/bin/aelix-acp --report .local/permission-qualification.json
+      - name: Verify installed managed operations and actual process interruption (no host)
+        run: |
+          .local/native/bin/python scripts/qualify_operations.py --adapter .local/native/bin/aelix-acp --report .local/operation-qualification.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -53,6 +56,7 @@ jobs:
             .local/qualification.json
             .local/management-qualification.json
             .local/permission-qualification.json
+            .local/operation-qualification.json
           if-no-files-found: error
 
   public-platforms:
@@ -95,9 +99,13 @@ jobs:
           "$ACP_NATIVE_PYTHON" -m pip install --no-index .local/acp-wheel/*.whl
       - name: Verify unchanged public wheels and actual native and ACP processes
         run: '"$ACP_NATIVE_PYTHON" scripts/qualify_beta2.py --adapter "$ACP_NATIVE_ADAPTER" --report .local/platform-qualification.json'
+      - name: Verify installed managed operations and owned native lifetime
+        run: '"$ACP_NATIVE_PYTHON" scripts/qualify_operations.py --adapter "$ACP_NATIVE_ADAPTER" --report .local/platform-operation-qualification.json'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: public-platform-${{ matrix.target }}
-          path: .local/platform-qualification.json
+          path: |
+            .local/platform-qualification.json
+            .local/platform-operation-qualification.json
           if-no-files-found: error

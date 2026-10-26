@@ -2,6 +2,8 @@
 import ctypes
 from ctypes import wintypes
 import os
+import importlib.util
+from pathlib import Path
 import subprocess
 import sys
 import threading
@@ -42,6 +44,8 @@ class WorkerJob:
         self.api.AssignProcessToJobObject.restype = wintypes.BOOL
         self.api.CloseHandle.argtypes = [wintypes.HANDLE]
         self.api.CloseHandle.restype = wintypes.BOOL
+        self.api.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+        self.api.IsProcessInJob.restype = wintypes.BOOL
         self.handle = self.api.CreateJobObjectW(None, None)
         if not self.handle:
             raise ctypes.WinError(ctypes.get_last_error())
@@ -67,6 +71,16 @@ class WorkerJob:
             self.api.CloseHandle(self.handle)
             self.handle = None
 
+    def contains(self, pid):
+        process = self.api.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION.
+        if not process:
+            return False
+        try:
+            belongs = wintypes.BOOL()
+            return bool(self.api.IsProcessInJob(process, self.handle, ctypes.byref(belongs)) and belongs.value)
+        finally:
+            self.api.CloseHandle(process)
+
 
 if __name__ == "__main__":
     # No buffered stdin lock/prefetch. RPC bytes after this gate go straight to
@@ -84,4 +98,21 @@ if __name__ == "__main__":
         deadline.join()
     if ready != b"\0" or len(sys.argv) < 2:
         raise SystemExit(2)
-    raise SystemExit(subprocess.call(sys.argv[1:], shell=False))
+    options = {}
+    reference = os.environ.get('AELIX_ACP_LEASE_REFERENCE')
+    expected = os.environ.get('AELIX_ACP_LEASE_ID')
+    if reference is not None or expected is not None:
+        # -I -S intentionally ignores PYTHONPATH/site-packages. Read only the
+        # adapter-owned helper at a fixed relative path, after Job release.
+        helper = Path(__file__).with_name('operations') / 'lease.py'
+        spec = importlib.util.spec_from_file_location('aelix_acp_gate_lease', helper)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        reference = int(reference)
+        if module.inherited_identity(reference) != expected:
+            raise SystemExit(2)
+        os.set_handle_inheritable(reference, True)
+        startup = subprocess.STARTUPINFO()
+        startup.lpAttributeList = {'handle_list': [reference]}
+        options = {'startupinfo': startup, 'close_fds': True}
+    raise SystemExit(subprocess.call(sys.argv[1:], shell=False, **options))

@@ -4,6 +4,7 @@ Loaded explicitly into the RPC child. The parent owns a private Unix socket or
 authenticated Windows loopback channel; absent/broken channels block the tool.
 """
 import asyncio
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,8 +12,21 @@ from urllib.parse import urlsplit
 
 from aelix_agent_core.harness.hooks import ToolCallResult
 
+_managed_lease = None
+
+
+def _check_managed_lease():
+    if _managed_lease is not None:
+        observe, reference, expected = _managed_lease
+        if observe(reference) != expected:
+            raise RuntimeError('Managed native writer reference changed')
+
 
 async def before_tool(event, ctx):
+    try:
+        _check_managed_lease()
+    except Exception:
+        return ToolCallResult(block=True, reason='Managed native ownership is unavailable')
     path = os.environ.get("AELIX_ACP_SOCKET")
     endpoint = os.environ.get("AELIX_ACP_ENDPOINT")
     token = os.environ.get("AELIX_ACP_PERMISSION_TOKEN")
@@ -45,10 +59,29 @@ async def before_tool(event, ctx):
 
 
 def setup(aelix):
+    global _managed_lease
     aelix.on("tool_call", before_tool)
     ready_file = os.environ.get("AELIX_ACP_READY_FILE")
     nonce = os.environ.get("AELIX_ACP_NONCE")
     if not ready_file or not nonce:
         raise RuntimeError("ACP bridge must be launched by aelix-acp")
-    Path(ready_file).write_text(nonce)
+    reference = os.environ.get('AELIX_ACP_LEASE_REFERENCE')
+    expected = os.environ.get('AELIX_ACP_LEASE_ID')
+    if reference is not None or expected is not None:
+        if not reference or not expected:
+            raise RuntimeError('Managed native writer reference is missing')
+        # The native interpreter need not have ACP installed on sys.path.
+        helper = Path(__file__).with_name('operations') / 'lease.py'
+        spec = importlib.util.spec_from_file_location('aelix_acp_native_lease', helper)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _managed_lease = (module.inherited_identity, int(reference), expected)
+        _check_managed_lease()
+        generation = os.environ.get('AELIX_ACP_WORKER_GENERATION')
+        if not generation:
+            raise RuntimeError('Managed native generation is missing')
+        ready = {'nonce': nonce, 'leaseId': expected, 'nativePid': os.getpid(), 'generation': generation}
+        Path(ready_file).write_text(json.dumps(ready), encoding='utf-8')
+    else:
+        Path(ready_file).write_text(nonce)
     os.chmod(ready_file, 0o600)

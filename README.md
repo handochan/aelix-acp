@@ -97,6 +97,12 @@ Plotly 자산은 MIT 라이선스이며 패키지의 `assets/PLOTLY-LICENSE.txt`
 
 ## 검증
 
+Opt-in `--managed-operations`는 stable prompt operation ID, 중복/충돌 처리,
+bounded outcome과 native 시작 없는 status-only transport를 추가합니다.
+원본 public beta.2 wheel은 그대로이며 기존 CLI 공통 writer lock이나 exactly-once
+외부 효과를 보장하지 않습니다. [wire·저장·검증 계약](docs/beta2/operations.md)을
+따르며 Studio #16 forwarding/UI 수용은 별도입니다.
+
 ```sh
 # Aelix가 설치된 Python 3.11+ 사용. Unix 소켓을 허용하는 환경에서 실행합니다.
 python -m unittest discover -s tests -v

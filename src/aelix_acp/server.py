@@ -19,6 +19,9 @@ import uuid
 
 from . import __version__
 from .stdio import StdinReader
+from .operations.bindings import NativeBindings
+from .operations.ledger import LedgerError, META_KEY, OperationContext, OperationLedger, SCHEMA
+from .operations.lease import LeaseBusy, OwnershipError
 
 PACKAGE = Path(__file__).resolve().parent
 KINDS = {"read": "read", "grep": "search", "find": "search", "ls": "read",
@@ -54,6 +57,30 @@ def text_content(content):
     return "\n".join(c.get("text", "") for c in content or [] if c.get("type") == "text")
 
 
+def prompt_message(blocks):
+    """The accepted native text, shared by dispatch and its keyed fingerprint."""
+    if not isinstance(blocks, list):
+        raise ProtocolError('Prompt content must be an array')
+    parts = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            raise ProtocolError('Invalid prompt block')
+        if block.get('type') == 'text' and isinstance(block.get('text'), str):
+            parts.append(block['text'])
+        elif block.get('type') == 'resource' and isinstance(block.get('resource'), dict):
+            resource = block['resource']
+            if not isinstance(resource.get('text'), str) or not isinstance(resource.get('uri', 'resource'), str):
+                raise ProtocolError('Unsupported embedded prompt resource')
+            parts.append(f"{resource.get('uri', 'resource')}:\n{resource['text']}")
+        elif block.get('type') == 'resource_link' and isinstance(block.get('uri'), str):
+            if not isinstance(block.get('name', 'File'), str):
+                raise ProtocolError('Invalid prompt resource name')
+            parts.append(f"{block.get('name', 'File')}: {block['uri']}")
+        else:
+            raise ProtocolError('Unsupported prompt block')
+    return '\n\n'.join(parts)
+
+
 class Session:
     def __init__(self, server, session_id, cwd):
         self.server, self.id, self.cwd = server, session_id, cwd
@@ -73,9 +100,23 @@ class Session:
         self.permission_token = None
         self.permission_endpoint = None
         self.worker_job = None
+        self.writer_lease = None
+        self.worker_generation = uuid.uuid4().hex
+        self.operation = None
         self.analytics_project = Path(cwd) if (Path(cwd) / "analytics.json").is_file() else None
 
     async def start(self, session_file=None):
+        # Public beta.2 --help lists these history selectors. Launch prefixes
+        # must not bypass the DB-only load boundary, including flag-off new.
+        for argument in getattr(self.server.args, 'aelix_arg', []):
+            if argument.split('=', 1)[0] in ('--session', '--resume', '-r', '--continue', '-c', '--fork', '--no-session'):
+                raise ProtocolError('Adapter launch cannot override native session selection')
+        self.server.validate_session_store(self.id)
+        if session_file and self.server.operations is None:
+            NativeBindings.require_unmanaged(session_file)
+        if self.server.operations is not None:
+            self.writer_lease = self.server.bindings.prepare_writer(
+                self.id, self.server.args.profile, registered_file=session_file)
         self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
         os.chmod(self.socket_dir, 0o700)
         socket_path = str(Path(self.socket_dir) / "bridge.sock")
@@ -113,6 +154,8 @@ class Session:
                    AELIX_ACP_READY_FILE=str(ready_file), AELIX_ACP_NONCE=nonce)
         for name in ("AELIX_ACP_ENDPOINT", "AELIX_ACP_PERMISSION_TOKEN"):
             env.pop(name, None)
+        for name in ('AELIX_ACP_LEASE_REFERENCE', 'AELIX_ACP_LEASE_ID', 'AELIX_ACP_WORKER_GENERATION'):
+            env.pop(name, None)
         if self.permission_endpoint:
             env.pop("AELIX_ACP_SOCKET", None)
             env.update(AELIX_ACP_ENDPOINT=self.permission_endpoint, AELIX_ACP_PERMISSION_TOKEN=self.permission_token)
@@ -122,10 +165,31 @@ class Session:
             # The trusted gate consumes one byte before starting ANY native
             # bootstrap (including configured MCP startup subprocesses).
             args = [sys.executable, "-I", "-S", "-B", str(PACKAGE / "windows.py"), *args]
-        self.proc = await asyncio.create_subprocess_exec(
-            *args, cwd=self.cwd, env=env, stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            limit=16 * 1024 * 1024)
+        async def spawn(options):
+            return await asyncio.create_subprocess_exec(
+                *args, cwd=self.cwd, env=env, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                limit=16 * 1024 * 1024, **options)
+        if self.writer_lease is not None:
+            with self.writer_lease.inheritance() as (reference, options):
+                env.update(AELIX_ACP_LEASE_REFERENCE=str(reference), AELIX_ACP_LEASE_ID=self.writer_lease.identity,
+                           AELIX_ACP_WORKER_GENERATION=self.worker_generation)
+                if os.name != 'nt':
+                    options['start_new_session'] = True
+                # Do not lose ownership of a successfully created child if a
+                # cancellation arrives between CreateProcess/fork and return.
+                task = asyncio.create_task(spawn(options))
+                cancelled = False
+                while True:
+                    try:
+                        self.proc = await asyncio.shield(task)
+                        break
+                    except asyncio.CancelledError:
+                        cancelled = True
+                if cancelled:
+                    raise asyncio.CancelledError
+        else:
+            self.proc = await spawn({})
         if self.worker_job:
             # The known native RPC child receives no commands before it joins
             # the job. Later tool/MCP descendants inherit this owned lifetime.
@@ -139,12 +203,37 @@ class Session:
                 raise
         self.tasks = [asyncio.create_task(self.read_rpc()), asyncio.create_task(self.read_stderr())]
         self.state = await self.rpc("get_state")
-        if not ready_file.is_file() or ready_file.read_text() != nonce:
+        if self.writer_lease is not None:
+            try:
+                with ready_file.open('rb') as source:
+                    data = source.read(4097)
+                if len(data) > 4096:
+                    raise ValueError
+                ready = json.loads(data)
+                pid = ready['nativePid']
+                owned_pid = (isinstance(pid, int) and not isinstance(pid, bool)
+                             and (self.worker_job.contains(pid) if self.worker_job else pid == self.proc.pid))
+                if (ready['nonce'] != nonce or ready['leaseId'] != self.writer_lease.identity
+                        or ready['generation'] != self.worker_generation or not owned_pid):
+                    raise ValueError
+                self.writer_lease.verify()
+                native_file = self.state['sessionFile']
+                if session_file and not os.path.samefile(native_file, session_file):
+                    raise ValueError
+                self.server.bindings.bind_native(self.id, self.server.args.profile, native_file,
+                                                 self.writer_lease, native_id=self.state['sessionId'], allow_create=True)
+            except (OSError, ValueError, KeyError, TypeError):
+                raise ProtocolError('Managed native ownership handshake failed', -32603) from None
+        elif not ready_file.is_file() or ready_file.read_text() != nonce:
             raise ProtocolError("The tool approval bridge did not load; refusing this session", -32603)
         await self.rpc("set_auto_retry", enabled=False)
         self.save(include_mode=False)
 
     def save(self, include_mode=True):
+        if self.server.operations is not None:
+            self.server.db.execute('INSERT OR IGNORE INTO managed_stores VALUES(?,?)',
+                                   (self.id, self.server.operations.store_id))
+            self.server.validate_session_store(self.id)
         self.server.db.execute(
             "INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?,?)",
             (self.id, self.cwd, self.server.args.profile, self.state.get("sessionFile"),
@@ -158,6 +247,9 @@ class Session:
                   "_meta": {"aelix/permission": {"nativeLaunchMode": self.permission_mode,
                             "approvalPolicy": "ask" if self.permission_mode == "default" else "yolo",
                             "appliesAt": "worker_restart", "nativePostureObservation": "launch_argument"}}}
+        if self.server.operations is not None:
+            result['_meta']['aelix/operationStore'] = dict(schema=SCHEMA, storeId=self.server.operations.store_id,
+                workerGeneration=self.worker_generation, nativeSessionId=self.state.get('sessionId'))
         model = self.state.get("model") or {}
         if model.get("id"):
             model_id = f"{model.get('provider', '')}/{model['id']}"
@@ -180,7 +272,13 @@ class Session:
             self.pending.pop(request_id, None)
 
     async def read_stderr(self):
+        omitted = False
         while line := await self.proc.stderr.readline():
+            if self.server.operations is not None:
+                if not omitted:
+                    print('[aelix-acp] Native diagnostic output omitted for managed operations', file=sys.stderr)
+                    omitted = True
+                continue
             # Provider errors may contain user data: keep diagnostics local on stderr.
             sys.stderr.write(f"[aelix:{self.id[:8]}] {line.decode(errors='replace')}")
             sys.stderr.flush()
@@ -199,7 +297,9 @@ class Session:
                         if event.get("success"):
                             future.set_result(event.get("data") or {})
                         else:
-                            future.set_exception(ProtocolError(str(event.get("error", "RPC failed")), -32603))
+                            message = ('Native RPC rejected the request' if self.server.operations is not None
+                                       else str(event.get('error', 'RPC failed')))
+                            future.set_exception(ProtocolError(message, -32603))
                 else:
                     await self.event(event)
         except Exception as exc:
@@ -250,7 +350,8 @@ class Session:
                             await self.update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text",
                                 "text": f"\n[AionUi 분석 미리보기]({preview})\n"}})
                         except (OSError, ValueError) as exc:
-                            print(f"[aelix-acp] Standalone preview unavailable: {exc}", file=sys.stderr)
+                            print('[aelix-acp] Standalone preview unavailable' if self.server.operations is not None
+                                  else f"[aelix-acp] Standalone preview unavailable: {exc}", file=sys.stderr)
         elif kind == "message_end":
             message = event.get("message") or {}
             error = message.get("errorMessage") or message.get("error_message")
@@ -315,37 +416,33 @@ class Session:
             {"name": c["name"], "description": c.get("description") or c["name"]}
             for c in data.get("commands", [])]})
 
-    async def prompt(self, blocks):
+    def require_prompt_slot(self):
         if self.id in self.server.mutations:
             raise ProtocolError("Session is changing configuration; retry after the operation completes", -32000)
         if self.prompt_active or (self.done and not self.done.done()):
             raise ProtocolError("A prompt is already running in this session")
-        parts = []
-        for block in blocks:
-            if block.get("type") == "text":
-                parts.append(block["text"])
-            elif block.get("type") == "resource" and "text" in block.get("resource", {}):
-                resource = block["resource"]
-                parts.append(f"{resource.get('uri', 'resource')}:\n{resource['text']}")
-            elif block.get("type") == "resource_link":
-                parts.append(f"{block.get('name', 'File')}: {block['uri']}")
-            else:
-                raise ProtocolError(f"Unsupported prompt block: {block.get('type')}")
+
+    async def prompt(self, blocks, *, accepted_message=None):
+        self.require_prompt_slot()
+        message = prompt_message(blocks) if accepted_message is None else accepted_message
         self.done = asyncio.get_running_loop().create_future()
         self.prompt_active = True
         self.failure, self.cancelled = None, False
         self.tools.clear()
         try:
-            await self.rpc("prompt", message="\n\n".join(parts))
+            await self.rpc("prompt", message=message)
             await asyncio.wait_for(asyncio.shield(self.done), 600)
             if self.failure:
-                raise ProtocolError(self.failure, -32603)
+                raise ProtocolError('Native turn failed' if self.server.operations is not None else self.failure, -32603)
             self.state = await self.rpc("get_state")
+            if self.server.operations is not None and (self.state.get('isStreaming') is not False
+                                                        or self.state.get('isCompacting') is not False):
+                raise ProtocolError('Managed native terminal state cannot be verified', -32603)
             self.save()
             return {"stopReason": "cancelled" if self.cancelled else "end_turn"}
         except TimeoutError:
             await self.cancel()
-            raise ProtocolError("Aelix turn timed out", -32603)
+            raise ProtocolError("Aelix turn timed out", -32603, {'aelix/stop': 'timeout'})
         finally:
             self.prompt_active = False
             if self.done and not self.done.done():
@@ -369,11 +466,19 @@ class Session:
                 self.worker_job.close()
                 self.worker_job = None
             else:
-                self.proc.terminate()
+                if self.writer_lease is not None and os.name != 'nt':
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(self.proc.pid, signal.SIGTERM)
+                else:
+                    self.proc.terminate()
             try:
                 await asyncio.wait_for(self.proc.wait(), 5)
             except TimeoutError:
-                self.proc.kill()
+                if self.writer_lease is not None and os.name != 'nt':
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(self.proc.pid, signal.SIGKILL)
+                else:
+                    self.proc.kill()
                 await self.proc.wait()
         if self.worker_job:
             self.worker_job.close()
@@ -389,16 +494,36 @@ class Session:
             with contextlib.suppress(FileNotFoundError):
                 shutil.rmtree(self.socket_dir)
             self.socket_dir = None
+        if self.writer_lease is not None:
+            self.writer_lease.close()
+            self.writer_lease = None
 
 
 class Server:
     def __init__(self, args):
         self.args = args
+        self.status_only = getattr(args, 'operations_status_only', False)
+        self.instance_id = uuid.uuid4().hex
+        self.operations = None
+        self.bindings = None
         state_dir = Path(args.state_dir).expanduser()
-        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.db = sqlite3.connect(state_dir / "sessions.sqlite3")
-        self.db.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, cwd TEXT, profile TEXT, file TEXT, title TEXT, updated INTEGER)")
-        self.db.execute("CREATE TABLE IF NOT EXISTS permission_modes (id TEXT PRIMARY KEY, mode TEXT NOT NULL)")
+        if self.status_only:
+            self.db = None
+        else:
+            state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.db = sqlite3.connect(state_dir / "sessions.sqlite3")
+            self.db.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, cwd TEXT, profile TEXT, file TEXT, title TEXT, updated INTEGER)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS permission_modes (id TEXT PRIMARY KEY, mode TEXT NOT NULL)")
+            self.db.execute('CREATE TABLE IF NOT EXISTS managed_stores (session_id TEXT PRIMARY KEY, store_id TEXT NOT NULL)')
+        if self.status_only or getattr(args, 'managed_operations', False):
+            previously_managed = self.db is not None and self.db.execute('SELECT 1 FROM managed_stores LIMIT 1').fetchone()
+            try:
+                self.operations = OperationLedger(state_dir, create=not self.status_only and not previously_managed)
+            except BaseException:
+                if self.db is not None:
+                    self.db.close()
+                raise
+            self.bindings = NativeBindings(self.operations)
         self.sessions = {}
         self.mutations = {}
         self.pending = {}
@@ -430,6 +555,11 @@ class Server:
         if session_id in self.mutations:
             raise ProtocolError("Session configuration is busy", -32000)
         self.mutations[session_id] = asyncio.current_task()
+
+    def validate_session_store(self, session_id):
+        row = self.db.execute('SELECT store_id FROM managed_stores WHERE session_id=?', (session_id,)).fetchone()
+        if row and (self.operations is None or row[0] != self.operations.store_id):
+            raise ProtocolError('Saved managed session requires its original operation store', -32042)
 
     def store_mode(self, session_id, mode):
         self.db.execute("INSERT OR REPLACE INTO permission_modes VALUES(?,?)", (session_id, mode))
@@ -464,6 +594,98 @@ class Server:
                 continue  # Repeated Stop/EOF must not interrupt cleanup.
         if cancelled and propagate_cancel:
             raise asyncio.CancelledError
+
+    def operation_context(self, params):
+        meta = params.get('_meta', {})
+        if not isinstance(meta, dict):
+            raise ProtocolError('Invalid operation metadata')
+        if META_KEY not in meta:
+            if self.operations is not None and 'aelix/requestId' in meta:
+                raise ProtocolError('Legacy request metadata does not negotiate managed operations')
+            return None
+        if self.operations is None:
+            raise ProtocolError('Managed operations are not negotiated', -32601)
+        return OperationContext.parse(meta[META_KEY])
+
+    @staticmethod
+    def operation_result(receipt):
+        if receipt['state'] in ('completed', 'cancelled'):
+            return {'stopReason': receipt['stopReason'], '_meta': {META_KEY: receipt}}
+        if receipt['state'] == 'pending':
+            raise ProtocolError('Operation is pending; query its original status', -32045, {META_KEY: receipt})
+        raise ProtocolError('Operation is interrupted or failed; automatic replay is disabled', -32046,
+                            {META_KEY: receipt})
+
+    async def prompt(self, params):
+        operation = self.operation_context(params)
+        if operation is None:
+            return await self.session(params).prompt(params['prompt'])
+        message = prompt_message(params['prompt'])
+        # Bound the ACTUAL current RPC encoding before reserving an operation.
+        try:
+            if len(json.dumps({'type': 'prompt', 'message': message}).encode('utf-8')) > 16 * 1024 * 1024 - 1024:
+                raise ProtocolError('Prompt exceeds the managed native frame budget')
+        except UnicodeError:
+            raise ProtocolError('Prompt encoding is invalid') from None
+        session_id = params['sessionId']
+        existing = self.operations.lookup(session_id, self.args.profile, operation)
+        if existing is not None:
+            _, receipt = self.operations.claim(session_id, self.args.profile, operation,
+                                                message, self.instance_id, None)
+            return self.operation_result(receipt)
+        session = self.session(params)
+        session.require_prompt_slot()
+        if operation.generation != session.worker_generation:
+            raise ProtocolError('Managed native generation is stale', -32044)
+        self.bindings.bind_native(session.id, self.args.profile, session.state['sessionFile'],
+                                  session.writer_lease, native_id=session.state['sessionId'])
+        claimed, receipt = self.operations.claim(session_id, self.args.profile, operation,
+                                                  message, self.instance_id, session.writer_lease)
+        if not claimed:
+            return self.operation_result(receipt)
+        session.operation = operation
+        try:
+            result = await session.prompt(params['prompt'], accepted_message=message)
+            cancelled = result['stopReason'] == 'cancelled'
+            receipt = self.operations.finish(session.id, operation.operation_id, self.instance_id,
+                                               'cancelled' if cancelled else 'completed',
+                                               'cancelled' if cancelled else 'end_turn')
+        except BaseException as error:
+            # Abort acknowledgement is not a settled native terminal. Close the
+            # owned worker, then require a FRESH OS barrier before settlement.
+            self.sessions.pop(session.id, None)
+            await self.finish_cleanup(session)
+            reason = 'timeout' if getattr(error, 'data', None) == {'aelix/stop': 'timeout'} else 'transport_closed'
+            try:
+                receipt = self.operations.recover_abandoned(session.id, self.args.profile, operation, code=reason)
+            except LeaseBusy:
+                receipt = self.operations.lookup(session.id, self.args.profile, operation)
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            return self.operation_result(receipt)
+        finally:
+            session.operation = None
+        return self.operation_result(receipt)
+
+    def operation_status(self, params):
+        if self.operations is None:
+            raise ProtocolError('Managed operations are not negotiated', -32601)
+        if set(params) != {'sessionId', 'operation'}:
+            raise ProtocolError('Invalid operation status request')
+        operation = OperationContext.parse(params['operation'])
+        receipt = self.operations.lookup(params['sessionId'], self.args.profile, operation)
+        if receipt is None:
+            return {'operation': dict(schema=SCHEMA, id=operation.operation_id, storeId=self.operations.store_id,
+                                      conversationId=operation.conversation_id, turnId=operation.turn_id,
+                                      generation=operation.generation, state='not_found',
+                                      effectsUnknown=True, automaticRetry=False)}
+        current = self.sessions.get(params['sessionId'])
+        if receipt['state'] == 'pending' and not (current and current.operation == operation and current.prompt_active):
+            try:
+                receipt = self.operations.recover_abandoned(params['sessionId'], self.args.profile, operation)
+            except LeaseBusy:
+                receipt['executionObservation'] = 'recovery_waiting'
+        return {'operation': receipt}
 
     async def set_mode(self, params):
         mode = params.get("modeId")
@@ -510,15 +732,35 @@ class Server:
             self.mutations.pop(session.id, None)
 
     async def dispatch(self, method, params):
+        if self.status_only and method not in ('initialize', '_aelix/operation_status'):
+            raise ProtocolError('Status-only transport cannot start or control a native session', -32601)
         if method == "initialize":
             if params.get("protocolVersion") != 1:
                 raise ProtocolError("Only ACP protocol version 1 is supported")
+            capabilities = {"loadSession": True, "promptCapabilities": {"embeddedContext": True},
+                            "mcpCapabilities": {"http": False, "sse": False},
+                            "sessionCapabilities": {"list": {}}}
+            if self.status_only:
+                capabilities.update(loadSession=False, promptCapabilities={}, sessionCapabilities={})
+            if self.operations is not None:
+                self.operations._validate_storage_identity()
+                capabilities['_meta'] = {'aelix/operations': dict(schema=SCHEMA, storeId=self.operations.store_id,
+                    statusMethod='_aelix/operation_status', statusOnlyArgument='--operations-status-only',
+                    statusOnly=self.status_only)}
             return {"protocolVersion": 1,
                     "agentInfo": {"name": "aelix-acp", "title": f"Aelix {self.args.profile.title()}", "version": __version__},
-                    "agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True},
-                                          "mcpCapabilities": {"http": False, "sse": False},
-                                          "sessionCapabilities": {"list": {}}}, "authMethods": []}
+                    "agentCapabilities": capabilities, "authMethods": []}
+        if method == '_aelix/operation_status':
+            return self.operation_status(params)
         if method in ("session/new", "session/load"):
+            meta = params.get('_meta', {})
+            if not isinstance(meta, dict):
+                raise ProtocolError('Invalid session operation metadata')
+            expected_store = meta.get('aelix/operationStore')
+            if expected_store is not None:
+                if (self.operations is None or not isinstance(expected_store, dict)
+                        or expected_store != {'schema': SCHEMA, 'storeId': self.operations.store_id}):
+                    raise ProtocolError('Managed operation store identity changed', -32042)
             cwd = str(Path(params["cwd"]).expanduser().resolve())
             if not Path(cwd).is_dir():
                 raise ProtocolError("Session cwd must be an existing directory")
@@ -577,8 +819,13 @@ class Server:
                                   "updatedAt": datetime.fromtimestamp(r[3], timezone.utc).isoformat()} for r in rows
                                  if not params.get("cwd") or r[1] == params["cwd"]]}
         if method == "session/prompt":
-            return await self.session(params).prompt(params["prompt"])
+            return await self.prompt(params)
         if method == "session/cancel":
+            operation = self.operation_context(params)
+            if operation is not None:
+                current = self.sessions.get(params.get('sessionId'))
+                if current is None or current.operation != operation:
+                    return {'cancelled': False, 'reason': 'stale_operation'}
             if task := self.mutations.get(params.get("sessionId")):
                 if not task.cancelling():
                     task.cancel()
@@ -597,7 +844,7 @@ class Server:
             return {}
         if method == "authenticate":
             raise ProtocolError("Configure provider authentication using the existing Aelix CLI first")
-        raise ProtocolError(f"Method not supported: {method}", -32601)
+        raise ProtocolError('Method not supported' if self.operations is not None else f"Method not supported: {method}", -32601)
 
     async def handle(self, message):
         request_id = message.get("id")
@@ -617,13 +864,24 @@ class Server:
                         await session.update({"sessionUpdate": "current_mode_update", "currentModeId": session.permission_mode})
         except Exception as exc:
             if request_id is not None and not replied:
-                error = {"code": getattr(exc, "code", -32603), "message": str(exc)}
+                if isinstance(exc, LedgerError):
+                    codes = {'invalid_operation': -32602, 'operation_conflict': -32041, 'store_changed': -32042,
+                             'store_unavailable': -32043, 'ownership_changed': -32044}
+                    error = {'code': codes[exc.code], 'message': str(exc), 'data': {'kind': exc.code, 'automaticRetry': False}}
+                elif isinstance(exc, OwnershipError):
+                    error = {'code': -32044, 'message': 'Managed native ownership is unavailable',
+                             'data': {'kind': 'ownership_unavailable', 'automaticRetry': False}}
+                elif self.operations is not None and not isinstance(exc, ProtocolError):
+                    error = {'code': -32603, 'message': 'Managed request failed',
+                             'data': {'kind': 'internal_error', 'automaticRetry': False}}
+                else:
+                    error = {"code": getattr(exc, "code", -32603), "message": str(exc)}
                 if getattr(exc, "data", None) is not None:
                     error["data"] = exc.data
                 await self.send({"jsonrpc": "2.0", "id": request_id,
                                  "error": error})
             else:
-                print(f"[aelix-acp] {exc}", file=sys.stderr)
+                print('[aelix-acp] Managed notification failed' if self.operations is not None else f"[aelix-acp] {exc}", file=sys.stderr)
 
     async def run(self):
         reader = StdinReader()
@@ -662,7 +920,10 @@ class Server:
                     task.cancel()
             await asyncio.gather(*self.tasks, return_exceptions=True)
             await asyncio.gather(*(s.close() for s in self.sessions.values()), return_exceptions=True)
-            self.db.close()
+            if self.db is not None:
+                self.db.close()
+            if self.operations is not None:
+                self.operations.close()
             for sig in installed_signals:
                 loop.remove_signal_handler(sig)
 
@@ -679,6 +940,8 @@ def main():
     parser.add_argument("--model")
     parser.add_argument("--permission-mode", choices=sorted(MODE_IDS), default="default",
                         help="Initial mode for new sessions; saved sessions restore their recorded mode")
+    parser.add_argument('--managed-operations', action='store_true', help='Negotiate private managed operation/ownership contracts')
+    parser.add_argument('--operations-status-only', action='store_true', help='Read existing managed outcomes without native startup')
     args = parser.parse_args()
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
