@@ -25,7 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def native_help(executable):
     # Public beta.2 loads cwd .env before handling --help.
     with tempfile.TemporaryDirectory(prefix="beta2-help-") as temporary:
-        return subprocess.check_output([str(executable), "--help"], text=True, timeout=20,
+        command = list(executable) if isinstance(executable, (list, tuple)) else [str(executable)]
+        return subprocess.check_output([*command, "--help"], text=True, encoding="utf-8", timeout=20,
                                        cwd=temporary, env=isolated_environment(Path(temporary)))
 
 

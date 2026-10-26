@@ -15,7 +15,7 @@ def isolated_environment(root):
                AELIX_CODING_AGENT_DIR=str(root / "agent"),
                AELIX_CODING_AGENT_SESSION_DIR=str(root / "sessions"),
                AELIX_SETTINGS_PATH=str(root / "agent/settings.json"),
-               AELIX_AUTH_PATH=str(root / "agent/auth.json"), PYTHONUNBUFFERED="1")
+               AELIX_AUTH_PATH=str(root / "agent/auth.json"), PYTHONUNBUFFERED="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     return env
 
 

@@ -5,8 +5,9 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-15, windows-2022]
         python: ['3.11', '3.12']
     runs-on: ${{ matrix.os }}
     steps:
@@ -52,4 +53,51 @@ jobs:
             .local/qualification.json
             .local/management-qualification.json
             .local/permission-qualification.json
+          if-no-files-found: error
+
+  public-platforms:
+    name: Public native and ACP (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: darwin-arm64, os: macos-15 }
+          - { target: darwin-x64, os: macos-15-intel }
+          - { target: linux-arm64, os: ubuntu-24.04-arm }
+          - { target: linux-x64, os: ubuntu-24.04 }
+          - { target: win32-x64, os: windows-2022 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Resolve platform entrypoints
+        run: |
+          python - <<'PYTHON'
+          import os
+          from pathlib import Path
+          scripts = Path('.local/native') / ('Scripts' if os.name == 'nt' else 'bin')
+          values = {'ACP_NATIVE_PYTHON': scripts / ('python.exe' if os.name == 'nt' else 'python'),
+                    'ACP_NATIVE_ADAPTER': scripts / ('aelix-acp.exe' if os.name == 'nt' else 'aelix-acp')}
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
+              for key, value in values.items(): output.write(key + '=' + value.as_posix() + '\n')
+          PYTHON
+      - name: Install released native and candidate adapter wheels
+        run: |
+          python -m venv .local/native
+          "$ACP_NATIVE_PYTHON" -m pip install --index-url https://pypi.org/simple --only-binary=:all: aelix==0.1.0b2
+          python -m pip wheel --no-deps --wheel-dir .local/acp-wheel .
+          "$ACP_NATIVE_PYTHON" -m pip install --no-index .local/acp-wheel/*.whl
+      - name: Verify unchanged public wheels and actual native and ACP processes
+        run: '"$ACP_NATIVE_PYTHON" scripts/qualify_beta2.py --adapter "$ACP_NATIVE_ADAPTER" --report .local/platform-qualification.json'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-platform-${{ matrix.target }}
+          path: .local/platform-qualification.json
           if-no-files-found: error

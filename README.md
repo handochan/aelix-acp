@@ -53,7 +53,7 @@ bin/aelix-acp --profile analytics \
 
 승인 브리지 로딩을 임시 파일의 실행별 nonce로 확인한 뒤에만 세션 생성을
 완료합니다. 브리지가 없거나 소켓이 끊기거나 승인 시간이 지나면 도구를
-차단합니다. 승인 소켓은 세션별 0700 임시 디렉터리의 0600 Unix 소켓입니다.
+차단합니다. 승인 채널은 POSIX의 세션별 0700 임시 디렉터리/0600 Unix 소켓과 Windows의 세대별 토큰으로 인증하는 127.0.0.1 TCP입니다.
 이는 로컬 실행 승인 경로이며 OS 샌드박스나 악성 확장 격리를 제공하지 않습니다.
 
 ACP #5 개발 후보의 초기 모드는 `--permission-mode default|yolo`이며 저장 세션은
@@ -109,3 +109,20 @@ python scripts/smoke.py --profile analytics
 실제 실행 결과는 [로컬 PoC 검증 기록](docs/local-poc.md)에 구분하여 기록합니다.
 전체 대화 로그, 분석 프로젝트, 업데이트 전 백업은 Git에 포함되지 않는
 `.local/`에 보존합니다.
+
+
+## Windows portability candidate (#15)
+
+Windows 표준 입력은 bounded raw-descriptor daemon으로 처리하며 Proactor subprocess 지원을 유지합니다. UTF-8을 명시적으로 설정합니다.
+Native 실행 prefix는 반복 `--aelix-arg=VALUE` 배열이고 shell parsing을 사용하지 않습니다.
+Windows native bootstrap은 ACP 소유 gate에서 대기하고, kill-on-close Job 연결이 끝난 뒤에만 시작합니다.
+MCP 등 첫 RPC 전의 시작 자식도 같은 Job을 상속하며, 승인 토큰은 UI/자동 승인 전에 검사합니다.
+잘못된 token·stale generation·cancelled 요청과 초과 연결은 거절합니다. 기존 Ask/Yolo·재개/복구 및 public native wheel은 유지합니다.
+
+이 절은 #15 개발 후보 설명입니다. 전체 OS/설치 수용 결과는 Issue의 현재 SHA·CI·Studio #5 연결 결과로 확인합니다.
+
+독립 소스 리뷰에서 Job 연결 전 native/MCP 시작 자식이 빠질 수 있는 문제를 발견해,
+native 대신 소유 gate를 먼저 연결하고 release byte 뒤에만 실행하도록 수정했습니다.
+시작 즉시 자식을 만드는 fixture와 의도적인 Job 연결 지연을 Windows 회귀로 추가했습니다.
+지원 Python 3.12 로컬 검사 44개 중 43개 통과/Windows Job 1개 미실행이며, 실제 Windows와
+5개 native target CI 결과가 나오기 전에는 해당 플랫폼 수용으로 표시하지 않습니다.
