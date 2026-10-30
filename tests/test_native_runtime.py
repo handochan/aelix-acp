@@ -69,7 +69,14 @@ def setup(api):
             messages = request.get("messages", [])
             last = messages[-1] if messages else {}
             content = str(last.get("content", ""))
-            if last.get("role") == "user" and "WRITE_TEST" in content:
+            if last.get("role") == "user" and "DELEGATE_NOW" in content:
+                delta = {"role": "assistant", "tool_calls": [{"index": 0, "id": "call_agent_" + str(len(self.model_requests)),
+                    "type": "function", "function": {"name": "agent", "arguments": json.dumps({
+                        "profile": "reviewer", "task": "CHILD_TASK respond briefly"})}}]}
+                stop = "tool_calls"
+            elif last.get("role") == "user" and "CHILD_TASK" in content:
+                delta, stop = {"role": "assistant", "content": "CHILD_OK"}, "stop"
+            elif last.get("role") == "user" and "WRITE_TEST" in content:
                 delta = {"role": "assistant", "tool_calls": [{"index": 0, "id": "call_" + str(len(self.model_requests)),
                     "type": "function", "function": {"name": "write", "arguments": json.dumps({
                         "path": str(self.write_path), "content": "approved write"})}}]}
@@ -380,6 +387,26 @@ def setup(api):
         for mode in ("plan", "auto-accept-edits", "auto"):
             with self.assertRaisesRegex(RuntimeError, "Unsupported value"):
                 await self.config("permission_mode", mode)
+
+    async def test_delegated_child_progress_rides_the_parent_tool_call(self):
+        profiles = self.root / "agent/agents"
+        profiles.mkdir()
+        (profiles / "reviewer.md").write_text("---\nname: reviewer\ndescription: Review\ntools: [read]\n---\nReview.\n", encoding="utf-8")
+        await self.manage("agents/enable", {"enabled": True})
+        self.assertEqual(await self.prompt("DELEGATE_NOW"), {"stopReason": "end_turn"})
+        updates = [event["params"]["update"] for event in self.client.updates if event.get("method") == "session/update"]
+        parent = next(update["toolCallId"] for update in updates
+                      if update.get("sessionUpdate") == "tool_call" and update.get("title") == "agent")
+        frames = [update for update in updates if update.get("toolCallId") == parent and "_meta" in update]
+        self.assertTrue(frames, "No parent tool_call_update carried child progress")
+        self.assertTrue(all(update["sessionUpdate"] == "tool_call_update" for update in frames))
+        children = [frame["_meta"]["aelix/subagents"]["children"] for frame in frames]
+        self.assertEqual({child["profile"] for group in children for child in group}, {"reviewer"})
+        self.assertIn("subagent_start", {child["event"] for group in children for child in group})
+        final = next(update for update in reversed(updates) if update.get("toolCallId") == parent and update.get("status") == "completed")
+        self.assertEqual(final["_meta"]["aelix/subagents"]["children"][0]["state"], "done")
+        # Standard ACP only: the unhandled extension notification is not used for a parented child.
+        self.assertFalse([event for event in self.client.updates if event.get("method") == "_aelix/subagent"])
 
     async def test_launch_extension_cannot_be_disabled_by_the_session(self):
         extension = str((self.root / "commands.py").resolve())

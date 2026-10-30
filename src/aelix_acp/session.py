@@ -28,6 +28,7 @@ from .runtime.store import (save_preferences, load_preferences, legacy_permissio
 from .runtime.commands import BUILTINS, execute as execute_slash
 from .runtime.extensions import extension_reference
 from .runtime.leases import acquire as acquire_lease
+from .runtime.subagents import SubagentTracker
 
 PACKAGE = Path(__file__).resolve().parent
 KINDS = {"read": "read", "grep": "search", "find": "search", "ls": "read",
@@ -79,6 +80,7 @@ class Session:
         self.dispatched = False
         self.tools = {}
         self.tool_arrived = asyncio.Event()
+        self.subagents = SubagentTracker()
         self.recovery_warnings = []
         self.permissions = set()
         self.permission_connections = set()
@@ -442,6 +444,7 @@ class Session:
             name = event.get("toolName") or event.get("tool_name") or "tool"
             if kind == "tool_execution_start":
                 # Aelix emits execution_start before the extension consent hook.
+                self.subagents.tool_started(call_id, name)
                 call = tool_call(call_id, name, event.get("args") or {}, self.cwd, "pending")
                 known = call_id in self.tools
                 self.tools[call_id] = call
@@ -454,6 +457,12 @@ class Session:
                           "status": ("failed" if failed else "completed") if kind.endswith("end") else "in_progress",
                           "rawOutput": result,
                           "content": [{"type": "content", "content": {"type": "text", "text": text_content(result.get("content"))}}]}
+                if kind.endswith("end"):
+                    self.subagents.tool_ended(call_id)
+                # Every frame of a delegating call carries its latest children,
+                # so a client that keeps only the newest frame still has them.
+                if meta := self.subagents.meta(call_id):
+                    update["_meta"] = meta
                 await self.update(update)
                 if kind.endswith("end") and not failed:
                     details = result.get("details") or {}
@@ -473,14 +482,29 @@ class Session:
             if error:
                 self.failure = error
         elif kind == "aelix_subagent":
-            await self.server.send({"jsonrpc": "2.0", "method": "_aelix/subagent",
-                                    "params": {"sessionId": self.id, "event": event.get("event"), "data": event.get("data", {})}})
+            await self.subagent_progress(event.get("event"), event.get("data") or {})
         elif kind == "extension_ui_request":
             task = asyncio.create_task(self.handle_ui(event))
             self.tasks.add(task)
             self.ui_tasks.add(task)
             task.add_done_callback(self.tasks.discard)
             task.add_done_callback(self.ui_tasks.discard)
+
+    async def subagent_progress(self, name, data):
+        """Show a delegated child on its parent `agent` tool call (standard ACP)."""
+        parent, meta = self.subagents.record(name, data)
+        if parent is None:
+            # No parent tool call (for example `/agents run`): keep the
+            # extension notification. Standard clients ignore it.
+            await self.server.send({"jsonrpc": "2.0", "method": "_aelix/subagent",
+                                    "params": {"sessionId": self.id, "event": name, "data": data}})
+            return
+        if meta is None:
+            return
+        update = {"sessionUpdate": "tool_call_update", "toolCallId": parent, "_meta": meta}
+        if parent == self.subagents.open_call:
+            update["status"] = "in_progress"
+        await self.update(update)
 
     async def update(self, update):
         append_event(self.server.db, self.id, update)
@@ -699,6 +723,7 @@ class Session:
         self.done = asyncio.get_running_loop().create_future()
         self.failure = None
         self.tools.clear()
+        self.subagents.clear()
         try:
             timeout = getattr(self.server.args, "turn_timeout", 600)
             async with asyncio.timeout(timeout or None):

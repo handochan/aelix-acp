@@ -20,6 +20,7 @@ from . import __version__
 from .wire.errors import ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH, require_object, require_string
 from .runtime.store import open_store, load_preferences, history
 from .runtime.controls import MODE_IDS
+from .runtime.subagents import META_KEY as SUBAGENTS_META
 from .stdio import StdinReader
 from .wire.transport import decode_frame, StdoutWriter
 from .runtime.extensions import run_extension_action, require_consent
@@ -118,7 +119,8 @@ class Server:
                     "agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True, "image": True},
                                           "mcpCapabilities": {"http": True, "sse": True},
                                           "sessionCapabilities": {"list": {}, "delete": {}},
-                                          "_meta": {"aelix/errors": {"sessionLocked": SESSION_LOCKED, "turnFailedAfterDispatch": TURN_FAILED_AFTER_DISPATCH}}},
+                                          "_meta": {SUBAGENTS_META: {"version": 1, "on": "tool_call_update"},
+                                                    "aelix/errors": {"sessionLocked": SESSION_LOCKED, "turnFailedAfterDispatch": TURN_FAILED_AFTER_DISPATCH}}},
                     "_meta": {"aelix/control": {"version": 1, "methods": ["_aelix/capabilities", "_aelix/manage"],
                               "clientActionCapability": "aelix/clientActions"}}, "authMethods": []}
         if method in ("session/new", "session/load"):
