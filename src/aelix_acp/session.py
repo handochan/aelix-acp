@@ -125,7 +125,8 @@ class Session:
         if mode is None:
             mode = self.initial_mode or "default"
         if not isinstance(mode, str) or mode not in MODE_IDS:
-            raise ProtocolError("Saved permission mode is unsupported; refusing to resume")
+            raise ProtocolError("Saved permission mode is not Ask or Yolo; refusing to resume", -32602,
+                                {"kind": "unsupported_saved_mode", "mode": str(mode)[:64], "supported": sorted(MODE_IDS)})
         self.launch_mode = mode
 
     async def start(self, session_file=None):
@@ -222,7 +223,8 @@ class Session:
             raise ProtocolError("The tool approval bridge did not load; refusing this session", -32603)
         await self.controls.refresh()
         if self.controls.capabilities.get("version") != 1:
-            raise ProtocolError("Aelix runtime control v1 is required; update Aelix", -32004)
+            raise ProtocolError("Aelix runtime control v1 is required; update Aelix", -32004,
+                                {"kind": "runtime_control_required", "required": 1})
         methods = self.controls.capabilities.get("methods", [])
         self.recovery_warnings = []
         if self.client_mcp:

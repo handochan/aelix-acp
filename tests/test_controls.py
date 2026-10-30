@@ -155,8 +155,10 @@ class ControlsTests(unittest.IsolatedAsyncioTestCase):
         for stored in ("auto", "plan"):
             with self.server.db:
                 save_preferences(self.server.db, "stale", {"permission_mode": stored})
-            with self.assertRaisesRegex(ProtocolError, "unsupported"):
+            with self.assertRaises(ProtocolError) as caught:
                 Session(self.server, "stale", self.temp.name)
+            self.assertEqual(caught.exception.data["kind"], "unsupported_saved_mode")
+            self.assertEqual(caught.exception.data["mode"], stored)
 
     async def test_restored_mode_notification_follows_open_response(self):
         events = []
