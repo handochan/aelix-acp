@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import ProtocolError, Server, Session
+from aelix_acp.wire.errors import SESSION_LOCKED, is_native_session_locked
+from aelix_acp.runtime.leases import acquire
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -174,6 +176,34 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             await self.session.rpc("compact", _timeout=0.01)
         self.assertEqual(caught.exception.code, -32007)
         self.assertEqual(calls, ["compact", "abort"])
+
+    def test_native_lock_phrase_is_recognized_in_one_place(self):
+        self.assertTrue(is_native_session_locked("Error: this session is already open in another terminal.\n  /x.jsonl"))
+        self.assertTrue(is_native_session_locked("session is already open in another terminal: /x.jsonl"))
+        self.assertFalse(is_native_session_locked("Error: this session's lock file cannot be used."))
+
+    async def test_native_lock_rejection_of_a_request_is_structured(self):
+        reader = asyncio.StreamReader()
+        self.session.proc = SimpleNamespace(stdout=reader, returncode=None)
+        future = asyncio.get_running_loop().create_future()
+        self.session.pending["swap"] = future
+        reader.feed_data(json.dumps({"type": "response", "id": "swap", "success": False, "command": "switch_session",
+                                     "error": "session is already open in another terminal: /private/file.jsonl"}).encode() + b"\n")
+        reader.feed_eof()
+        self.session._close_task = asyncio.get_running_loop().create_future()  # Keep read_rpc from closing the fixture.
+        await self.session.read_rpc()
+        error = future.exception()
+        self.assertEqual((error.code, error.data["kind"], error.data["lockedBy"]), (SESSION_LOCKED, "session_locked", "native"))
+        self.assertNotIn("/private/file.jsonl", json.dumps(error.data) + str(error))
+
+    def test_a_second_adapter_lease_is_a_structured_lock(self):
+        held = acquire(self.tmp.name, "shared")
+        try:
+            with self.assertRaises(ProtocolError) as caught:
+                acquire(self.tmp.name, "shared")
+            self.assertEqual((caught.exception.code, caught.exception.data["lockedBy"]), (SESSION_LOCKED, "acp"))
+        finally:
+            held.close()
 
     async def test_child_eof_finishes_turn_with_error(self):
         reader = asyncio.StreamReader()

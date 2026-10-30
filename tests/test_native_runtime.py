@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from support import AcpClient
+from aelix_acp.wire.errors import SESSION_LOCKED
 
 EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
 
@@ -222,10 +223,13 @@ def setup(api):
     async def test_live_session_lease_blocks_other_adapters_and_close_preserves_history(self):
         other = await AcpClient.start(self.root, EXECUTABLE)
         try:
-            with self.assertRaisesRegex(RuntimeError, "another ACP process"):
-                await other.request("session/load", {"sessionId": self.session, "cwd": str(self.root), "mcpServers": []})
-            with self.assertRaisesRegex(RuntimeError, "another ACP process"):
-                await other.request("session/delete", {"sessionId": self.session})
+            for method, params in (("session/load", {"sessionId": self.session, "cwd": str(self.root), "mcpServers": []}),
+                                   ("session/delete", {"sessionId": self.session})):
+                with self.assertRaises(RuntimeError) as caught:
+                    await other.request(method, params)
+                error = json.loads(str(caught.exception))
+                self.assertEqual((error["code"], error["data"]["kind"], error["data"]["lockedBy"]),
+                                 (SESSION_LOCKED, "session_locked", "acp"))
             await self.manage("sessions/close")
             result = await other.request("session/load", {"sessionId": self.session, "cwd": str(self.root), "mcpServers": []})
             self.assertIn("configOptions", result)
@@ -416,6 +420,33 @@ def setup(api):
         self.client.permission = "reject-once"
         await self.prompt("Respond")
         self.assertFalse(self.model_requests[-1].get("tools"), self.model_requests[-1].get("tools"))
+
+    async def test_native_lock_holder_refuses_load_with_a_structured_error(self):
+        import sqlite3
+        import subprocess
+        await self.prompt("Respond")
+        await self.manage("sessions/close")
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            native_file = db.execute("SELECT file FROM sessions WHERE id=?", (self.session,)).fetchone()[0]
+        env = {key: os.environ[key] for key in ["PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"] if key in os.environ}
+        env.update(HOME=str(self.root / "home"), USERPROFILE=str(self.root / "home"),
+                   AELIX_CODING_AGENT_DIR=str(self.root / "agent"), AELIX_SETTINGS_PATH=str(self.root / "agent/settings.json"))
+        holder = subprocess.Popen([EXECUTABLE, "--mode", "rpc", "--offline", "--no-extensions", "--session", native_file],
+                                  cwd=self.root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            holder.stdin.write(b'{"id":"ready","type":"get_state"}\n')
+            holder.stdin.flush()
+            self.assertIn(b'"ready"', await asyncio.to_thread(holder.stdout.readline))
+            with self.assertRaises(RuntimeError) as caught:
+                await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}, timeout=60)
+            error = json.loads(str(caught.exception))
+            self.assertEqual((error["code"], error["data"]["lockedBy"], error["data"]["holder"], error["data"]["retryable"]),
+                             (SESSION_LOCKED, "native", None, False))
+        finally:
+            holder.stdin.close()
+            holder.wait(10)
+        result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}, timeout=60)
+        self.assertIn("configOptions", result)
 
     async def test_extension_commands_and_dialogs_do_not_call_the_model(self):
         await self.prompt("/echo  raw")

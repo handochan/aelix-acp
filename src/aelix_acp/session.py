@@ -18,7 +18,8 @@ import tempfile
 import time
 import uuid
 
-from .wire.errors import ProtocolError, BackendError, require_object, require_string
+from .wire.errors import (ProtocolError, BackendError, is_native_session_locked,
+                          require_object, require_string, session_locked)
 from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter
 from .runtime.controls import SessionControls, MODE_IDS
@@ -34,6 +35,7 @@ KINDS = {"read": "read", "grep": "search", "find": "search", "ls": "read",
          "analytics_status": "read", "analytics_query": "read"}
 # Native history selectors. A launch prefix must not bypass session/load.
 SESSION_SELECTORS = ("--session", "--resume", "-r", "--continue", "-c", "--fork", "--no-session")
+STDERR_TAIL = 16 * 1024
 FRAME_LIMIT = 16 * 1024 * 1024
 
 
@@ -81,6 +83,8 @@ class Session:
         self.permission_token = None
         self.permission_endpoint = None
         self.worker_job = None
+        self.stderr_task = None
+        self.stderr_tail = bytearray()
         self.controls = SessionControls(self)
         self.mutation_lock = asyncio.Lock()
         self.restore_launch_preferences()
@@ -191,8 +195,13 @@ class Session:
                 self.proc.kill()
                 await self.proc.wait()
                 raise
-        self.tasks = {asyncio.create_task(self.read_rpc()), asyncio.create_task(self.read_stderr())}
-        self.state = await self.rpc("get_state")
+        self.stderr_task = asyncio.create_task(self.read_stderr())
+        self.tasks = {asyncio.create_task(self.read_rpc()), self.stderr_task}
+        try:
+            self.state = await self.rpc("get_state")
+        except ProtocolError:
+            await self.raise_if_locked()
+            raise
         if not ready_file.is_file() or ready_file.read_text() != nonce:
             raise ProtocolError("The tool approval bridge did not load; refusing this session", -32603)
         await self.controls.refresh()
@@ -244,6 +253,22 @@ class Session:
         if metadata.get("aelix/clientActions") is True and "ui/enable" in methods:
             await self.rpc("aelix_control", method="ui/enable", params={"enabled": True})
         self.save()
+
+    async def raise_if_locked(self):
+        """Report native's writer-lock refusal as a structured, final error."""
+        await self.settle_exit()
+        if is_native_session_locked(self.stderr_tail.decode("utf-8", errors="replace")):
+            raise session_locked(self.id, "native") from None
+
+    async def settle_exit(self):
+        # Native explains a startup refusal on stderr and exits. Let a worker
+        # whose RPC stream already closed finish exiting and flush stderr.
+        if self.proc is None or self.stderr_task is None or not self.rpc_closed:
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self.proc.wait(), 2)
+        if self.proc.returncode is not None:
+            await asyncio.wait({self.stderr_task}, timeout=2)
 
     async def restore_tools(self):
         if self.active_tools is None:
@@ -344,6 +369,8 @@ class Session:
         writer = StdoutWriter(sys.stderr.fileno())
         try:
             while chunk := await self.proc.stderr.read(4096):
+                # Bounded copy for native refusals reported only on stderr.
+                self.stderr_tail = (self.stderr_tail + chunk)[-STDERR_TAIL:]
                 text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
                 await writer.write(text.encode("utf-8"))
         finally:
@@ -364,6 +391,8 @@ class Session:
                     if not future.done():
                         if event.get("success"):
                             future.set_result(event.get("data") or {})
+                        elif is_native_session_locked(event.get("error", "")):
+                            future.set_exception(session_locked(self.id, "native"))
                         else:
                             future.set_exception(BackendError(str(event.get("error", "RPC failed")), event.get("command", "unknown")))
                 else:
@@ -702,6 +731,7 @@ class Session:
 
     async def _close(self):
         self.permission_token = None
+        await self.settle_exit()
         for task in list(self.permission_connections):
             task.cancel()
         await asyncio.gather(*self.permission_connections, return_exceptions=True)

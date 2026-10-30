@@ -12,6 +12,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import Server, Session
 from aelix_acp.runtime.store import save_preferences
+from aelix_acp.wire.errors import SESSION_LOCKED
 
 
 FAKE_CHILD = '''import json,os,sys,subprocess
@@ -105,6 +106,17 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('approval bridge did not load', result['error']['message'])
         child_pid = int((self.root / 'child.pid').read_text())
         self.assertFalse(process_alive(child_pid))
+
+    async def test_native_lock_refusal_is_a_structured_error(self):
+        await self.start(locked=True)
+        result = await self.request(1, 'session/new', {'cwd':str(self.root),'mcpServers':[]})
+        error = result['error']
+        self.assertEqual(error['code'], SESSION_LOCKED)
+        self.assertEqual(error['data']['kind'], 'session_locked')
+        self.assertEqual(error['data']['lockedBy'], 'native')
+        self.assertIsNone(error['data']['holder'])
+        self.assertIs(error['data']['retryable'], False)
+        self.assertNotIn('/fixture/session.jsonl', json.dumps(error))
 
     async def test_launch_preferences_are_read_after_session_lease_admission(self):
         self.child.write_text(FAKE_CHILD.replace('Path("child.pid")', 'Path("child.args").write_text(json.dumps(sys.argv))\nPath("child.pid")', 1), encoding='utf-8')

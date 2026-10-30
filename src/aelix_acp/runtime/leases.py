@@ -5,7 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 
-from ..wire.errors import ProtocolError
+from ..wire.errors import ProtocolError, session_locked
 
 
 def acquire(directory: str, session_id: str):
@@ -29,5 +29,5 @@ def acquire(directory: str, session_id: str):
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         stream.close()
-        raise ProtocolError("Session is open in another ACP process; close it there first", -32000) from None
+        raise session_locked(session_id, "acp") from None
     return stream
