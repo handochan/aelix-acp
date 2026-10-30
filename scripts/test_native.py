@@ -18,6 +18,7 @@ def main():
         actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=core, text=True).strip()
         if actual != expected:
             raise SystemExit(f"Native runtime mismatch: expected {expected}, found {actual}")
+        print(f"Native runtime: aelix-ai {actual} (runtime-reference.json)", flush=True)
     binaries = core / ".venv" / ("Scripts" if os.name == "nt" else "bin")
     python = binaries / ("python.exe" if os.name == "nt" else "python")
     aelix = binaries / ("aelix.exe" if os.name == "nt" else "aelix")
