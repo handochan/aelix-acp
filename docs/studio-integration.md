@@ -16,6 +16,8 @@ Aelix lacks these operations. Advertise client actions only after implementing t
    IDs: `permission_mode`, `model`, `thinking_level`, `steeringMode`,
    `followUpMode`, `autoCompactionEnabled`, `autoRetryEnabled`. Boolean options
    use string `true`/`false`. Replace the catalog after model changes.
+   `permission_mode` is `default` (Ask) or `yolo`. A `current_mode_update`
+   follows every new/load response with the restored mode.
 5. Render available commands, text/thought chunks, tool calls, updates, status,
    raw input/output and file locations. Answer `session/request_permission`
    with a listed option ID. Dismissal denies/cancels.
@@ -39,9 +41,22 @@ without repeating output; reload history if output was lost. `-32006` means
 unresolved effects: show history and require a deliberate new user action.
 Never silently retry with a fresh key. `-32008` is changed content under one
 key, `-32007` RPC timeout, `-32004` missing capability/client action,
-`-32000` busy/limit/lease, `-32003` denied management approval, `-32602`
-invalid parameters and `-32603` backend failure. Use `error.data`, not parsing
-human error messages, when details are provided.
+`-32000` busy/limit, `-32003` denied management approval, `-32602`
+invalid parameters and `-32603` backend failure before native work started.
+Use `error.data`, not parsing human error messages, when details are provided.
+
+Two application codes sit outside the ranges JSON-RPC and ACP reserve, and are
+also listed in `agentCapabilities._meta["aelix/errors"]`:
+
+| Code | `data` | Meaning |
+|---|---|---|
+| `-33001` | `{kind:"session_locked", sessionId, lockedBy:"native"\|"acp", holder:null, retryable:false}` | Another writer holds the session: the CLI or another native process (`native`), or another adapter process (`acp`). Show it; reopen after that writer closes. `holder` stays `null` until aelix-ai reports the lock holder (Studio request R7). |
+| `-33002` | `{kind:"turn_failed_after_dispatch", retryable:false, cause?}` | The turn failed after native accepted work. Model calls or tool effects may have happened; do not resend automatically. |
+
+AionCore maps both to a non-retryable protocol error, so its automatic turn
+replay (only for `retryable == true`) does not run. The native lock is
+recognized from native's own refusal text until R7 provides a structured
+signal; the native transcript path is never copied into the error.
 
 ## Management
 
@@ -86,7 +101,10 @@ Offline updates need a recorded local source or configured local index.
 Create/load can return `_meta["aelix/recoveryWarnings"]`. Display these warnings
 alongside the effective selectors; warnings are also emitted as text. Missing
 model choices retain the native fallback. A failed saved profile resets its
-identity and uses explicit approval unless Plan was already selected.
+identity and returns to Ask. A saved profile or tool selection that the runtime
+cannot enforce refuses the load (`-32004`, `kind:"restrictions_unenforceable"`).
+`_meta["aelix/permission"]` reports the native posture read back with
+`permissions/get` next to the client approval policy.
 
 Skills/prompts are native files. Studio can author them through its file
 editor, set `skill_paths` / `prompt_template_paths` and reload. This API
@@ -114,7 +132,6 @@ from an active slash action.
 | `dialog` | Native event, `id`, `method`, `title`, options, etc. | Render and return result below |
 | `new_session` | `{cwd}` | Queue creation/navigation after acknowledging |
 | `open_session` | `{sessionId,parentSessionId?}` | Queue load/navigation after acknowledging |
-| `clear` | Raw argument string | Clear visible view per Studio policy |
 | `login` / `logout` | Raw argument string | Open provider management |
 | `trust` | Raw argument string | Open trust controls |
 | `statusline` / `hotkeys` / `expand` | Raw argument string | Studio presentation |
@@ -132,12 +149,36 @@ Dismissal replies `{cancelled:true}`. Select/input/editor/oauthSelect use
 reply `{}` to continue or cancel. Never persist OAuth codes/inputs/URLs as
 transcript text. Native deadline is 300 seconds, client request slightly less.
 
-Notifications `_aelix/notification` and `_aelix/subagent` need no response.
-The former carries transient auth progress. The latter carries
-`{sessionId,event,data}` with event `subagent_start`, `subagent_tool` or
-`subagent_end`. Data can contain native ID, profile, state, current_tool,
-elapsed_ms, tokens, cost, model, provider. Key cards by native ID. Progress
-events are not a crash-recovery queue or independent child chats.
+`_aelix/notification` carries transient auth progress and needs no response.
+
+## Delegated children
+
+A child started by the model's `agent` tool is reported on that tool call, in
+standard ACP. Every `tool_call_update` for the parent after the first child
+event carries:
+
+```json
+{"sessionUpdate":"tool_call_update","toolCallId":"call_1","status":"in_progress",
+ "_meta":{"aelix/subagents":{"version":1,"children":[{"id":"sub-…","profile":"reviewer",
+ "state":"running","currentTool":"read","elapsedMs":2300,"tokens":0,"cost":0.0,
+ "model":"one","provider":"fixture","event":"subagent_tool"}]}}}
+```
+
+`children` is the complete latest list for that call (at most 32), so a client
+that keeps only the newest frame, or merges frames with JSON merge-patch as
+AionCore stores them, still has every child. `state` is native's
+`starting|running|done|error|stopped`; text fields are child-authored, bounded
+to 256 characters and stripped of control characters. Native's own progress
+card text keeps arriving as the call's `content`. A late child event after the
+call ended carries `_meta` without `status`. `agent action=resume` moves the
+child to the new call. Native runs `agent` calls one at a time, which is what
+lets the adapter attribute children without a parent ID in native's event.
+
+A child event with no open `agent` call (for example `/agents run`) is still
+sent as the `_aelix/subagent` notification `{sessionId,event,data}`. AionCore
+ignores agent-to-client extension notifications. Progress is not a
+crash-recovery queue or an independent child chat; per-child approval, stop
+and steering are not part of this contract.
 
 ## Packaging and acceptance
 

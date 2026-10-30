@@ -1,5 +1,8 @@
 # ACP Preview 개발 착수
 
+> Preview 시점의 착수 안내입니다. Beta 작업은 [ACP #20](https://github.com/handochan/aelix-acp/issues/20)
+> 이후 runtime-control v1 기준 main에서 진행하며, beta.2 Preview는 ACP `117cf6c9d536c4aa98b1f3a6481c12464584960c`를 씁니다.
+
 공통 설계의 기준 저장소는 [Aelix Studio](https://github.com/handochan/aelix-studio/blob/main/docs/studio-release-train/README.md)다.
 기능·계약·출시 조건을 ACP에 별도로 복제하지 않고 해당 문서와 실제 Issue를 함께 갱신한다.
 

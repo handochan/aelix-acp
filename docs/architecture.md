@@ -1,6 +1,6 @@
 # ACP runtime-control boundary
 
-Status: development candidate, 2026-10-23.
+Status: development candidate, 2026-10-23; realigned on main for the Beta, 2026-10-31 (ACP #20).
 
 The adapter owns ACP v1 framing, presentation, process lifetime, session indexing
 and client approval. Aelix owns models, authentication, native sessions,
@@ -33,16 +33,17 @@ need a client-specific adaptation.
 Each session owns one child, approval listener, readers, pending requests and
 an OS session lease. Startup reservations enforce the process limit during
 concurrent creation. Failure before readiness closes the candidate. EOF and
-adapter shutdown close children. POSIX process groups and Windows process-group
-and taskkill fallback provide bounded orderly cleanup. This is not a Windows
-Job Object or a universal guarantee after hard parent termination.
-On Windows without an attached console, termination falls back to the system's
-absolute taskkill path. Pipe readers drain during shutdown so child exit is
-not held open by a full output buffer. POSIX cleanup also kills remaining
-members of the owned group after its leader exits.
+adapter shutdown close children. POSIX native workers run in their own process
+group; cleanup terminates it and kills members left after the leader exits.
+On Windows a trusted gate holds the native bootstrap until the worker joins a
+kill-on-close Job Object, so the worker and every descendant, including MCP
+servers started before the first RPC, end when the adapter's job handle closes,
+even after a hard adapter kill. The extension manager subprocess keeps the
+process-group/taskkill fallback. Pipe readers drain during shutdown so child
+exit is not held open by a full output buffer.
 
-Windows stdin uses a daemon with one-line demand credits, avoiding unbounded
-queues and blocked executor shutdown. Frames are bounded to 16 MiB; invalid
+Stdin uses a bounded raw-descriptor daemon on every OS, avoiding unbounded
+queues, Windows Proactor pipes and blocked executor shutdown. Frames are bounded to 16 MiB; invalid
 Unicode, nonfinite numbers and excess requests are rejected. Stderr drains in
 chunks. Cancellation reaches native control tasks without waiting for their
 mutation lock and cancels pending dialogs.
@@ -65,12 +66,15 @@ ephemeral loopback endpoint. Requests must match a known native tool-call ID
 and name. Actual arguments after prior hooks are shown for consent. Invalid
 authentication, failure, cancellation and deadlines deny execution.
 
-Permission modes use verified native provenance, not names. The authenticated
-bridge also evaluates the pinned native containment/sensitive-path helper for
-file edits; unavailable compatibility falls back to client approval. Unknown and MCP
-tools never inherit built-in read/edit exemptions. Auto shell classification
-uses the native classifier. Native policy precedes client approval; full
-access removes client prompts while native guardrails remain.
+Permission modes are Ask and Yolo. Ask requests client approval for every
+tool; Yolo removes client prompts while native guardrails, tool restrictions
+and other extensions' denials remain. Native posture follows through
+`--permission-mode` at launch and `permissions/set`, read back with
+`permissions/get`. A downgrade revokes client Yolo and its saved value before
+native is asked; an upgrade applies only after native confirms. Native's
+Plan, Auto Edit and Auto are not advertised: their headless RPC behavior has
+not been accepted for Studio. On POSIX the channel is a private Unix socket in
+a 0700 directory; on Windows a per-worker token authenticates loopback TCP.
 
 Installed extensions and the process environment are trusted. Extension Python
 can run during loading or commands with the host's authority. The bridge is
@@ -101,7 +105,22 @@ not prove a tool did nothing. Protect history as sensitive user data.
 The native `agent_end` closes a provider attempt. ACP prompt completion instead
 waits for native `get_state.isStreaming` to become false, including retries and
 closing compaction. Missing saved model/profile choices recover with visible
-warnings; a missing restricted profile never recovers into silent write access.
+warnings; a missing restricted profile returns to Ask. A saved profile or tool
+selection the runtime cannot enforce refuses the session instead of falling
+back to broader defaults.
+
+Once a turn has sent native anything but a read-only request (the prompt, a
+mutating control or command, a worker restart or a package change), a failure
+is reported as `-33002` with `retryable:false`. A client or host must not
+replay it automatically: model calls and tool effects may already have run.
+AionCore's turn recovery replays only errors it classifies as retryable, and
+classifies this code as a non-retryable protocol error.
+
+A native writer-lock refusal ("already open in another terminal", whether at
+startup or on a session switch) and a second adapter's ACP lease become
+`-33001` (`session_locked`). Until aelix-ai reports the lock holder (Studio
+request R7), native's refusal text is the only signal; one function in
+`wire/errors.py` matches it so R7 can replace it.
 
 Known unresolved candidate limitation: native JSONL is bounded to 16 MiB too.
 An oversized aggregate event or `get_messages` response can close its actor.

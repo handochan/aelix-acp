@@ -1,4 +1,61 @@
-# Productization evidence — 2026-10-23
+# Productization evidence
+
+## Beta realignment — 2026-10-31 (ACP #20)
+
+Candidate: this adapter on ACP main plus native aelix-ai
+`e19ab55e17e871a40356fc9802f3f6669ca727de` (main before the beta.3 cut,
+including delegated child results #615 and `agent action=resume` #610/#626).
+Re-pin to the beta.3 release tag when it is cut; control-v1 is not frozen yet
+(aelix-ai #623), so the native suite must be rerun on that tag.
+
+Host: macOS arm64, Python 3.12.13, synthetic loopback model, isolated HOME and
+native directories. Levels are kept separate:
+
+| Level | What ran | Result |
+|---|---|---|
+| Source | Unit suite (`python -m unittest discover -s tests`) | Pass; native-process tests skipped without a runtime |
+| Native process | `scripts/test_native.py --core <aelix-ai at the pin>`: every unit test plus 34 tests through an actual native child | Pass (Windows Job test skipped on macOS) |
+| Native process | `scripts/test_packages.py`: offline starter wheel install, enable, `/hello`, update, disable, remove | Pass |
+| Host | `scripts/smoke_host.py` with the AionCore `v0.2.2` release binary (`aioncore-v0.2.2-aarch64-apple-darwin.tar.gz`, binary sha256 `04404864ca622159ffcc79ef9cb468e82fc820b91f16d565c5a5efdb0b0c4cb1`; the same source as aelix-studio-host main `47e66d0d`) | Pass, see below |
+| UI | Studio renderer / Electron | Not run |
+| Live provider | Real model provider, OAuth | Not run |
+
+Host smoke checks, through actual host HTTP → host ACP client → this adapter →
+native, with a structure-only wire tap and the host's own SQLite rows:
+
+- A provider failure after native dispatch reaches the host once as `-33002`;
+  the host sends no second prompt and no reload, and the model sees one request.
+  The same flow with the PR #1 adapter (`-32603`) made the host start its
+  automatic replay: it re-initialized the adapter and sent `session/load`. That
+  attempt then stopped on the previous adapter's still-held session lease, so
+  this run shows the replay starting, not a second model call.
+- A model-driven `agent` delegation streams parent `tool_call_update` frames
+  with `_meta["aelix/subagents"]` while the call is `in_progress`; the host
+  persists the parent `acp_tool_call` row with the final child (`reviewer`,
+  `done`) and returns it from the conversation messages API.
+- With a separate native process holding the session file, the host's resume
+  receives `-33001` (`session_locked`, `lockedBy: native`), records the error,
+  does not fall back to `session/new` and sends nothing to the model. After the
+  holder exits the same conversation resumes.
+
+Native-process coverage added for this change: Ask/Yolo effects and native
+posture read-back; refusal of Plan/Auto Edit/Auto; launch-owned extension
+disable refused while its command keeps running (#9); a disabled extension
+leaves native's inventory; seeded `agent=restricted-fixture`, `activeTools=[]`,
+`permission_mode=yolo` resumes in Ask with a warning and an actual model request
+that carries no tools (#10); a real native lock holder refuses `session/load`
+with `-33001`; a provider failure with native retry off returns `-33002` after
+one model request; a parented child never uses `_aelix/subagent`.
+
+Not covered: Windows and Linux are left to exact-head CI; packaged
+installers, the Studio renderer showing the `_meta`, real providers, and a crash
+of the adapter process itself (AionCore classifies that disconnect as
+retryable and can replay it).
+
+## Development candidate — 2026-10-23 (historical)
+
+The rest of this file records PR #1 at native `10854a2d4cfc089cdf021c3f2e251bce9f230d94`.
+It includes the Plan/edit modes that the Beta realignment no longer advertises.
 
 Candidate: aelix-acp 0.2.0a1 + native runtime-control v1, exact source recorded
 in `runtime-reference.json`. This is a development candidate for Studio
