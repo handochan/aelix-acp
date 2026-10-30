@@ -10,7 +10,7 @@ import unittest
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from aelix_acp.server import Server, Session
+from aelix_acp.server import ProtocolError, Server, Session
 from aelix_acp.runtime.store import save_preferences
 from aelix_acp.wire.errors import SESSION_LOCKED
 
@@ -136,6 +136,24 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await session.close()
             server.db.close()
+
+    async def test_saved_restrictions_without_native_enforcement_refuse_to_start(self):
+        self.child.write_text(FAKE_CHILD.replace('"tools/set_active",', ''), encoding='utf-8')
+        server = Server(SimpleNamespace(state_dir=str(self.root / "state"), profile="coding",
+            aelix=sys.executable, aelix_arg=[str(self.child)], provider=None, model=None))
+        session = Session(server, "restricted", str(self.root))
+        try:
+            with server.db:
+                save_preferences(server.db, "restricted", {"activeTools": [], "permission_mode": "yolo"})
+            with self.assertRaises(ProtocolError) as caught:
+                await session.start()
+            self.assertEqual(caught.exception.code, -32004)
+            self.assertEqual(caught.exception.data, {"kind": "restrictions_unenforceable", "methods": ["tools/set_active"]})
+            self.assertEqual(session.controls.permission_mode, "default")
+        finally:
+            await session.close()
+            server.db.close()
+        self.assertFalse(process_alive(int((self.root / 'child.pid').read_text())))
 
     @unittest.skipUnless(sys.platform == 'win32', 'Windows kill-on-close job boundary')
     async def test_forced_adapter_death_kills_owned_worker_and_descendant(self):
