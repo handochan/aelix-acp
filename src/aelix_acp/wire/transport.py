@@ -1,4 +1,4 @@
-"""Bounded JSONL and JSON-RPC validation, including Windows stdio pipes."""
+"""Bounded JSON-RPC validation and non-blocking stdout writes, including Windows pipes."""
 from __future__ import annotations
 
 import asyncio
@@ -114,55 +114,3 @@ def decode_frame(raw: bytes) -> dict:
     elif "id" not in value or ("result" in value) == ("error" in value):
         raise ProtocolError("Invalid JSON-RPC response", -32600)
     return value
-
-
-async def stdin_reader() -> tuple[asyncio.StreamReader, object | None]:
-    reader = asyncio.StreamReader(limit=MAX_FRAME_BYTES)
-    loop = asyncio.get_running_loop()
-    if sys.platform != "win32":
-        transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer)
-        return reader, transport
-
-    # A daemon rather than the default executor: a cancelled blocked stdin read
-    # must not hold asyncio.run()'s executor shutdown open on Windows.
-    credit = threading.Semaphore(0)
-    stopped = threading.Event()
-
-    class DemandReader(asyncio.StreamReader):
-        async def readline(self):
-            credit.release()
-            return await super().readline()
-
-    class PumpControl:
-        def close(self):
-            stopped.set()
-            credit.release()
-
-    reader = DemandReader(limit=MAX_FRAME_BYTES)
-
-    def pump() -> None:
-        try:
-            while not stopped.is_set():
-                credit.acquire()
-                if stopped.is_set():
-                    return
-                raw = sys.stdin.buffer.readline(MAX_FRAME_BYTES + 1)
-                if not raw:
-                    return
-                if len(raw) > MAX_FRAME_BYTES:
-                    loop.call_soon_threadsafe(reader.set_exception, ValueError("Input frame too large"))
-                    return
-                loop.call_soon_threadsafe(reader.feed_data, raw)
-        except (OSError, ValueError) as error:
-            try:
-                loop.call_soon_threadsafe(reader.set_exception, error)
-            except RuntimeError:
-                pass
-        finally:
-            try:
-                loop.call_soon_threadsafe(reader.feed_eof)
-            except RuntimeError:
-                pass
-
-    threading.Thread(target=pump, name="acp-stdin", daemon=True).start()
-    return reader, PumpControl()

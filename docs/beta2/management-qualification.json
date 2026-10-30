@@ -1,0 +1,982 @@
+{
+  "schema": "aelix-acp.management-qualification/1",
+  "status": "passed",
+  "recordedAt": "2026-10-25T04:30:20.736953+00:00",
+  "platform": "Darwin/arm64",
+  "python": "3.12.13",
+  "scope": "test-only helper spike, installed ACP, actual AionCore HTTP/stdio; synthetic model and OAuth",
+  "mode": "native-and-host",
+  "nativePatches": [],
+  "realProvider": false,
+  "installer": false,
+  "sourceCommit": "c573b2cacc26b1b76e1377ceeaa1bd1bf6b3431e",
+  "harnessSourceSha256": {
+    "qualify_management.py": "a4295284a40ee35982bb51a83cdc902da34378cfe8318e420a017888a1ba6318",
+    "management_probe_helper.py": "7f8dd55c80187d8771eeba9a15a8a06e6c605123483da58b41a0796266cb69f8",
+    "host_wire_tap.py": "2d85ed6c3455ce8a47c1da7e3ebe6ec4012ccc7273cf73308ba432bd3c7943f0",
+    "auth_lock_probe.py": "3b28f38e758844da942da66635f5bc84ac3be9555411936cac6743fccd55e720",
+    "management_model_fixture.py": "07dd24a5192b3af16aef1383ca826d71fec28125f0b4849f25d741346ab75e4b"
+  },
+  "stage": "complete",
+  "identityBefore": {
+    "wheels": [
+      {
+        "distribution": "aelix",
+        "version": "0.1.0b2",
+        "sha256": "98a9201be2c84c96a1e3944bd003ba7b7346e6e0807dfbfaae3a00ef8e4994b7",
+        "wheelBytes": 21796,
+        "installedMembersVerified": 9
+      },
+      {
+        "distribution": "aelix-ai",
+        "version": "0.1.0b2",
+        "sha256": "5a8b03bdc87161ea17efd96500b13fd7627618c14b6402e9e46a20d6414f1552",
+        "wheelBytes": 392074,
+        "installedMembersVerified": 68
+      },
+      {
+        "distribution": "aelix-agent-core",
+        "version": "0.1.0b2",
+        "sha256": "f3fdabe25ed8e49aeed467a815fcfd4e5d18eedb4fb6d871649739220341b609",
+        "wheelBytes": 216721,
+        "installedMembersVerified": 42
+      },
+      {
+        "distribution": "aelix-coding-agent",
+        "version": "0.1.0b2",
+        "sha256": "60b19815c9355fa1a5d3c4f99e9d32ff53d4ad2522515038b76115273db8baf6",
+        "wheelBytes": 1361351,
+        "installedMembersVerified": 190
+      }
+    ],
+    "imports": [
+      "aelix_agent_core.harness.hooks:ToolCallResult",
+      "aelix_ai.oauth.auth_storage:AuthStorage",
+      "aelix_ai.models:get_supported_thinking_levels",
+      "aelix_coding_agent.extensions.api:ExtensionAPI",
+      "aelix_coding_agent.extensions.api:ExtensionContext",
+      "aelix_coding_agent.agents:parse_profile",
+      "aelix_coding_agent.agents:resolve_profile",
+      "aelix_coding_agent.agents:profile_to_flags",
+      "aelix_agent_core.session.jsonl_repo:JsonlSessionRepo"
+    ],
+    "environment": {
+      "uvicorn": "0.54.0",
+      "mcp": "1.30.0",
+      "starlette": "1.10.0",
+      "click": "8.5.0",
+      "packaging": "26.3",
+      "cryptography": "48.0.1",
+      "Pygments": "2.21.0",
+      "jsonschema-specifications": "2025.9.1",
+      "requests": "2.34.2",
+      "google-auth": "2.62.0",
+      "aelix-ai": "0.1.0b2",
+      "certifi": "2026.10.23",
+      "websockets": "16.1.1",
+      "jsonschema": "4.26.0",
+      "PyJWT": "2.15.1",
+      "tree-sitter-bash": "0.25.1",
+      "docstring_parser": "0.18.0",
+      "tree-sitter-powershell": "0.26.4",
+      "tenacity": "9.1.4",
+      "jiter": "0.18.0",
+      "httpcore": "1.0.9",
+      "aelix-coding-agent": "0.1.0b2",
+      "pycparser": "3.12",
+      "tqdm": "4.70.1",
+      "openai": "1.109.1",
+      "urllib3": "2.8.0",
+      "h11": "0.16.0",
+      "sniffio": "1.3.1",
+      "pydantic_core": "2.50.1",
+      "tree-sitter": "0.25.2",
+      "pyasn1": "0.6.4",
+      "mdurl": "0.1.2",
+      "python-multipart": "0.0.32",
+      "PyYAML": "6.0.3",
+      "sse-starlette": "3.5.1",
+      "truststore": "0.10.5",
+      "python-dotenv": "1.2.4",
+      "cffi": "2.1.1",
+      "anthropic": "0.125.0",
+      "aelix": "0.1.0b2",
+      "google-genai": "1.75.0",
+      "annotated-types": "0.8.0",
+      "referencing": "0.37.0",
+      "pydantic-settings": "2.16.1",
+      "markdown-it-py": "4.2.0",
+      "typing-inspection": "0.4.4",
+      "distro": "1.9.0",
+      "rpds-py": "2026.9.1",
+      "attrs": "26.1.0",
+      "pathspec": "1.1.1",
+      "httpx": "0.28.1",
+      "typing_extensions": "4.16.0",
+      "aelix-agent-core": "0.1.0b2",
+      "pillow": "11.3.0",
+      "pyasn1_modules": "0.4.2",
+      "pydantic": "2.14.1",
+      "charset-normalizer": "3.5.2",
+      "httpx-sse": "0.4.3",
+      "anyio": "4.15.1",
+      "idna": "3.20"
+    },
+    "verificationScope": "Original wheel members except installer-rewritten RECORD; not a dependency or bytecode security attestation"
+  },
+  "adapterBefore": {
+    "version": "0.1.0",
+    "packageFiles": {
+      "aelix_acp/__init__.py": "079a74c70fb815a4e2b50f4888e7a131575448ad3ebf9040649bbc59414e2ea7",
+      "aelix_acp/assets/PLOTLY-LICENSE.txt": "8c45d9eaf50c2f72dd9c7ab9ef440788ba58a3538484b5c51c1f17d5128752e7",
+      "aelix_acp/assets/plotly-basic-3.7.0.min.js.gz": "d48da1a9aa08bc3b4d60241f2a261dc325fe8d0100b1841e4fecf97d0b265705",
+      "aelix_acp/bridge.py": "8725a79120291fe8591fd7d190a9c315373ad404b909189ffefb63ce2e7110dc",
+      "aelix_acp/preview.py": "b6ae954188204f66c3a28417bb31a3b57d036cd96ff8e9722f13fc7058ff8201",
+      "aelix_acp/profiles/analytics.md": "e730852acda1bc29f58478bc803d076f650de903e3fdc2aa22ff20803adde357",
+      "aelix_acp/profiles/coding.md": "e232e70bbc0898957fc0cd187de1aba86abd9f1eef4d2b63e4fbff86a24af12a",
+      "aelix_acp/server.py": "b8141bd6c584dbe4bf9fc562354d09497ff581a15c464c406bc9360da11c4076"
+    }
+  },
+  "helper": {
+    "checksPassed": [
+      "explicit_cli_auth_root_differs_from_implicit_storage",
+      "llm_free_key_registration_native_store",
+      "two_process_held_auth_stale_until_reload",
+      "native_auth_file_private",
+      "sequential_two_process_provider_merge_and_logout",
+      "synthetic_native_oauth_callback_cancel_no_commit",
+      "synthetic_native_oauth_callback_commit_and_logout",
+      "helper_eof_cancels_pending_oauth_without_commit",
+      "native_sessionless_profile_resolution_and_failure",
+      "native_package_inventory_without_worker",
+      "helper_refuses_live_session_methods",
+      "status_and_results_omit_secret_values"
+    ],
+    "llmWorkersStarted": 0,
+    "productionHelper": false,
+    "oauth": "registered synthetic provider invoking real AuthStorage.login callbacks; real providers untested",
+    "sharedMutation": "sequential only; concurrent legacy writes unsupported",
+    "profileCrud": "not implemented",
+    "packageMutation": "not exercised"
+  },
+  "sharedAuth": {
+    "checksPassed": [
+      "native_rename_changes_locked_inode",
+      "second_process_public_setter_completes_while_old_fd_locked"
+    ],
+    "scope": "native private IO primitive counterexample; not a full public-setter lost-update/crash stress test",
+    "concurrentSharedMutationSupported": false,
+    "windows": "not run"
+  },
+  "adapter": {
+    "checksPassed": [
+      "auth_not_advertised_authenticate_rejected",
+      "custom_manage_method_not_found",
+      "same_request_id_executes_twice_no_dedup",
+      "busy_prompt_rejected",
+      "notification_cancel_native_terminal",
+      "disconnect_new_process_history_resume"
+    ],
+    "busyCode": -32602,
+    "deduplication": false,
+    "reconnect": "history replay after closing old process; no live attach or pending-operation replay"
+  },
+  "host": {
+    "checksPassed": [
+      "actual_host_basic_session",
+      "legacy_selector_translation",
+      "unsupported_model_rejected",
+      "same_http_request_id_runs_twice_metadata_lost",
+      "busy_delivery_rejected",
+      "stale_turn_cancel_noop",
+      "native_tool_denial_no_write_effect",
+      "cancel_pending_permission_no_write_effect",
+      "host_cancel_notification_and_cancelled_terminal",
+      "host_history_and_runtime_restart",
+      "synthetic_custom_reverse_request_no_reply_observed"
+    ],
+    "hostBinarySha256": "04404864ca622159ffcc79ef9cb468e82fc820b91f16d565c5a5efdb0b0c4cb1",
+    "hostMode": "isolated local embedded HTTP facade; no renderer UI acceptance",
+    "http": {
+      "customRoute": 404,
+      "modelUnsupported": 400,
+      "busy": 409,
+      "staleCancel": 200
+    },
+    "activeRuntimeState": "running",
+    "wire": [
+      {
+        "direction": "host_to_adapter",
+        "method": "initialize",
+        "hasId": true,
+        "paramKeys": [
+          "clientCapabilities",
+          "clientInfo",
+          "protocolVersion"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648787.227141041,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648787.25446025,
+        "resultKeys": [
+          "agentCapabilities",
+          "agentInfo",
+          "authMethods",
+          "protocolVersion"
+        ],
+        "stopReason": null,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "session/new",
+        "hasId": true,
+        "paramKeys": [
+          "cwd",
+          "mcpServers"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648787.25482775,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648787.559962375,
+        "sessionUpdate": "available_commands_update",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648787.56005875,
+        "resultKeys": [
+          "models",
+          "modes",
+          "sessionId"
+        ],
+        "stopReason": null,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "initialize",
+        "hasId": true,
+        "paramKeys": [
+          "clientCapabilities",
+          "clientInfo",
+          "protocolVersion"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648787.659200458,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648787.687752916,
+        "resultKeys": [
+          "agentCapabilities",
+          "agentInfo",
+          "authMethods",
+          "protocolVersion"
+        ],
+        "stopReason": null,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "session/new",
+        "hasId": true,
+        "paramKeys": [
+          "cwd",
+          "mcpServers"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648787.688143375,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648787.973339791,
+        "sessionUpdate": "available_commands_update",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648787.973465083,
+        "resultKeys": [
+          "models",
+          "modes",
+          "sessionId"
+        ],
+        "stopReason": null,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "session/prompt",
+        "hasId": true,
+        "paramKeys": [
+          "prompt",
+          "sessionId"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648787.977040375,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "fixture_to_host",
+        "method": "_aelix/client_action",
+        "hasId": true,
+        "paramKeys": [
+          "action",
+          "arguments",
+          "sessionId"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648787.977112166,
+        "fixtureReverseReply": true
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.124226375,
+        "sessionUpdate": "agent_message_chunk",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.12541075,
+        "resultKeys": [
+          "stopReason"
+        ],
+        "stopReason": "end_turn",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "session/prompt",
+        "hasId": true,
+        "paramKeys": [
+          "prompt",
+          "sessionId"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.183055541,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.188950666,
+        "sessionUpdate": "agent_message_chunk",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.189778708,
+        "resultKeys": [
+          "stopReason"
+        ],
+        "stopReason": "end_turn",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "session/prompt",
+        "hasId": true,
+        "paramKeys": [
+          "prompt",
+          "sessionId"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.287371625,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.294387625,
+        "sessionUpdate": "tool_call",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.294923041,
+        "sessionUpdate": "tool_call_update",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/request_permission",
+        "hasId": true,
+        "paramKeys": [
+          "options",
+          "sessionId",
+          "toolCall"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.29500425,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.389516833,
+        "resultKeys": [
+          "outcome"
+        ],
+        "stopReason": null,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.390095791,
+        "sessionUpdate": "tool_call_update",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.395807208,
+        "sessionUpdate": "agent_message_chunk",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.396738958,
+        "resultKeys": [
+          "stopReason"
+        ],
+        "stopReason": "end_turn",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "session/prompt",
+        "hasId": true,
+        "paramKeys": [
+          "prompt",
+          "sessionId"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.496372916,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.504433333,
+        "sessionUpdate": "tool_call",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.504749541,
+        "sessionUpdate": "tool_call_update",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/request_permission",
+        "hasId": true,
+        "paramKeys": [
+          "options",
+          "sessionId",
+          "toolCall"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.504842791,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "session/cancel",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.603086875,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.603336958,
+        "resultKeys": [
+          "outcome"
+        ],
+        "stopReason": null,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.605421166,
+        "resultKeys": [
+          "stopReason"
+        ],
+        "stopReason": "cancelled",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "session/prompt",
+        "hasId": true,
+        "paramKeys": [
+          "prompt",
+          "sessionId"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648788.712720166,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "session/cancel",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648791.725954875,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648791.728603583,
+        "resultKeys": [
+          "stopReason"
+        ],
+        "stopReason": "cancelled",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "session/cancel",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648791.832757583,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "initialize",
+        "hasId": true,
+        "paramKeys": [
+          "clientCapabilities",
+          "clientInfo",
+          "protocolVersion"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.373528416,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.40842375,
+        "resultKeys": [
+          "agentCapabilities",
+          "agentInfo",
+          "authMethods",
+          "protocolVersion"
+        ],
+        "stopReason": null,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "host_to_adapter",
+        "method": "session/load",
+        "hasId": true,
+        "paramKeys": [
+          "cwd",
+          "mcpServers",
+          "sessionId"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.409007,
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.708929666,
+        "sessionUpdate": "available_commands_update",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.70911875,
+        "sessionUpdate": "user_message_chunk",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.709164458,
+        "sessionUpdate": "agent_message_chunk",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.70919875,
+        "sessionUpdate": "user_message_chunk",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.709229208,
+        "sessionUpdate": "agent_message_chunk",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.709259583,
+        "sessionUpdate": "user_message_chunk",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.709289125,
+        "sessionUpdate": "agent_message_chunk",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.709318416,
+        "sessionUpdate": "user_message_chunk",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": "session/update",
+        "hasId": false,
+        "paramKeys": [
+          "sessionId",
+          "update"
+        ],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.709347625,
+        "sessionUpdate": "user_message_chunk",
+        "fixtureReverseReply": false
+      },
+      {
+        "direction": "adapter_to_host",
+        "method": null,
+        "hasId": true,
+        "paramKeys": [],
+        "metaKeys": [],
+        "observedAtMonotonic": 648792.709397833,
+        "resultKeys": [
+          "models",
+          "modes"
+        ],
+        "stopReason": null,
+        "fixtureReverseReply": false
+      }
+    ],
+    "providerRequests": 6,
+    "customReverseRequest": {
+      "source": "test-only injected frame, not native capability",
+      "replyObserved": false,
+      "observationSeconds": 4.732285666977987,
+      "supported": false
+    }
+  },
+  "hostAuth": {
+    "checksPassed": [
+      "nonlocal_host_rejects_unauthenticated_facade_request"
+    ],
+    "httpStatus": 401,
+    "providerOAuth": "independent from WebUI login",
+    "helperRoute": "production helper not implemented"
+  },
+  "identityAfter": {
+    "wheels": [
+      {
+        "distribution": "aelix",
+        "version": "0.1.0b2",
+        "sha256": "98a9201be2c84c96a1e3944bd003ba7b7346e6e0807dfbfaae3a00ef8e4994b7",
+        "wheelBytes": 21796,
+        "installedMembersVerified": 9
+      },
+      {
+        "distribution": "aelix-ai",
+        "version": "0.1.0b2",
+        "sha256": "5a8b03bdc87161ea17efd96500b13fd7627618c14b6402e9e46a20d6414f1552",
+        "wheelBytes": 392074,
+        "installedMembersVerified": 68
+      },
+      {
+        "distribution": "aelix-agent-core",
+        "version": "0.1.0b2",
+        "sha256": "f3fdabe25ed8e49aeed467a815fcfd4e5d18eedb4fb6d871649739220341b609",
+        "wheelBytes": 216721,
+        "installedMembersVerified": 42
+      },
+      {
+        "distribution": "aelix-coding-agent",
+        "version": "0.1.0b2",
+        "sha256": "60b19815c9355fa1a5d3c4f99e9d32ff53d4ad2522515038b76115273db8baf6",
+        "wheelBytes": 1361351,
+        "installedMembersVerified": 190
+      }
+    ],
+    "imports": [
+      "aelix_agent_core.harness.hooks:ToolCallResult",
+      "aelix_ai.oauth.auth_storage:AuthStorage",
+      "aelix_ai.models:get_supported_thinking_levels",
+      "aelix_coding_agent.extensions.api:ExtensionAPI",
+      "aelix_coding_agent.extensions.api:ExtensionContext",
+      "aelix_coding_agent.agents:parse_profile",
+      "aelix_coding_agent.agents:resolve_profile",
+      "aelix_coding_agent.agents:profile_to_flags",
+      "aelix_agent_core.session.jsonl_repo:JsonlSessionRepo"
+    ],
+    "environment": {
+      "uvicorn": "0.54.0",
+      "mcp": "1.30.0",
+      "starlette": "1.10.0",
+      "click": "8.5.0",
+      "packaging": "26.3",
+      "cryptography": "48.0.1",
+      "Pygments": "2.21.0",
+      "jsonschema-specifications": "2025.9.1",
+      "requests": "2.34.2",
+      "google-auth": "2.62.0",
+      "aelix-ai": "0.1.0b2",
+      "certifi": "2026.10.23",
+      "websockets": "16.1.1",
+      "jsonschema": "4.26.0",
+      "PyJWT": "2.15.1",
+      "tree-sitter-bash": "0.25.1",
+      "docstring_parser": "0.18.0",
+      "tree-sitter-powershell": "0.26.4",
+      "tenacity": "9.1.4",
+      "jiter": "0.18.0",
+      "httpcore": "1.0.9",
+      "aelix-coding-agent": "0.1.0b2",
+      "pycparser": "3.12",
+      "tqdm": "4.70.1",
+      "openai": "1.109.1",
+      "urllib3": "2.8.0",
+      "h11": "0.16.0",
+      "sniffio": "1.3.1",
+      "pydantic_core": "2.50.1",
+      "tree-sitter": "0.25.2",
+      "pyasn1": "0.6.4",
+      "mdurl": "0.1.2",
+      "python-multipart": "0.0.32",
+      "PyYAML": "6.0.3",
+      "sse-starlette": "3.5.1",
+      "truststore": "0.10.5",
+      "python-dotenv": "1.2.4",
+      "cffi": "2.1.1",
+      "anthropic": "0.125.0",
+      "aelix": "0.1.0b2",
+      "google-genai": "1.75.0",
+      "annotated-types": "0.8.0",
+      "referencing": "0.37.0",
+      "pydantic-settings": "2.16.1",
+      "markdown-it-py": "4.2.0",
+      "typing-inspection": "0.4.4",
+      "distro": "1.9.0",
+      "rpds-py": "2026.9.1",
+      "attrs": "26.1.0",
+      "pathspec": "1.1.1",
+      "httpx": "0.28.1",
+      "typing_extensions": "4.16.0",
+      "aelix-agent-core": "0.1.0b2",
+      "pillow": "11.3.0",
+      "pyasn1_modules": "0.4.2",
+      "pydantic": "2.14.1",
+      "charset-normalizer": "3.5.2",
+      "httpx-sse": "0.4.3",
+      "anyio": "4.15.1",
+      "idna": "3.20"
+    },
+    "verificationScope": "Original wheel members except installer-rewritten RECORD; not a dependency or bytecode security attestation"
+  },
+  "adapterAfter": {
+    "version": "0.1.0",
+    "packageFiles": {
+      "aelix_acp/__init__.py": "079a74c70fb815a4e2b50f4888e7a131575448ad3ebf9040649bbc59414e2ea7",
+      "aelix_acp/assets/PLOTLY-LICENSE.txt": "8c45d9eaf50c2f72dd9c7ab9ef440788ba58a3538484b5c51c1f17d5128752e7",
+      "aelix_acp/assets/plotly-basic-3.7.0.min.js.gz": "d48da1a9aa08bc3b4d60241f2a261dc325fe8d0100b1841e4fecf97d0b265705",
+      "aelix_acp/bridge.py": "8725a79120291fe8591fd7d190a9c315373ad404b909189ffefb63ce2e7110dc",
+      "aelix_acp/preview.py": "b6ae954188204f66c3a28417bb31a3b57d036cd96ff8e9722f13fc7058ff8201",
+      "aelix_acp/profiles/analytics.md": "e730852acda1bc29f58478bc803d076f650de903e3fdc2aa22ff20803adde357",
+      "aelix_acp/profiles/coding.md": "e232e70bbc0898957fc0cd187de1aba86abd9f1eef4d2b63e4fbff86a24af12a",
+      "aelix_acp/server.py": "b8141bd6c584dbe4bf9fc562354d09497ff581a15c464c406bc9360da11c4076"
+    }
+  }
+}

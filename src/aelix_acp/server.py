@@ -19,7 +19,9 @@ import math
 from . import __version__
 from .wire.errors import ProtocolError, require_object, require_string
 from .runtime.store import open_store, load_preferences, history
-from .wire.transport import decode_frame, stdin_reader, StdoutWriter
+from .runtime.controls import MODE_IDS
+from .stdio import StdinReader
+from .wire.transport import decode_frame, StdoutWriter
 from .runtime.extensions import run_extension_action, require_consent
 
 from .session import Session, text_content, tool_call
@@ -115,8 +117,9 @@ class Server:
                     "agentInfo": {"name": "aelix-acp", "title": f"Aelix {self.args.profile.title()}", "version": __version__},
                     "agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True, "image": True},
                                           "mcpCapabilities": {"http": True, "sse": True},
-                                          "sessionCapabilities": {"list": {}, "delete": {}}}, "_meta": {"aelix/control": {"version": 1, "methods": ["_aelix/capabilities", "_aelix/manage"],
-                                "clientActionCapability": "aelix/clientActions"}}, "authMethods": []}
+                                          "sessionCapabilities": {"list": {}, "delete": {}}},
+                    "_meta": {"aelix/control": {"version": 1, "methods": ["_aelix/capabilities", "_aelix/manage"],
+                              "clientActionCapability": "aelix/clientActions"}}, "authMethods": []}
         if method in ("session/new", "session/load"):
             cwd = str(Path(require_string(params.get("cwd"), "cwd")).expanduser().resolve())
             if not isinstance(params.get("mcpServers", []), list):
@@ -153,7 +156,8 @@ class Server:
                 if previous:
                     self.sessions.pop(session_id, None)
                     await previous.close()
-                session = Session(self, session_id, cwd)
+                session = Session(self, session_id, cwd,
+                                  initial_mode=getattr(self.args, "permission_mode", "default") if method == "session/new" else None)
                 session.index_snapshot = index_snapshot
                 session.client_mcp = params.get("mcpServers", [])
                 await session.start(session_file)
@@ -293,7 +297,7 @@ class Server:
                     return {"enabled": enabled}
                 if action == "extensions/action":
                     return await self.extension_action(session, require_string(arguments["command"], "command") if "command" in arguments else arguments)
-                allowed = {"resources/list", "resources/reload", "settings/get", "settings/set", "tools/set_active", "mcp/status", "mcp/configure", "auth/status", "auth/set_api_key", "auth/login", "auth/logout", "extensions/list", "agents/list", "agents/show", "agents/use", "agents/run"}
+                allowed = {"resources/list", "resources/reload", "settings/get", "settings/set", "tools/set_active", "mcp/status", "mcp/configure", "auth/status", "auth/set_api_key", "auth/login", "auth/logout", "extensions/list", "agents/list", "agents/show", "agents/use", "agents/run", "permissions/get"}
                 if action not in allowed or action not in session.controls.capabilities.get("methods", []):
                     raise ProtocolError("Unsupported management action")
                 if action == "mcp/configure":
@@ -322,12 +326,22 @@ class Server:
 
     async def handle(self, message):
         request_id = message.get("id")
+        replied = False
         try:
             result = await self.dispatch(message["method"], message.get("params") or {})
             if request_id is not None:
                 await self.send({"jsonrpc": "2.0", "id": request_id, "result": result})
+                replied = True
+                if message["method"] in ("session/new", "session/load"):
+                    session = self.sessions.get(result.get("sessionId") or message.get("params", {}).get("sessionId"))
+                    if session:
+                        # Follows the open response, so a host that applies its
+                        # own saved preference first still observes the
+                        # restored policy.
+                        await session.update({"sessionUpdate": "current_mode_update",
+                                              "currentModeId": session.controls.permission_mode})
         except Exception as exc:
-            if request_id is not None:
+            if request_id is not None and not replied:
                 error = {"code": getattr(exc, "code", -32603), "message": str(exc)}
                 if isinstance(exc, ProtocolError) and exc.data is not None:
                     error["data"] = exc.data
@@ -338,7 +352,7 @@ class Server:
             self.active_request_ids.discard(request_id)
 
     async def run(self):
-        reader, input_transport = await stdin_reader()
+        reader = StdinReader()
         loop = asyncio.get_running_loop()
         run_task = asyncio.current_task()
         installed_signals = []
@@ -371,7 +385,7 @@ class Server:
                 if not self.initialized and message["method"] not in ("initialize",):
                     if message.get("id") is not None:
                         await self.send({"jsonrpc": "2.0", "id": message["id"],
-                                         "error": {"code": -32002, "message": "Call initialize first"}})
+                                         "error": {"code": -32600, "message": "Call initialize first"}})
                     continue
                 request_id = message.get("id")
                 if request_id is not None and request_id in self.active_request_ids:
@@ -389,8 +403,7 @@ class Server:
                 self.tasks.add(task)
                 task.add_done_callback(self.tasks.discard)
         finally:
-            if input_transport is not None:
-                input_transport.close()
+            reader.close()
             for task in list(self.tasks):
                 task.cancel()
             await asyncio.gather(*self.tasks, return_exceptions=True)
@@ -417,7 +430,8 @@ def main():
     parser.add_argument("--command-timeout", type=float, default=600, help="Seconds per extension command; 0 disables the deadline")
     parser.add_argument("--offline", action="store_true", help="Disable extension-manager catalog/package network access")
     parser.add_argument("--turn-timeout", type=float, default=600, help="Seconds per model turn; 0 disables this deadline")
-    parser.add_argument("--allow-legacy-runtime", action="store_true", help="Allow Aelix without runtime control v1, with reduced functionality")
+    parser.add_argument("--permission-mode", choices=sorted(MODE_IDS), default="default",
+                        help="Initial mode for new sessions; saved sessions restore their recorded mode")
     parser.add_argument("--extension-manager", help="Writable Aelix CLI used for extension package management")
     parser.add_argument("--extension", action="append", default=[], help="Explicit trusted Aelix extension path (repeatable)")
     parser.add_argument("--provider")

@@ -24,3 +24,4 @@ def require_string(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip() or "\x00" in value:
         raise ProtocolError(f"{name} must be a non-empty string without NUL bytes")
     return value
+

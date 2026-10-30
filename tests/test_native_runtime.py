@@ -211,12 +211,12 @@ def setup(api):
         self.assertEqual(len(self.model_requests), count)
 
     async def test_empty_session_can_be_reopened_without_a_native_transcript(self):
-        await self.config("permission_mode", "plan")
+        await self.config("permission_mode", "yolo")
         await self.config("model", "fixture/two")
         await self.client.close()
         self.client = await AcpClient.start(self.root, EXECUTABLE)
         result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
-        self.assertEqual(result["modes"]["currentModeId"], "plan")
+        self.assertEqual(result["modes"]["currentModeId"], "yolo")
         self.assertEqual(result["models"]["currentModelId"], "fixture/two")
 
     async def test_live_session_lease_blocks_other_adapters_and_close_preserves_history(self):
@@ -321,19 +321,6 @@ def setup(api):
         await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
         self.assertEqual((await self.manage("resources/list"))["activeTools"], ["read"])
 
-    async def test_auto_edit_modes_request_approval_for_outside_and_sensitive_paths(self):
-        with tempfile.TemporaryDirectory() as outside:
-            self.client.permission = "reject-once"
-            for mode in ("auto-accept-edits", "auto"):
-                await self.config("permission_mode", mode)
-                for target in (Path(outside) / "outside.txt", self.root / ".aelix/agents/test.md"):
-                    with self.subTest(mode=mode, target=str(target)):
-                        self.write_path = target
-                        self.client.requests.clear()
-                        await self.prompt("WRITE_TEST")
-                        self.assertFalse(target.exists())
-                        self.assertTrue(any(r["method"] == "session/request_permission" for r in self.client.requests))
-
     async def test_removed_model_recovers_with_the_native_fallback(self):
         await self.config("model", "fixture/two")
         await self.prompt("Respond")
@@ -356,7 +343,7 @@ def setup(api):
         profile = profiles / "reviewer.md"
         profile.write_text("---\nname: reviewer\ndescription: Review\ninherit_extensions: true\n---\nReview carefully.\n", encoding="utf-8")
         await self.manage("agents/use", {"name": "reviewer"})
-        await self.config("permission_mode", "auto-accept-edits")
+        await self.config("permission_mode", "yolo")
         await self.prompt("Respond")
         await self.client.close()
         profile.unlink()
@@ -373,15 +360,39 @@ def setup(api):
         await self.prompt("WRITE_TEST")
         self.assertFalse((self.root / "approved.txt").exists())
 
-    async def test_plan_and_accept_edit_modes_are_enforced(self):
-        await self.config("permission_mode", "plan")
-        await self.prompt("WRITE_TEST")
-        self.assertFalse((self.root / "approved.txt").exists())
-        self.client.requests.clear()
-        await self.config("permission_mode", "auto-accept-edits")
+    async def test_yolo_skips_client_approval_and_ask_restores_it(self):
+        await self.config("permission_mode", "yolo")
+        self.assertEqual((await self.manage("permissions/get"))["mode"], "yolo")
         await self.prompt("WRITE_TEST")
         self.assertTrue((self.root / "approved.txt").exists())
         self.assertFalse(any(r["method"] == "session/request_permission" for r in self.client.requests))
+        (self.root / "approved.txt").unlink()
+        await self.config("permission_mode", "default")
+        self.assertEqual((await self.manage("permissions/get"))["mode"], "default")
+        self.client.permission = "reject-once"
+        await self.prompt("WRITE_TEST")
+        self.assertFalse((self.root / "approved.txt").exists())
+        self.assertTrue(any(r["method"] == "session/request_permission" for r in self.client.requests))
+        for mode in ("plan", "auto-accept-edits", "auto"):
+            with self.assertRaisesRegex(RuntimeError, "Unsupported value"):
+                await self.config("permission_mode", mode)
+
+    async def test_saved_restrictions_survive_a_missing_profile_without_widening(self):
+        await self.prompt("Respond")
+        await self.client.close()
+        import sqlite3
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db, db:
+            value = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()[0])
+            value.update(agent="restricted-fixture", activeTools=[], permission_mode="yolo")
+            db.execute("UPDATE preferences SET value=? WHERE session_id=?", (json.dumps(value), self.session))
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+        self.assertEqual(result["modes"]["currentModeId"], "default")
+        self.assertEqual(result["_meta"]["aelix/recoveryWarnings"][0]["kind"], "agent_unavailable")
+        self.assertEqual((await self.manage("permissions/get"))["mode"], "default")
+        self.client.permission = "reject-once"
+        await self.prompt("Respond")
+        self.assertFalse(self.model_requests[-1].get("tools"), self.model_requests[-1].get("tools"))
 
     async def test_extension_commands_and_dialogs_do_not_call_the_model(self):
         await self.prompt("/echo  raw")

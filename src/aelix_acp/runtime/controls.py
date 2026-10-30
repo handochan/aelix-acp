@@ -5,13 +5,13 @@ import contextlib
 
 from ..wire.errors import ProtocolError
 
+# Ask/Yolo is the accepted product scope. Native also has plan, auto-accept-edits
+# and auto, but their headless RPC behavior has not been accepted for Studio.
 PERMISSION_MODES = (
-    ("default", "Ask", "Request approval before every tool"),
-    ("plan", "Plan", "Only verified built-in read-only tools may run"),
-    ("auto-accept-edits", "Accept edits", "Allow verified built-in file edits; ask for other tools"),
-    ("auto", "Auto", "Use Aelix's shell classifier; ask when classification is uncertain"),
-    ("yolo", "Full access", "Skip client prompts; Aelix guardrails still apply"),
+    ("default", "Ask", "Ask before every tool; native guardrails remain active"),
+    ("yolo", "Yolo", "Skip client tool approval; native guardrails and tool restrictions remain active"),
 )
+MODE_IDS = frozenset(mode for mode, _name, _description in PERMISSION_MODES)
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
@@ -43,6 +43,7 @@ class SessionControls:
         self.models: list[dict] = []
         self.capabilities: dict = {}
         self.permission_mode = "default"
+        self.native_mode = None
 
     async def refresh(self) -> None:
         self.session.state = await self.session.rpc("get_state")
@@ -103,7 +104,9 @@ class SessionControls:
             "currentModeId": self.permission_mode,
             "availableModes": [{"id": value, "name": name, "description": description}
                                for value, name, description in PERMISSION_MODES],
-        }}
+        }, "_meta": {"aelix/permission": {
+            "nativeMode": self.native_mode, "approvalPolicy": "ask" if self.permission_mode == "default" else "yolo",
+            "appliesAt": "immediate", "nativePostureObservation": "permissions/get"}}}
         current = state.get("model") or {}
         if current.get("id"):
             result["models"] = {"currentModelId": model_key(current), "availableModels": [
@@ -127,14 +130,13 @@ class SessionControls:
                 if publish:
                     self.session.save()
                     await self.session.update({"sessionUpdate": "config_option_update", "configOptions": self.options()})
+                    if config_id == "permission_mode":
+                        await self.session.update({"sessionUpdate": "current_mode_update", "currentModeId": self.permission_mode})
             raise
 
     async def _apply(self, config_id, value, *, publish):
         if config_id == "permission_mode":
-            if self.capabilities.get("permissionModes"):
-                await self.session.rpc("aelix_control", method="permissions/set", params={"mode": value})
-            # Client approval policy remains authoritative even on an older Aelix runtime.
-            self.permission_mode = value
+            await self.apply_permission(value, persist=publish)
             if publish:
                 await self.session.update({"sessionUpdate": "current_mode_update", "currentModeId": value})
         elif config_id == "model":
@@ -158,3 +160,28 @@ class SessionControls:
             self.session.save()
             await self.session.update({"sessionUpdate": "config_option_update", **result})
         return result
+
+    async def apply_permission(self, mode: str, *, persist: bool) -> None:
+        """Change Ask/Yolo without ever widening authority on a failure.
+
+        Client approval is the enforcement point, so a downgrade revokes it (and
+        its saved value) before native is asked; an upgrade takes effect only
+        after native confirms the new posture.
+        """
+        if mode not in MODE_IDS:
+            raise ProtocolError("Unsupported value for permission_mode")
+        if "permissions/set" not in self.capabilities.get("methods", []):
+            raise ProtocolError("This Aelix runtime cannot change its permission posture", -32004)
+        if mode == "default":
+            self.permission_mode = "default"
+            if persist:
+                self.session.save()
+        result = await self.session.rpc("aelix_control", method="permissions/set", params={"mode": mode})
+        self.native_mode = result.get("mode")
+        if self.native_mode != mode:
+            raise ProtocolError("Aelix did not confirm the permission change", -32603)
+        self.permission_mode = mode
+
+    async def observe_permission(self) -> None:
+        if "permissions/get" in self.capabilities.get("methods", []):
+            self.native_mode = (await self.session.rpc("aelix_control", method="permissions/get", params={})).get("mode")

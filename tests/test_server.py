@@ -94,6 +94,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.server.client_request = consent
         self.session.rpc = abort
+        await self.session.event({"type": "tool_execution_start", "toolCallId": "t2", "toolName": "bash",
+                                  "args": {"command": "no-run"}})
         listener = await asyncio.start_server(self.session.permission, host="127.0.0.1", port=0)
         address = listener.sockets[0].getsockname()
         reader, writer = await asyncio.open_connection(address[0], address[1])

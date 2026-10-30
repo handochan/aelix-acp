@@ -146,3 +146,4 @@ def extension_reference(value: str, cwd: str) -> str:
             raise ProtocolError("A project path shadows this module reference; use an explicit absolute path")
         return value
     raise ProtocolError("Extension source must be an explicit path or a native Python module reference")
+

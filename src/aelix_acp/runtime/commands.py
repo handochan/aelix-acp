@@ -34,7 +34,6 @@ BUILTINS = {
     "clone": "Clone the conversation",
     "tree": "Show session fork points",
     "import": "Import an Aelix session",
-    "clear": "Clear the client conversation view",
     "login": "Configure provider authentication",
     "logout": "Remove provider authentication",
     "trust": "Manage workspace trust",
@@ -46,7 +45,8 @@ BUILTINS = {
     "quit": "Close this session's Aelix runtime",
 }
 ALIASES = {"rename": "name", "exit": "quit"}
-CLIENT_ACTIONS = {"clear", "login", "logout", "trust", "agents", "statusline", "hotkeys", "expand", "import"}
+# `/clear` is deliberately absent: Studio reuses its own conversation view.
+CLIENT_ACTIONS = {"login", "logout", "trust", "agents", "statusline", "hotkeys", "expand", "import"}
 
 
 def split_command(text: str) -> tuple[str, str] | None:

@@ -175,9 +175,11 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         reader.feed_data((json.dumps({"jsonrpc": "2.0", "id": "client-request", "error": {
             "code": -32601, "message": "Unsupported client action"}}) + "\n").encode())
         reader.feed_eof()
-        async def input_reader():
-            return reader, None
-        with patch("aelix_acp.server.stdin_reader", input_reader):
+        class Input:
+            readline = staticmethod(reader.readline)
+            def close(self):
+                pass
+        with patch("aelix_acp.server.StdinReader", Input):
             await self.server.run()
         error = future.exception()
         self.assertEqual(error.code, -32603)
@@ -188,7 +190,7 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         entered, release = asyncio.Event(), asyncio.Event()
         class Starting:
             instances = 0
-            def __init__(self, server, identifier, cwd):
+            def __init__(self, server, identifier, cwd, **_options):
                 Starting.instances += 1
                 self.id = identifier
                 self.mutation_lock = asyncio.Lock()

@@ -28,6 +28,14 @@ def open_store(directory: str) -> sqlite3.Connection:
     return db
 
 
+def legacy_permission_mode(db: sqlite3.Connection, session_id: str):
+    """A mode saved by the earlier Ask/Yolo adapter, which kept it in its own table."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='permission_modes'").fetchone():
+        return None
+    row = db.execute("SELECT mode FROM permission_modes WHERE id=?", (session_id,)).fetchone()
+    return row[0] if row else None
+
+
 def save_preferences(db: sqlite3.Connection, session_id: str, value: dict) -> None:
     db.execute("INSERT OR REPLACE INTO preferences VALUES(?,?)", (session_id, json.dumps(value, allow_nan=False)))
 

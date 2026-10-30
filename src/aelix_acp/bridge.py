@@ -1,8 +1,13 @@
-"""Aelix extension: fail closed unless the owning ACP process allows a tool."""
+"""Aelix extension: wait for ACP consent BEFORE every tool execution.
+
+Loaded explicitly into the RPC child. The parent owns a private Unix socket or
+authenticated Windows loopback channel; absent/broken channels block the tool.
+"""
 import asyncio
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from aelix_agent_core.harness.hooks import ToolCallResult
 
@@ -10,42 +15,22 @@ from aelix_agent_core.harness.hooks import ToolCallResult
 async def before_tool(event, ctx):
     path = os.environ.get("AELIX_ACP_SOCKET")
     endpoint = os.environ.get("AELIX_ACP_ENDPOINT")
+    token = os.environ.get("AELIX_ACP_PERMISSION_TOKEN")
     if not path and not endpoint:
         return ToolCallResult(block=True, reason="ACP permission channel is absent")
     writer = None
     try:
         async with asyncio.timeout(300):
-            token = None
+            request = {"toolCallId": event.tool_call_id, "name": event.tool_name, "args": event.args}
             if endpoint:
-                address = json.loads(endpoint)
-                if address.get("host") != "127.0.0.1":
-                    raise ValueError("Permission endpoint must be loopback")
-                reader, writer = await asyncio.open_connection(address["host"], address["port"])
-                token = address["token"]
+                target = urlsplit(endpoint)
+                if target.scheme != "tcp" or target.hostname != "127.0.0.1" or not target.port or target.username or target.password or target.path or target.query or target.fragment or not token:
+                    return ToolCallResult(block=True, reason="ACP permission channel is invalid")
+                reader, writer = await asyncio.open_connection("127.0.0.1", target.port, limit=65536)
+                request["token"] = token
             else:
                 reader, writer = await asyncio.open_unix_connection(path)
-            provenance = None
-            write_allowed = False
-            try:
-                from aelix_coding_agent.tools.provenance import builtin_provenance
-                tools = getattr(getattr(event, "context", None), "tools", [])
-                actual = next((tool for tool in reversed(tools) if tool.name == event.tool_name), None)
-                if actual is not None:
-                    provenance = builtin_provenance(actual)
-            except (ImportError, AttributeError, TypeError):
-                pass  # Unknown or older tool objects always require approval.
-            if provenance == "write":
-                try:
-                    # Run the native containment/sensitive-path policy in its
-                    # own interpreter. Missing compatibility means ASK.
-                    from aelix_coding_agent.builtin.permission import _is_auto_allowable_write, _path_from_args
-                    write_allowed = _is_auto_allowable_write(_path_from_args(event.args), ctx.cwd) is True
-                except (ImportError, AttributeError, TypeError, ValueError, OSError):
-                    pass
-            writer.write((json.dumps({"toolCallId": event.tool_call_id,
-                                      "name": event.tool_name, "args": event.args,
-                                      "token": token, "provenance": provenance,
-                                      "writeAllowed": write_allowed}) + "\n").encode())
+            writer.write((json.dumps(request) + "\n").encode("utf-8"))
             await writer.drain()
             answer = json.loads(await reader.readline())
         if answer.get("allow") is True:

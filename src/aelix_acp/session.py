@@ -13,7 +13,6 @@ import secrets
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -22,9 +21,9 @@ import uuid
 from .wire.errors import ProtocolError, BackendError, require_object, require_string
 from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter
-from .runtime.controls import SessionControls, PERMISSION_MODES
-from .runtime.policy import permission_decision
-from .runtime.store import save_preferences, load_preferences, append_event, begin_turn, finish_turn
+from .runtime.controls import SessionControls, MODE_IDS
+from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event,
+                            begin_turn, finish_turn)
 from .runtime.commands import BUILTINS, execute as execute_slash
 from .runtime.extensions import extension_reference
 from .runtime.leases import acquire as acquire_lease
@@ -33,7 +32,9 @@ PACKAGE = Path(__file__).resolve().parent
 KINDS = {"read": "read", "grep": "search", "find": "search", "ls": "read",
          "write": "edit", "edit": "edit", "bash": "execute", "aelix_status": "read",
          "analytics_status": "read", "analytics_query": "read"}
-
+# Native history selectors. A launch prefix must not bypass session/load.
+SESSION_SELECTORS = ("--session", "--resume", "-r", "--continue", "-c", "--fork", "--no-session")
+FRAME_LIMIT = 16 * 1024 * 1024
 
 
 def tool_call(call_id, name, args, cwd, status="pending"):
@@ -53,8 +54,9 @@ def text_content(content):
 
 
 class Session:
-    def __init__(self, server, session_id, cwd):
+    def __init__(self, server, session_id, cwd, *, initial_mode=None):
         self.server, self.id, self.cwd = server, session_id, cwd
+        self.initial_mode = initial_mode
         self.proc = None
         self.pending = {}
         self.tasks = set()
@@ -77,6 +79,8 @@ class Session:
         self.socket_dir = None
         self.socket_server = None
         self.permission_token = None
+        self.permission_endpoint = None
+        self.worker_job = None
         self.controls = SessionControls(self)
         self.mutation_lock = asyncio.Lock()
         self.restore_launch_preferences()
@@ -96,8 +100,21 @@ class Session:
             raise ProtocolError("Invalid saved delegation setting")
         if not isinstance(self.extra_extensions, list) or any(not isinstance(path, str) for path in self.extra_extensions):
             raise ProtocolError("Invalid stored extension configuration")
+        # Older records without a mode stay Ask; an unknown saved mode refuses
+        # rather than guessing a posture.
+        mode = preferences.get("permission_mode")
+        if mode is None:
+            mode = legacy_permission_mode(self.server.db, self.id)
+        if mode is None:
+            mode = self.initial_mode or "default"
+        if not isinstance(mode, str) or mode not in MODE_IDS:
+            raise ProtocolError("Saved permission mode is unsupported; refusing to resume")
+        self.launch_mode = mode
 
     async def start(self, session_file=None):
+        for argument in getattr(self.server.args, "aelix_arg", []):
+            if argument.split("=", 1)[0] in SESSION_SELECTORS:
+                raise ProtocolError("Adapter launch cannot override native session selection")
         if self.lease is None:
             self.lease = acquire_lease(self.server.args.state_dir, self.id)
         if self.index_snapshot is not None:
@@ -108,11 +125,20 @@ class Session:
         self.restore_launch_preferences()  # Re-read under the acquired lease, not the constructor's stale snapshot.
         self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
         os.chmod(self.socket_dir, 0o700)
-        self.permission_token = secrets.token_urlsafe(32)
-        self.socket_server = await asyncio.start_server(self.permission, host="127.0.0.1", port=0, limit=16 * 1024 * 1024)
-        address = self.socket_server.sockets[0].getsockname()
-        endpoint = json.dumps({"host": "127.0.0.1", "port": address[1], "token": self.permission_token})
+        socket_path = str(Path(self.socket_dir) / "bridge.sock")
+        self.permission_endpoint = None
+        self.permission_token = None
+        if sys.platform == "win32":
+            # Windows has no private Unix socket here: a per-worker token
+            # authenticates the loopback channel instead.
+            self.permission_token = secrets.token_urlsafe(32)
+            self.socket_server = await asyncio.start_server(self.permission, "127.0.0.1", 0, limit=FRAME_LIMIT, backlog=8)
+            self.permission_endpoint = f"tcp://127.0.0.1:{self.socket_server.sockets[0].getsockname()[1]}"
+        else:
+            self.socket_server = await asyncio.start_unix_server(self.permission, path=socket_path, limit=FRAME_LIMIT)
+            os.chmod(socket_path, 0o600)
         args = [self.server.args.aelix, *getattr(self.server.args, "aelix_arg", []), "--mode", "rpc", "--offline", "--no-extensions",
+                "--permission-mode", self.launch_mode,
                 "--append-system-prompt-file", str(PACKAGE / "profiles" / f"{self.server.args.profile}.md")]
         args += ["--agents" if self.agents_enabled else "--no-agents"]
         if self.trust_project is not None:
@@ -124,6 +150,7 @@ class Session:
             args += ["-e", str(Path(extension).resolve())]
         for extension in [*getattr(self.server.args, "extension", []), *self.extra_extensions]:
             args += ["-e", extension_reference(extension, self.cwd)]
+        # Consent sees arguments after other trusted extension hooks.
         args += ["-e", str(PACKAGE / "bridge.py")]
         if self.server.args.provider:
             args += ["--provider", self.server.args.provider]
@@ -135,37 +162,66 @@ class Session:
             args += ["--session", session_file]
         nonce = uuid.uuid4().hex
         ready_file = Path(self.socket_dir) / "ready"
-        env = dict(os.environ, AELIX_ACP_ENDPOINT=endpoint, PYTHONUNBUFFERED="1",
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
                    AELIX_ACP_READY_FILE=str(ready_file), AELIX_ACP_NONCE=nonce)
+        for name in ("AELIX_ACP_SOCKET", "AELIX_ACP_ENDPOINT", "AELIX_ACP_PERMISSION_TOKEN"):
+            env.pop(name, None)
+        if self.permission_endpoint:
+            env.update(AELIX_ACP_ENDPOINT=self.permission_endpoint, AELIX_ACP_PERMISSION_TOKEN=self.permission_token)
+        else:
+            env["AELIX_ACP_SOCKET"] = socket_path
+        if sys.platform == "win32":
+            from .windows import WorkerJob
+            self.worker_job = WorkerJob()
+            # The trusted gate consumes one byte before starting ANY native
+            # bootstrap (including configured MCP startup subprocesses).
+            args = [sys.executable, "-I", "-S", "-B", str(PACKAGE / "windows.py"), *args]
         self.proc = await asyncio.create_subprocess_exec(
             *args, cwd=self.cwd, env=env, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            limit=16 * 1024 * 1024,
-            **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
-               else {"start_new_session": True}))
+            limit=FRAME_LIMIT, **({} if sys.platform == "win32" else {"start_new_session": True}))
+        if self.worker_job:
+            # The native RPC child receives no command before it joins the job;
+            # its later tool/MCP descendants inherit the owned lifetime.
+            try:
+                self.worker_job.assign(self.proc.pid)
+                self.proc.stdin.write(b"\0")
+                await self.proc.stdin.drain()
+            except BaseException:
+                self.proc.kill()
+                await self.proc.wait()
+                raise
         self.tasks = {asyncio.create_task(self.read_rpc()), asyncio.create_task(self.read_stderr())}
         self.state = await self.rpc("get_state")
         if not ready_file.is_file() or ready_file.read_text() != nonce:
             raise ProtocolError("The tool approval bridge did not load; refusing this session", -32603)
         await self.controls.refresh()
-        if self.controls.capabilities.get("version") != 1 and not getattr(self.server.args, "allow_legacy_runtime", False):
-            raise ProtocolError("Aelix runtime control v1 is required; update Aelix, or explicitly use --allow-legacy-runtime for reduced functionality", -32004)
+        if self.controls.capabilities.get("version") != 1:
+            raise ProtocolError("Aelix runtime control v1 is required; update Aelix", -32004)
+        methods = self.controls.capabilities.get("methods", [])
         self.recovery_warnings = []
         if self.client_mcp:
-            if "mcp/configure" not in self.controls.capabilities.get("methods", []):
+            if "mcp/configure" not in methods:
                 raise ProtocolError("This Aelix runtime cannot accept client MCP servers; update its control API", -32004)
             await self.configure_mcp(self.client_mcp)
         preferences = load_preferences(self.server.db, self.id)
         saved_agent = preferences.get("agent")
+        # A saved profile or tool selection restricts authority. Refuse rather
+        # than resume with the runtime's broader defaults.
+        missing = [method for method, needed in (("agents/use", saved_agent), ("tools/set_active", self.active_tools is not None),
+                                                 ("permissions/set", True)) if needed and method not in methods]
+        if missing:
+            raise ProtocolError("This Aelix runtime cannot enforce this session's saved restrictions; update Aelix",
+                                -32004, {"kind": "restrictions_unenforceable", "methods": missing})
         profile_failed = False
-        if saved_agent and "agents/use" in self.controls.capabilities.get("methods", []):
+        if saved_agent:
             try:
                 await self.rpc("aelix_control", method="agents/use", params={"name": saved_agent})
             except BackendError:
                 await self.rpc("aelix_control", method="agents/use", params={"name": "--none"})
                 profile_failed = True
                 self.recovery_warnings.append({"kind": "agent_unavailable", "previousValue": saved_agent,
-                    "message": f"Saved agent {saved_agent} could not be applied; resumed without that profile. Select an available profile before continuing."})
+                    "message": f"Saved agent {saved_agent} could not be applied; resumed without that profile in Ask mode. Select an available profile before continuing."})
             await self.controls.refresh()
         config = preferences.get("config", {})
         require_object(config, "saved session config")
@@ -177,25 +233,27 @@ class Session:
                         "previousValue": config[config_id], "message": f"Saved {config_id} is unavailable; using the native runtime's current selection."})
                 else:
                     await self.controls.set(config_id, config[config_id], publish=False)
-        restored = preferences.get("permission_mode", "default")
-        if profile_failed and restored != "plan":
-            restored = "default"  # Never recover a missing restricted identity into silent writes.
-        if restored in {entry[0] for entry in PERMISSION_MODES}:
-            if self.controls.capabilities.get("permissionModes"):
-                await self.rpc("aelix_control", method="permissions/set", params={"mode": restored})
-            self.controls.permission_mode = restored
+        # Never recover a missing restricted identity into silent writes.
+        restored = "default" if profile_failed else self.launch_mode
+        await self.controls.observe_permission()
+        if self.controls.native_mode != restored:
+            await self.controls.apply_permission(restored, persist=False)
+        self.controls.permission_mode = restored
         await self.restore_tools()
         metadata = getattr(self.server, "client_capabilities", {}).get("_meta", {})
-        if metadata.get("aelix/clientActions") is True and "ui/enable" in self.controls.capabilities.get("methods", []):
+        if metadata.get("aelix/clientActions") is True and "ui/enable" in methods:
             await self.rpc("aelix_control", method="ui/enable", params={"enabled": True})
         self.save()
 
     async def restore_tools(self):
-        if self.active_tools is not None and "tools/set_active" in self.controls.capabilities.get("methods", []):
-            resources = await self.rpc("aelix_control", method="resources/list", params={})
-            available = {tool["name"] for tool in resources.get("tools", [])}
-            selected = [name for name in self.active_tools if name in available]
-            await self.rpc("aelix_control", method="tools/set_active", params={"names": selected})
+        if self.active_tools is None:
+            return
+        if "tools/set_active" not in self.controls.capabilities.get("methods", []):
+            raise ProtocolError("This Aelix runtime cannot restore the saved tool selection", -32004)
+        resources = await self.rpc("aelix_control", method="resources/list", params={})
+        available = {tool["name"] for tool in resources.get("tools", [])}
+        selected = [name for name in self.active_tools if name in available]
+        await self.rpc("aelix_control", method="tools/set_active", params={"names": selected})
 
     async def configure_mcp(self, servers):
         before = await self.rpc("aelix_control", method="resources/list", params={})
@@ -249,7 +307,7 @@ class Session:
     def selectors(self):
         result = self.controls.selectors()
         if self.recovery_warnings:
-            result["_meta"] = {"aelix/recoveryWarnings": self.recovery_warnings}
+            result["_meta"]["aelix/recoveryWarnings"] = self.recovery_warnings
         return result
 
     async def publish_recovery_warnings(self):
@@ -387,44 +445,38 @@ class Session:
                                 "params": {"sessionId": self.id, "update": update}})
 
     async def permission(self, reader, writer):
-        if len(self.permission_connections) >= 32:
-            writer.close()
-            await writer.wait_closed()
-            return
         owner = asyncio.current_task()
-        self.permission_connections.add(owner)
         allowed = False
         try:
-            async with asyncio.timeout(300):
+            # Loopback peers are unauthenticated until they present the token.
+            if len(self.permission_connections) >= (8 if self.permission_endpoint else 32):
+                return
+            self.permission_connections.add(owner)
+            async with asyncio.timeout(5 if self.permission_endpoint else 300):
                 request = json.loads(await reader.readline())
-                if self.permission_token is not None:
-                    token = request.get("token")
-                    if not isinstance(token, str) or not hmac.compare_digest(token, self.permission_token):
-                        return
-                    while request.get("toolCallId") not in self.tools:
-                        self.tool_arrived.clear()
-                        if self.cancelled or self.rpc_closed:
-                            return
-                        await self.tool_arrived.wait()
-                    existing = self.tools[request["toolCallId"]]
-                    if existing.get("title") != request.get("name"):
-                        return
-                decision = permission_decision(self.controls.permission_mode, request.get("provenance"),
-                                               write_allowed=request.get("writeAllowed") is True)
-                if self.controls.permission_mode == "auto" and request.get("provenance") == "bash":
-                    if "permissions/evaluate" in self.controls.capabilities.get("methods", []):
-                        evaluation = await self.rpc("aelix_control", method="permissions/evaluate", params={"args": request.get("args", {})})
-                        decision = {"allow": "allow", "deny": "deny"}.get(evaluation.get("decision"), "ask")
-                if self.cancelled or decision == "deny":
+            if not isinstance(request, dict):
+                return
+            if self.permission_endpoint or self.permission_token is not None:
+                token = request.pop("token", None)
+                if not self.permission_token or not isinstance(token, str) or not hmac.compare_digest(token, self.permission_token):
                     return
-                if decision == "allow":
+            async with asyncio.timeout(300):
+                while request.get("toolCallId") not in self.tools:
+                    self.tool_arrived.clear()
+                    if self.cancelled or self.rpc_closed:
+                        return
+                    await self.tool_arrived.wait()
+                existing = self.tools[request["toolCallId"]]
+                if existing.get("title") != request.get("name") or self.cancelled:
+                    return
+                if self.controls.permission_mode == "yolo":
                     allowed = True
-                    return
-                call = tool_call(request["toolCallId"], request["name"], request["args"], self.cwd)
-                known = call["toolCallId"] in self.tools
-                self.tools[call["toolCallId"]] = call
-                await self.update({"sessionUpdate": "tool_call_update" if known else "tool_call", **call})
-                if not self.cancelled:
+                else:
+                    call = tool_call(request["toolCallId"], request["name"], request["args"], self.cwd)
+                    self.tools[call["toolCallId"]] = call
+                    await self.update({"sessionUpdate": "tool_call_update", **call})
+                    if self.cancelled:
+                        return
                     permission_task = asyncio.current_task()
                     self.permissions.add(permission_task)
                     try:
@@ -434,11 +486,11 @@ class Session:
                                         {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}]})
                         outcome = answer.get("outcome") or {}
                         allowed = outcome.get("outcome") == "selected" and outcome.get("optionId") == "allow-once"
-                        if allowed and not self.cancelled:
-                            await self.update({"sessionUpdate": "tool_call_update",
-                                               "toolCallId": call["toolCallId"], "status": "in_progress"})
                     finally:
                         self.permissions.discard(permission_task)
+                if allowed and not self.cancelled:
+                    await self.update({"sessionUpdate": "tool_call_update",
+                                       "toolCallId": request["toolCallId"], "status": "in_progress"})
         except (Exception, asyncio.CancelledError):
             allowed = False
         finally:
@@ -649,6 +701,7 @@ class Session:
         await asyncio.shield(self._close_task)
 
     async def _close(self):
+        self.permission_token = None
         for task in list(self.permission_connections):
             task.cancel()
         await asyncio.gather(*self.permission_connections, return_exceptions=True)
@@ -664,18 +717,33 @@ class Session:
                     pass
             drains = [asyncio.create_task(discard(stream)) for stream in (self.proc.stdout, self.proc.stderr)]
             try:
-                await terminate_owned(self.proc)
+                if self.worker_job:
+                    # Kill-on-close ends the worker and every descendant in its job.
+                    self.worker_job.close()
+                    self.worker_job = None
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(self.proc.wait(), 5)
+                    if self.proc.returncode is None:
+                        self.proc.kill()
+                        await self.proc.wait()
+                else:
+                    await terminate_owned(self.proc)
             finally:
                 for task in drains:
                     task.cancel()
                 await asyncio.gather(*drains, return_exceptions=True)
+        if self.worker_job:
+            self.worker_job.close()
+            self.worker_job = None
         if self.socket_server:
             self.socket_server.close()
             await self.socket_server.wait_closed()
+            self.socket_server = None
         if self.lease:
             self.lease.close()
             self.lease = None
         if self.socket_dir:
             shutil.rmtree(self.socket_dir, ignore_errors=True)
+            self.socket_dir = None
         if self.server.sessions.get(self.id) is self:
             self.server.sessions.pop(self.id, None)
