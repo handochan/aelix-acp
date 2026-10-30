@@ -61,8 +61,15 @@ async def _run_extension_action(server, session, raw) -> dict:
         reference = extension_reference(arguments[0], session.cwd)
         if action == "enable" and Path(reference).is_absolute() and not Path(reference).exists():
             raise ProtocolError("Extension source path does not exist")
-        await require_consent(server, session, f"{action} extension", {"source": reference})
+        if reference in operator_extensions(server, session.cwd):
+            # The adapter's launch configuration owns this reference and loads
+            # it on every start; this session cannot switch it off or on.
+            raise ProtocolError("This extension is part of the adapter's launch configuration; change that configuration instead",
+                                -32004, {"kind": "extension_owned_by_launch", "source": reference})
         selected = list(session.extra_extensions)
+        if action == "disable" and reference not in selected:
+            raise ProtocolError("This extension is not enabled in this session")
+        await require_consent(server, session, f"{action} extension", {"source": reference})
         if action == "enable" and reference not in selected:
             if len(selected) >= 64:
                 raise ProtocolError("At most 64 explicit extensions may be enabled")
@@ -72,7 +79,13 @@ async def _run_extension_action(server, session, raw) -> dict:
         await session.restart(extensions=selected)
         resources = await session.rpc("aelix_control", method="resources/list", params={})
         errors = resources.get("extensionErrors", [])
-        return {"enabledExtensions": selected, "loadErrors": errors, "ready": not errors}
+        if action == "disable" and is_loaded(reference, resources):
+            raise ProtocolError("Aelix still loads this extension after it was disabled", -32603,
+                                {"kind": "extension_still_loaded", "source": reference})
+        loaded = is_loaded(reference, resources)
+        return {"enabledExtensions": selected, "loadErrors": errors,
+                "ready": not errors and (loaded if action == "enable" else True),
+                **({"loaded": loaded} if action == "enable" else {})}
     if action not in READ_ACTIONS | WRITE_ACTIONS or len(arguments) > 1:
         raise ProtocolError("Use /extension list|verify|discover|install|remove|update|enable|disable|reload [target]")
     if arguments and (not arguments[0] or arguments[0].startswith("-") or "\x00" in arguments[0]):
@@ -147,3 +160,29 @@ def extension_reference(value: str, cwd: str) -> str:
         return value
     raise ProtocolError("Extension source must be an explicit path or a native Python module reference")
 
+
+def operator_extensions(server, cwd: str) -> set[str]:
+    """References the adapter loads on every start, outside session control."""
+    owned = {extension_reference(entry, cwd) for entry in getattr(server.args, "extension", [])}
+    analytics = getattr(server.args, "analytics_extension", None)
+    if server.args.profile == "analytics" and analytics:
+        owned.add(str(Path(analytics).resolve()))
+    return owned
+
+
+def is_loaded(reference: str, resources: dict) -> bool:
+    """Whether native's own inventory (`resources/list`) lists this reference."""
+    target = Path(reference)
+    for entry in resources.get("extensions", []):
+        for value in (entry.get("source"), entry.get("name")) if isinstance(entry, dict) else ():
+            if not isinstance(value, str):
+                continue
+            if value == reference:
+                return True
+            if target.is_absolute() and Path(value).is_absolute():
+                try:
+                    if Path(value).resolve() == target.resolve():
+                        return True
+                except OSError:
+                    continue
+    return False

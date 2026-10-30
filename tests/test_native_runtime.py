@@ -377,6 +377,29 @@ def setup(api):
             with self.assertRaisesRegex(RuntimeError, "Unsupported value"):
                 await self.config("permission_mode", mode)
 
+    async def test_launch_extension_cannot_be_disabled_by_the_session(self):
+        extension = str((self.root / "commands.py").resolve())
+        with self.assertRaisesRegex(RuntimeError, "launch configuration"):
+            await self.manage("extensions/action", {"action": "disable", "target": extension})
+        await self.prompt("/echo still-loaded")
+        self.assertIn("echo:still-loaded", self.client.text())
+        loaded = {entry.get("source") or entry.get("name") for entry in (await self.manage("resources/list"))["extensions"]}
+        self.assertIn(extension, loaded)
+
+    async def test_disabled_extension_is_absent_from_native_inventory(self):
+        extension = self.root / "extra.py"
+        extension.write_text('def setup(api):\n    api.register_command("extra", handler=lambda args, ctx: "EXTRA_OK", description="Extra")\n')
+        enabled = await self.manage("extensions/action", {"action": "enable", "target": str(extension)})
+        self.assertEqual((enabled["ready"], enabled["loaded"]), (True, True))
+        loaded = {entry.get("source") or entry.get("name") for entry in (await self.manage("resources/list"))["extensions"]}
+        self.assertIn(str(extension.resolve()), loaded)
+        disabled = await self.manage("extensions/action", {"action": "disable", "target": str(extension)})
+        self.assertEqual(disabled["enabledExtensions"], [])
+        loaded = {entry.get("source") or entry.get("name") for entry in (await self.manage("resources/list"))["extensions"]}
+        self.assertNotIn(str(extension.resolve()), loaded)
+        with self.assertRaisesRegex(RuntimeError, "Unknown slash"):
+            await self.prompt("/extra")
+
     async def test_saved_restrictions_survive_a_missing_profile_without_widening(self):
         await self.prompt("Respond")
         await self.client.close()
