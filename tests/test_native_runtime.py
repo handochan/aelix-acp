@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from support import AcpClient
-from aelix_acp.wire.errors import SESSION_LOCKED
+from aelix_acp.wire.errors import SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH
 
 EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
 
@@ -447,6 +447,23 @@ def setup(api):
             holder.wait(10)
         result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}, timeout=60)
         self.assertIn("configOptions", result)
+
+    async def test_failure_after_native_dispatch_is_not_retryable(self):
+        await self.config("autoRetryEnabled", "false")
+        self.failures = 1
+        with self.assertRaises(RuntimeError) as caught:
+            await self.prompt("Respond")
+        error = json.loads(str(caught.exception))
+        self.assertEqual(error["code"], TURN_FAILED_AFTER_DISPATCH)
+        self.assertEqual(error["data"], {"kind": "turn_failed_after_dispatch", "retryable": False})
+        self.assertIn("overloaded fixture", error["message"])
+        self.assertEqual(len(self.model_requests), 1)
+
+    async def test_failure_before_native_dispatch_keeps_its_specific_code(self):
+        with self.assertRaises(RuntimeError) as caught:
+            await self.client.request("session/prompt", {"sessionId": self.session, "prompt": [{"type": "audio", "data": ""}]})
+        self.assertEqual(json.loads(str(caught.exception))["code"], -32602)
+        self.assertEqual(self.model_requests, [])
 
     async def test_extension_commands_and_dialogs_do_not_call_the_model(self):
         await self.prompt("/echo  raw")

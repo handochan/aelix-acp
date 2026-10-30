@@ -17,7 +17,7 @@ import time
 import math
 
 from . import __version__
-from .wire.errors import ProtocolError, SESSION_LOCKED, require_object, require_string
+from .wire.errors import ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH, require_object, require_string
 from .runtime.store import open_store, load_preferences, history
 from .runtime.controls import MODE_IDS
 from .stdio import StdinReader
@@ -118,7 +118,7 @@ class Server:
                     "agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True, "image": True},
                                           "mcpCapabilities": {"http": True, "sse": True},
                                           "sessionCapabilities": {"list": {}, "delete": {}},
-                                          "_meta": {"aelix/errors": {"sessionLocked": SESSION_LOCKED}}},
+                                          "_meta": {"aelix/errors": {"sessionLocked": SESSION_LOCKED, "turnFailedAfterDispatch": TURN_FAILED_AFTER_DISPATCH}}},
                     "_meta": {"aelix/control": {"version": 1, "methods": ["_aelix/capabilities", "_aelix/manage"],
                               "clientActionCapability": "aelix/clientActions"}}, "authMethods": []}
         if method in ("session/new", "session/load"):

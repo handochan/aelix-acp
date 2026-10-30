@@ -18,7 +18,7 @@ import tempfile
 import time
 import uuid
 
-from .wire.errors import (ProtocolError, BackendError, is_native_session_locked,
+from .wire.errors import (ProtocolError, BackendError, after_dispatch, is_native_session_locked,
                           require_object, require_string, session_locked)
 from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter
@@ -35,6 +35,15 @@ KINDS = {"read": "read", "grep": "search", "find": "search", "ls": "read",
          "analytics_status": "read", "analytics_query": "read"}
 # Native history selectors. A launch prefix must not bypass session/load.
 SESSION_SELECTORS = ("--session", "--resume", "-r", "--continue", "-c", "--fork", "--no-session")
+# Native requests that never change the runtime (aelix-ai rpc/control.py
+# CLASSIC_READ_ONLY and READ_ONLY_METHODS). Anything else sent during a turn
+# may have started work, so a later failure must not be replayed.
+READ_ONLY_COMMANDS = frozenset({"get_state", "get_messages", "get_available_models", "get_commands",
+                                "get_session_stats", "get_fork_messages", "get_last_assistant_text",
+                                "export_html", "abort", "abort_retry", "abort_bash"})
+READ_ONLY_CONTROLS = frozenset({"capabilities", "resources/list", "settings/get", "permissions/get",
+                                "permissions/evaluate", "mcp/status", "extensions/list", "auth/status",
+                                "agents/list", "agents/show", "commands/cancel"})
 STDERR_TAIL = 16 * 1024
 FRAME_LIMIT = 16 * 1024 * 1024
 
@@ -66,6 +75,8 @@ class Session:
         self.failure = None
         self.rpc_closed = False
         self.cancelled = False
+        self.turn_active = False
+        self.dispatched = False
         self.tools = {}
         self.tool_arrived = asyncio.Event()
         self.recovery_warnings = []
@@ -351,6 +362,9 @@ class Session:
                 raise ProtocolError("Aelix child is not running", -32603)
             self.proc.stdin.write((json.dumps({"id": request_id, "type": command, **kwargs}) + "\n").encode())
             await self.proc.stdin.drain()
+            if self.turn_active and command not in READ_ONLY_COMMANDS and not (
+                    command == "aelix_control" and kwargs.get("method") in READ_ONLY_CONTROLS):
+                self.dispatched = True
             try:
                 return await asyncio.wait_for(future, _timeout)
             except TimeoutError:
@@ -565,6 +579,8 @@ class Session:
         if self.id in self.server.starting_ids:
             raise ProtocolError("Session is already starting", -32000)
         self.server.starting_ids.add(self.id)
+        if self.turn_active:
+            self.dispatched = True  # Replacing the worker is itself an effect.
         held_lease = self.lease
         self.lease = None
         try:
@@ -606,15 +622,22 @@ class Session:
         if prior is not None:
             return prior
         result, error = None, None
+        self.dispatched = False
+        self.turn_active = True
         try:
             result = await self._prompt(blocks)
             return result
-        except ProtocolError as failure:
-            error = failure
+        except Exception as failure:
+            # Once native may have started work, a failure is final: an
+            # automatic replay could repeat model calls and tool effects.
+            error = after_dispatch(failure) if self.dispatched else failure
             append_event(self.server.db, self.id, {"sessionUpdate": "agent_message_chunk",
-                         "content": {"type": "text", "text": "Request failed: " + str(failure)}})
-            raise
+                         "content": {"type": "text", "text": "Request failed: " + str(error)}})
+            if error is failure:
+                raise
+            raise error from None
         finally:
+            self.turn_active = False
             finish_turn(self.server.db, self.id, key, result, error)
 
     async def _prompt(self, blocks):

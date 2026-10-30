@@ -93,6 +93,8 @@ async def _run_extension_action(server, session, raw) -> dict:
     if action in {"install", "remove"} and not arguments:
         raise ProtocolError(f"/extension {action} requires a target")
     executable = getattr(server.args, "extension_manager", None) or server.args.aelix
+    if action in WRITE_ACTIONS and session.turn_active:
+        session.dispatched = True  # The package manager changes the environment.
     if action in WRITE_ACTIONS:
         if ".app/contents/" in Path(executable).resolve().as_posix().casefold():
             raise ProtocolError("Bundled app resources are read-only. Configure --extension-manager with a writable managed Aelix environment", -32004)

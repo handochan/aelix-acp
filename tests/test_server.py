@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import ProtocolError, Server, Session
-from aelix_acp.wire.errors import SESSION_LOCKED, is_native_session_locked
+from aelix_acp.wire.errors import SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH, after_dispatch, is_native_session_locked
 from aelix_acp.runtime.leases import acquire
 
 
@@ -176,6 +176,60 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             await self.session.rpc("compact", _timeout=0.01)
         self.assertEqual(caught.exception.code, -32007)
         self.assertEqual(calls, ["compact", "abort"])
+
+    def native(self, *, failure=None, running=True):
+        """Answer the real rpc() path in-process, as a native child would."""
+        session, written = self.session, []
+        class Input:
+            def write(self, raw):
+                payload = json.loads(raw)
+                written.append(payload["type"])
+                if payload["type"] == "prompt" and failure:
+                    session.failure = failure
+                data = {"isStreaming": False} if payload["type"] == "get_state" else {}
+                asyncio.get_running_loop().call_soon(session.pending[payload["id"]].set_result, data)
+            async def drain(self):
+                pass
+        self.session.proc = SimpleNamespace(stdin=Input(), returncode=None if running else 1)
+        return written
+
+    async def test_failure_after_dispatch_is_marked_not_retryable(self):
+        written = self.native(failure="provider rejected the request")
+        with self.assertRaises(ProtocolError) as caught:
+            await self.session.prompt([{"type": "text", "text": "Respond"}])
+        self.assertEqual(caught.exception.code, TURN_FAILED_AFTER_DISPATCH)
+        self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False})
+        self.assertIn("provider rejected", str(caught.exception))
+        self.assertEqual(written[0], "prompt")
+
+    async def test_failure_before_anything_reaches_native_keeps_its_code(self):
+        self.native(running=False)
+        with self.assertRaises(ProtocolError) as caught:
+            await self.session.prompt([{"type": "text", "text": "Respond"}])
+        self.assertEqual(caught.exception.code, -32603)
+        with self.assertRaises(ProtocolError) as caught:
+            await self.session.prompt([{"type": "audio", "data": ""}])
+        self.assertEqual(caught.exception.code, -32602)
+
+    async def test_read_only_native_requests_do_not_count_as_dispatch(self):
+        self.native()
+        self.session.turn_active = True
+        await self.session.rpc("get_state")
+        await self.session.rpc("aelix_control", method="resources/list", params={})
+        self.assertFalse(self.session.dispatched)
+        await self.session.rpc("aelix_control", method="commands/run", params={"text": "/x"})
+        self.assertTrue(self.session.dispatched)
+
+    def test_after_dispatch_keeps_specific_codes_and_wraps_internal_errors(self):
+        specific = ProtocolError("Request id was reused", -32008)
+        self.assertIs(after_dispatch(specific), specific)
+        for error in (ProtocolError("backend", -32603, {"kind": "backend_error", "command": "prompt"}),
+                      RuntimeError("unexpected"), ProtocolError("gone", -32001)):
+            wrapped = after_dispatch(error)
+            self.assertEqual(wrapped.code, TURN_FAILED_AFTER_DISPATCH)
+            self.assertIs(wrapped.data["retryable"], False)
+        self.assertEqual(after_dispatch(ProtocolError("backend", -32603, {"kind": "backend_error", "command": "prompt"})).data["cause"],
+                         {"kind": "backend_error", "command": "prompt"})
 
     def test_native_lock_phrase_is_recognized_in_one_place(self):
         self.assertTrue(is_native_session_locked("Error: this session is already open in another terminal.\n  /x.jsonl"))
