@@ -191,8 +191,11 @@ class Session:
             from .windows import WorkerJob
             self.worker_job = WorkerJob()
             # The trusted gate consumes one byte before starting ANY native
-            # bootstrap (including configured MCP startup subprocesses).
-            args = [sys.executable, "-I", "-S", "-B", str(PACKAGE / "windows.py"), *args]
+            # bootstrap (including configured MCP startup subprocesses). A
+            # venv's python.exe is a redirector that starts the real
+            # interpreter before the job assignment, so run the base one.
+            gate = getattr(sys, "_base_executable", None) or sys.executable
+            args = [gate, "-I", "-S", "-B", str(PACKAGE / "windows.py"), *args]
         self.proc = await asyncio.create_subprocess_exec(
             *args, cwd=self.cwd, env=env, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
