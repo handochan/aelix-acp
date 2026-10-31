@@ -50,13 +50,15 @@ one model request; a parented child never uses `_aelix/subagent`.
 Not covered: Windows and Linux are left to exact-head CI; packaged
 installers, the Studio renderer showing the `_meta`, and real providers.
 
-Known host gap: when the adapter process itself dies, or the transport closes,
-after `session/prompt` was sent, there is no adapter error to mark. AionCore
-v0.2.2 classifies the closed transport as retryable and replays the turn once
-(reproduced: SIGKILL of the adapter mid-request, the model received the turn
-twice). The fix belongs to the host,
-[aelix-studio-host#6](https://github.com/handochan/aelix-studio-host/issues/6).
-A manual resend after a lost HTTP response is a new turn by decision.
+Host-side replay after an adapter crash: when the adapter process itself
+dies, or the transport closes, after `session/prompt` was sent, there is no
+adapter error to mark. AionCore v0.2.2 classifies the closed transport as
+retryable and replays the turn once (reproduced: SIGKILL of the adapter
+mid-request, the model received the turn twice). By the user's decision of
+2026-10-31 the host fixes this in handochan/aelix-studio-host#6, and the
+adapter no longer carries the managed-operation contract that covered it for
+Preview ([ACP #20 decision](https://github.com/handochan/aelix-acp/issues/20#issuecomment-6536397248)).
+A manual resend after a lost HTTP response is a new turn by the same decision.
 
 ## Development candidate — 2026-10-23 (historical)
 
