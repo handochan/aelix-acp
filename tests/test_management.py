@@ -1,4 +1,5 @@
 import asyncio
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -10,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import Server, Session, ProtocolError
 from aelix_acp.runtime.commands import split_command
 from aelix_acp.runtime.commands import execute
-from aelix_acp.runtime.extensions import extension_reference, run_extension_action
+from aelix_acp.runtime.extensions import extension_reference, run_extension_action, same_extension
 from support import process_alive
 
 
@@ -125,6 +126,50 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
             reload = next(arguments for command, arguments in reversed(calls) if command == "aelix_control" and arguments.get("method") == "resources/reload")
             self.assertEqual(compact["_timeout"], timeout or None)
             self.assertEqual(reload["_timeout"], timeout or None)
+
+    async def test_a_disable_that_native_still_loads_is_not_reported_as_disabled(self):
+        extension = self.root / "extra.py"
+        extension.write_text("def setup(api):\n    pass\n")
+        self.session.extra_extensions = [str(extension.resolve())]
+        async def approve(method, params):
+            return {"outcome": {"outcome": "selected", "optionId": "allow-once"}}
+        async def restart(**options):
+            self.session.extra_extensions = options["extensions"]
+        async def rpc(command, **kwargs):
+            # Native's inventory after the restart still lists the extension.
+            return {"extensions": [{"name": str(extension.resolve()), "source": None}], "extensionErrors": []}
+        self.server.client_request = approve
+        self.session.restart = restart
+        self.session.rpc = rpc
+        with self.assertRaises(ProtocolError) as caught:
+            await run_extension_action(self.server, self.session, {"action": "disable", "target": str(extension)})
+        self.assertEqual((caught.exception.code, caught.exception.data["kind"]), (-32603, "extension_still_loaded"))
+
+    async def test_launch_extension_aliases_are_refused_before_consent(self):
+        extension = self.root / "owned.py"
+        extension.write_text("def setup(api):\n    pass\n")
+        os.link(extension, self.root / "alias.py")
+        self.server.args.extension = [str(extension)]
+        async def unexpected(method, params):
+            self.fail("A launch-owned extension must not reach consent")
+        self.server.client_request = unexpected
+        for target in (str(extension), str(self.root / "alias.py")):
+            with self.assertRaises(ProtocolError) as caught:
+                await run_extension_action(self.server, self.session, {"action": "disable", "target": target})
+            self.assertEqual((caught.exception.code, caught.exception.data["kind"]), (-32004, "extension_owned_by_launch"))
+
+    def test_extension_identity_follows_files_not_spelling(self):
+        directory = self.root / "identity"
+        directory.mkdir()
+        original = directory / "one.py"
+        original.write_text("")
+        os.link(original, directory / "hard.py")
+        self.assertTrue(same_extension(str(original), str(directory / "hard.py")))
+        self.assertFalse(same_extension(str(original), str(directory / "other.py")))
+        self.assertTrue(same_extension("pack.extension:setup", "pack.extension:setup"))
+        self.assertFalse(same_extension("pack.extension:setup", str(original)))
+        if os.path.exists(directory / "ONE.py"):  # Case-insensitive filesystems only.
+            self.assertTrue(same_extension(str(original), str(directory / "ONE.py")))
 
     async def test_session_pages_do_not_duplicate_equal_timestamps(self):
         self.server.db.executemany("INSERT INTO sessions VALUES(?,?,?,?,?,?)", [

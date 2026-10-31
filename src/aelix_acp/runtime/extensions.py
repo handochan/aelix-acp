@@ -61,21 +61,22 @@ async def _run_extension_action(server, session, raw) -> dict:
         reference = extension_reference(arguments[0], session.cwd)
         if action == "enable" and Path(reference).is_absolute() and not Path(reference).exists():
             raise ProtocolError("Extension source path does not exist")
-        if reference in operator_extensions(server, session.cwd):
+        if any(same_extension(reference, owned) for owned in operator_extensions(server, session.cwd)):
             # The adapter's launch configuration owns this reference and loads
             # it on every start; this session cannot switch it off or on.
             raise ProtocolError("This extension is part of the adapter's launch configuration; change that configuration instead",
                                 -32004, {"kind": "extension_owned_by_launch", "source": reference})
         selected = list(session.extra_extensions)
-        if action == "disable" and reference not in selected:
+        enabled_here = any(same_extension(reference, entry) for entry in selected)
+        if action == "disable" and not enabled_here:
             raise ProtocolError("This extension is not enabled in this session")
         await require_consent(server, session, f"{action} extension", {"source": reference})
-        if action == "enable" and reference not in selected:
+        if action == "enable" and not enabled_here:
             if len(selected) >= 64:
                 raise ProtocolError("At most 64 explicit extensions may be enabled")
             selected.append(reference)
         if action == "disable":
-            selected = [entry for entry in selected if entry != reference]
+            selected = [entry for entry in selected if not same_extension(reference, entry)]
         await session.restart(extensions=selected)
         resources = await session.rpc("aelix_control", method="resources/list", params={})
         errors = resources.get("extensionErrors", [])
@@ -172,19 +173,26 @@ def operator_extensions(server, cwd: str) -> set[str]:
     return owned
 
 
+def same_extension(first: str, second: str) -> bool:
+    """Whether two references name one extension: the same file for paths, the same text otherwise.
+
+    Paths compare by file identity, so a case variant on a case-insensitive
+    filesystem, a hard link or a symbolic link is the same extension.
+    """
+    if first == second:
+        return True
+    if not (Path(first).is_absolute() and Path(second).is_absolute()):
+        return False
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second))
+
+
 def is_loaded(reference: str, resources: dict) -> bool:
     """Whether native's own inventory (`resources/list`) lists this reference."""
-    target = Path(reference)
     for entry in resources.get("extensions", []):
         for value in (entry.get("source"), entry.get("name")) if isinstance(entry, dict) else ():
-            if not isinstance(value, str):
-                continue
-            if value == reference:
+            if isinstance(value, str) and same_extension(reference, value):
                 return True
-            if target.is_absolute() and Path(value).is_absolute():
-                try:
-                    if Path(value).resolve() == target.resolve():
-                        return True
-                except OSError:
-                    continue
     return False

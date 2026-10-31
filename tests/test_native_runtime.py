@@ -423,13 +423,22 @@ def setup(api):
         self.assertFalse([event for event in self.client.updates if event.get("method") == "_aelix/subagent"])
 
     async def test_launch_extension_cannot_be_disabled_by_the_session(self):
-        extension = str((self.root / "commands.py").resolve())
-        with self.assertRaisesRegex(RuntimeError, "launch configuration"):
-            await self.manage("extensions/action", {"action": "disable", "target": extension})
+        extension = self.root / "commands.py"
+        os.link(extension, self.root / "linked.py")
+        variants = [str(extension.resolve()), str(self.root / "linked.py")]
+        if os.path.exists(self.root / "COMMANDS.py"):  # Only a case-insensitive filesystem has this name.
+            variants.append(str(self.root / "COMMANDS.py"))
+        for target in variants:
+            for action in ("disable", "enable"):
+                with self.subTest(target=target, action=action):
+                    with self.assertRaises(RuntimeError) as caught:
+                        await self.manage("extensions/action", {"action": action, "target": target})
+                    error = json.loads(str(caught.exception))
+                    self.assertEqual((error["code"], error["data"]["kind"]), (-32004, "extension_owned_by_launch"))
         await self.prompt("/echo still-loaded")
         self.assertIn("echo:still-loaded", self.client.text())
         loaded = {entry.get("source") or entry.get("name") for entry in (await self.manage("resources/list"))["extensions"]}
-        self.assertIn(extension, loaded)
+        self.assertIn(str(extension.resolve()), loaded)
 
     async def test_disabled_extension_is_absent_from_native_inventory(self):
         extension = self.root / "extra.py"
