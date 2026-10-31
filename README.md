@@ -113,6 +113,8 @@ native가 일을 받은 뒤(프롬프트, 상태를 바꾸는 명령, 확장 관
 `-33002`(`turn_failed_after_dispatch`, `retryable: false`)로 응답합니다.
 AionCore는 `retryable == true`인 오류만 한 번 자동 재실행하고, 이 코드를 재시도 불가로
 분류하므로 모델 호출·도구 효과를 반복하지 않습니다. native에 닿기 전의 실패는 원래 코드를 유지합니다.
+어댑터 프로세스 자체가 죽거나 연결이 끊기면 어댑터가 보낼 오류가 없으므로, 이 경우의 재실행 방지는
+host가 맡습니다([aelix-studio-host#6](https://github.com/handochan/aelix-studio-host/issues/6)).
 `_meta["aelix/requestId"]`로 같은 요청을 다시 보내면 완료된 결과를 재생하고,
 결과가 불확실한 요청은 다시 실행하지 않습니다(`-32006`).
 

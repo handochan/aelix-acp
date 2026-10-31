@@ -48,9 +48,15 @@ with `-33001`; a provider failure with native retry off returns `-33002` after
 one model request; a parented child never uses `_aelix/subagent`.
 
 Not covered: Windows and Linux are left to exact-head CI; packaged
-installers, the Studio renderer showing the `_meta`, real providers, and a crash
-of the adapter process itself (AionCore classifies that disconnect as
-retryable and can replay it).
+installers, the Studio renderer showing the `_meta`, and real providers.
+
+Known host gap: when the adapter process itself dies, or the transport closes,
+after `session/prompt` was sent, there is no adapter error to mark. AionCore
+v0.2.2 classifies the closed transport as retryable and replays the turn once
+(reproduced: SIGKILL of the adapter mid-request, the model received the turn
+twice). The fix belongs to the host,
+[aelix-studio-host#6](https://github.com/handochan/aelix-studio-host/issues/6).
+A manual resend after a lost HTTP response is a new turn by decision.
 
 ## Development candidate — 2026-10-23 (historical)
 
