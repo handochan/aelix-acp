@@ -348,20 +348,34 @@ def setup(api):
         self.assertEqual(result["models"]["currentModelId"], "replacement/one")
         self.assertTrue(result["_meta"]["aelix/recoveryWarnings"])
 
-    async def test_removed_profile_recovers_with_explicit_approval_mode(self):
+    async def test_removed_profile_refuses_the_load_and_never_widens_tools(self):
         profiles = self.root / "agent/agents"
         profiles.mkdir()
-        profile = profiles / "reviewer.md"
-        profile.write_text("---\nname: reviewer\ndescription: Review\ninherit_extensions: true\n---\nReview carefully.\n", encoding="utf-8")
-        await self.manage("agents/use", {"name": "reviewer"})
+        profile = profiles / "restricted.md"
+        profile.write_text("---\nname: restricted\ndescription: Restricted\ntools: [read]\n---\nRead only.\n", encoding="utf-8")
+        await self.manage("agents/use", {"name": "restricted"})
         await self.config("permission_mode", "yolo")
         await self.prompt("Respond")
+        self.assertEqual([tool["function"]["name"] for tool in self.model_requests[-1]["tools"]], ["read"])
         await self.client.close()
         profile.unlink()
+        requests = len(self.model_requests)
         self.client = await AcpClient.start(self.root, EXECUTABLE)
+        with self.assertRaises(RuntimeError) as caught:
+            await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+        error = json.loads(str(caught.exception))
+        self.assertEqual((error["code"], error["data"]), (-32004, {"kind": "profile_unavailable", "profile": "restricted"}))
+        self.assertIn("Restore or recreate", error["message"])
+        # What a host replays from its saved preference must not reach a session.
+        with self.assertRaises(RuntimeError):
+            await self.client.request("session/set_mode", {"sessionId": self.session, "modeId": "yolo"})
+        with self.assertRaises(RuntimeError):
+            await self.prompt("WRITE_TEST")
+        self.assertFalse(self.write_path.exists())
+        self.assertEqual(len(self.model_requests), requests)
+        profile.write_text("---\nname: restricted\ndescription: Restricted\ntools: [read]\n---\nRead only.\n", encoding="utf-8")
         result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
-        self.assertEqual(result["modes"]["currentModeId"], "default")
-        self.assertTrue(result["_meta"]["aelix/recoveryWarnings"])
+        self.assertEqual(result["modes"]["currentModeId"], "yolo")
 
     async def test_approved_write_is_real_and_denied_write_is_absent(self):
         await self.prompt("WRITE_TEST")
@@ -431,7 +445,7 @@ def setup(api):
         with self.assertRaisesRegex(RuntimeError, "Unknown slash"):
             await self.prompt("/extra")
 
-    async def test_saved_restrictions_survive_a_missing_profile_without_widening(self):
+    async def test_seeded_missing_profile_with_saved_yolo_refuses_instead_of_widening(self):
         await self.prompt("Respond")
         await self.client.close()
         import sqlite3
@@ -439,14 +453,14 @@ def setup(api):
             value = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()[0])
             value.update(agent="restricted-fixture", activeTools=[], permission_mode="yolo")
             db.execute("UPDATE preferences SET value=? WHERE session_id=?", (json.dumps(value), self.session))
+        requests = len(self.model_requests)
         self.client = await AcpClient.start(self.root, EXECUTABLE)
-        result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
-        self.assertEqual(result["modes"]["currentModeId"], "default")
-        self.assertEqual(result["_meta"]["aelix/recoveryWarnings"][0]["kind"], "agent_unavailable")
-        self.assertEqual((await self.manage("permissions/get"))["mode"], "default")
-        self.client.permission = "reject-once"
-        await self.prompt("Respond")
-        self.assertFalse(self.model_requests[-1].get("tools"), self.model_requests[-1].get("tools"))
+        with self.assertRaises(RuntimeError) as caught:
+            await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+        self.assertEqual(json.loads(str(caught.exception))["data"], {"kind": "profile_unavailable", "profile": "restricted-fixture"})
+        with self.assertRaises(RuntimeError):
+            await self.prompt("Respond")
+        self.assertEqual(len(self.model_requests), requests)
 
     async def test_native_lock_holder_refuses_load_with_a_structured_error(self):
         import sqlite3

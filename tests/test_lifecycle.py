@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import ProtocolError, Server, Session
@@ -20,6 +21,9 @@ from pathlib import Path
 if os.environ.get("TEST_LOCKED"):
     sys.stderr.write("Error: this session is already open in another terminal.\\n  /fixture/session.jsonl\\n")
     sys.exit(1)
+if os.environ.get("TEST_CRASH"):
+    sys.stderr.write("Error: unrelated startup failure\\n")
+    sys.exit(3)
 Path("child.pid").write_text(str(os.getpid()))
 if os.environ.get("TEST_STARTUP_DESCENDANT"):
     descendant=subprocess.Popen([sys.executable,"-c","import time;time.sleep(120)"],stdin=-3,stdout=-3,stderr=-3)
@@ -30,6 +34,7 @@ mode=sys.argv[sys.argv.index("--permission-mode")+1]
 METHODS=["permissions/get","permissions/set","tools/set_active","agents/use","resources/list"]
 for line in sys.stdin:
     request=json.loads(line)
+    with open("child.requests","a") as log: log.write(request["type"]+" "+str(request.get("method"))+"\\n")
     data={}
     if request["type"]=="get_commands":
         data={"commands":[]}
@@ -154,6 +159,35 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
             await session.close()
             server.db.close()
         self.assertFalse(process_alive(int((self.root / 'child.pid').read_text())))
+
+    def in_process(self, session_id):
+        server = Server(SimpleNamespace(state_dir=str(self.root / "state"), profile="coding",
+            aelix=sys.executable, aelix_arg=[str(self.child)], provider=None, model=None))
+        return server, Session(server, session_id, str(self.root))
+
+    async def test_client_mcp_without_tool_selection_refuses_before_configuring(self):
+        self.child.write_text(FAKE_CHILD.replace('"tools/set_active",', ''), encoding='utf-8')
+        server, session = self.in_process("mcp")
+        session.client_mcp = [{"name": "fixture", "command": sys.executable, "args": []}]
+        try:
+            with self.assertRaises(ProtocolError) as caught:
+                await session.start()
+            self.assertEqual(caught.exception.data, {"kind": "restrictions_unenforceable", "methods": ["tools/set_active"]})
+            self.assertNotIn("mcp/configure", (self.root / "child.requests").read_text())
+        finally:
+            await session.close()
+            server.db.close()
+
+    async def test_an_earlier_lock_refusal_does_not_label_a_later_startup_failure(self):
+        server, session = self.in_process("restarted")
+        session.stderr_tail = bytearray(b"Error: this session is already open in another terminal.\n")
+        try:
+            with patch.dict(os.environ, TEST_CRASH="1"), self.assertRaises(ProtocolError) as caught:
+                await session.start()
+            self.assertNotEqual(caught.exception.code, SESSION_LOCKED)
+        finally:
+            await session.close()
+            server.db.close()
 
     @unittest.skipUnless(sys.platform == 'win32', 'Windows kill-on-close job boundary')
     async def test_forced_adapter_death_kills_owned_worker_and_descendant(self):

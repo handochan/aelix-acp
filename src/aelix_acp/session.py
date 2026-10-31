@@ -141,6 +141,7 @@ class Session:
                 raise ProtocolError("Saved session changed before it could be opened; load it again", -32000)
             self.index_snapshot = None
         self.restore_launch_preferences()  # Re-read under the acquired lease, not the constructor's stale snapshot.
+        self.stderr_tail = bytearray()  # A refusal from an earlier worker must not label this one.
         self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
         os.chmod(self.socket_dir, 0o700)
         socket_path = str(Path(self.socket_dir) / "bridge.sock")
@@ -227,28 +228,30 @@ class Session:
                                 {"kind": "runtime_control_required", "required": 1})
         methods = self.controls.capabilities.get("methods", [])
         self.recovery_warnings = []
-        if self.client_mcp:
-            if "mcp/configure" not in methods:
-                raise ProtocolError("This Aelix runtime cannot accept client MCP servers; update its control API", -32004)
-            await self.configure_mcp(self.client_mcp)
         preferences = load_preferences(self.server.db, self.id)
         saved_agent = preferences.get("agent")
         # A saved profile or tool selection restricts authority. Refuse rather
-        # than resume with the runtime's broader defaults.
-        missing = [method for method, needed in (("agents/use", saved_agent), ("tools/set_active", self.active_tools is not None),
+        # than resume with the runtime's broader defaults; check before client
+        # MCP setup, which already needs tools/set_active.
+        missing = [method for method, needed in (("agents/use", saved_agent), ("tools/set_active", self.active_tools is not None or self.client_mcp),
                                                  ("permissions/set", True)) if needed and method not in methods]
         if missing:
             raise ProtocolError("This Aelix runtime cannot enforce this session's saved restrictions; update Aelix",
                                 -32004, {"kind": "restrictions_unenforceable", "methods": missing})
-        profile_failed = False
+        if self.client_mcp:
+            if "mcp/configure" not in methods:
+                raise ProtocolError("This Aelix runtime cannot accept client MCP servers; update its control API", -32004)
+            await self.configure_mcp(self.client_mcp)
         if saved_agent:
             try:
                 await self.rpc("aelix_control", method="agents/use", params={"name": saved_agent})
             except BackendError:
-                await self.rpc("aelix_control", method="agents/use", params={"name": "--none"})
-                profile_failed = True
-                self.recovery_warnings.append({"kind": "agent_unavailable", "previousValue": saved_agent,
-                    "message": f"Saved agent {saved_agent} could not be applied; resumed without that profile in Ask mode. Select an available profile before continuing."})
+                # The profile's tool and posture limits cannot be applied, and a
+                # warning during session/load is not shown by AionCore v0.2.2.
+                # Refuse instead of resuming with broader defaults.
+                raise ProtocolError(f"This session uses the agent profile '{saved_agent}', which could not be loaded. "
+                                    "Restore or recreate that profile, then open the session again; or start a new session.",
+                                    -32004, {"kind": "profile_unavailable", "profile": saved_agent}) from None
             await self.controls.refresh()
         config = preferences.get("config", {})
         require_object(config, "saved session config")
@@ -260,8 +263,7 @@ class Session:
                         "previousValue": config[config_id], "message": f"Saved {config_id} is unavailable; using the native runtime's current selection."})
                 else:
                     await self.controls.set(config_id, config[config_id], publish=False)
-        # Never recover a missing restricted identity into silent writes.
-        restored = "default" if profile_failed else self.launch_mode
+        restored = self.launch_mode
         await self.controls.observe_permission()
         if self.controls.native_mode != restored:
             await self.controls.apply_permission(restored, persist=False)
