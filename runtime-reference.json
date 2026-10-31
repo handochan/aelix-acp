@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/handochan/aelix-ai",
+  "commit": "e19ab55e17e871a40356fc9802f3f6669ca727de",
+  "runtimeControlVersion": 1,
+  "workspaceInstallRequired": true,
+  "minimumPython": "3.11",
+  "status": "beta.3-candidate",
+  "note": "aelix-ai main before the v0.1.0-beta.3 cut; re-pin to the tagged release when it is published."
+}

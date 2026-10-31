@@ -2,67 +2,29 @@ name: ACP tests
 on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
+concurrency:
+  group: acp-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   test:
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-15, windows-2022]
-        python: ['3.11', '3.12']
+        python: ['3.11', '3.12', '3.13', '3.14']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install .
       - run: python -m unittest discover -s tests -v
       - run: aelix-acp --version
-  public-beta2:
-    name: Public beta.2 qualification (Python ${{ matrix.python }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    strategy:
-      matrix:
-        python: ['3.11', '3.12']
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - name: Install released native wheels and the ACP wheel
-        run: |
-          python -m venv .local/native
-          .local/native/bin/python -m pip install --index-url https://pypi.org/simple --only-binary=:all: aelix==0.1.0b2
-          python -m pip wheel --no-deps --wheel-dir .local/acp-wheel .
-          .local/native/bin/python -m pip install --no-index .local/acp-wheel/*.whl
-      - name: Verify wheel bytes and exercise actual native and ACP processes
-        run: |
-          .local/native/bin/python scripts/qualify_beta2.py --adapter .local/native/bin/aelix-acp --report .local/qualification.json
-      - name: Verify sessionless management and installed ACP contracts (no host)
-        run: |
-          .local/native/bin/python scripts/qualify_management.py --adapter .local/native/bin/aelix-acp --native-only --report .local/management-qualification.json
-      - name: Verify Ask/Yolo effects and audit additional native modes (no host)
-        run: |
-          .local/native/bin/python scripts/qualify_permissions.py --adapter .local/native/bin/aelix-acp --report .local/permission-qualification.json
-      - name: Verify installed managed operations and actual process interruption (no host)
-        run: |
-          .local/native/bin/python scripts/qualify_operations.py --adapter .local/native/bin/aelix-acp --report .local/operation-qualification.json
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: public-beta2-python-${{ matrix.python }}
-          path: |
-            .local/qualification.json
-            .local/management-qualification.json
-            .local/permission-qualification.json
-            .local/operation-qualification.json
-          if-no-files-found: error
-
-  public-platforms:
-    name: Public native and ACP (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+  native:
+    name: Native candidate and ACP (${{ matrix.target }})
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -72,40 +34,25 @@ jobs:
           - { target: linux-arm64, os: ubuntu-24.04-arm }
           - { target: linux-x64, os: ubuntu-24.04 }
           - { target: win32-x64, os: windows-2022 }
-    defaults:
-      run:
-        shell: bash
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Resolve platform entrypoints
-        run: |
-          python - <<'PYTHON'
-          import os
-          from pathlib import Path
-          scripts = Path('.local/native') / ('Scripts' if os.name == 'nt' else 'bin')
-          values = {'ACP_NATIVE_PYTHON': scripts / ('python.exe' if os.name == 'nt' else 'python'),
-                    'ACP_NATIVE_ADAPTER': scripts / ('aelix-acp.exe' if os.name == 'nt' else 'aelix-acp')}
-          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
-              for key, value in values.items(): output.write(key + '=' + value.as_posix() + '\n')
-          PYTHON
-      - name: Install released native and candidate adapter wheels
-        run: |
-          python -m venv .local/native
-          "$ACP_NATIVE_PYTHON" -m pip install --index-url https://pypi.org/simple --only-binary=:all: aelix==0.1.0b2
-          python -m pip wheel --no-deps --wheel-dir .local/acp-wheel .
-          "$ACP_NATIVE_PYTHON" -m pip install --no-index .local/acp-wheel/*.whl
-      - name: Verify unchanged public wheels and actual native and ACP processes
-        run: '"$ACP_NATIVE_PYTHON" scripts/qualify_beta2.py --adapter "$ACP_NATIVE_ADAPTER" --report .local/platform-qualification.json'
-      - name: Verify installed managed operations and owned native lifetime
-        run: '"$ACP_NATIVE_PYTHON" scripts/qualify_operations.py --adapter "$ACP_NATIVE_ADAPTER" --report .local/platform-operation-qualification.json'
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - id: runtime
+        name: Pinned aelix-ai commit
+        run: python -c "import json,os; ref=json.load(open('runtime-reference.json'))['commit']; print('aelix-ai', ref); open(os.environ['GITHUB_OUTPUT'],'a').write('ref='+ref+'\n')"
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          name: public-platform-${{ matrix.target }}
-          path: |
-            .local/platform-qualification.json
-            .local/platform-operation-qualification.json
-          if-no-files-found: error
+          repository: handochan/aelix-ai
+          ref: ${{ steps.runtime.outputs.ref }}
+          path: .native-core
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: '0.12.23'
+      - run: uv sync --project .native-core --all-packages --python 3.12 --locked
+      - run: python scripts/test_native.py --core .native-core --check-ref
+      - run: uv build --wheel --out-dir .native-core/.local/wheels .native-core/packages/aelix-coding-agent/src/aelix_coding_agent/examples/starter
+      - name: Offline package lifecycle through ACP
+        run: python -c "import os,pathlib,subprocess,sys; root=pathlib.Path('.native-core'); cli=root/'.venv'/('Scripts/aelix.exe' if os.name=='nt' else 'bin/aelix'); wheel=next((root/'.local/wheels').glob('aelix_starter_ext-*.whl')); sys.exit(subprocess.call([sys.executable,'scripts/test_packages.py','--aelix',str(cli),'--wheel',str(wheel)]))"

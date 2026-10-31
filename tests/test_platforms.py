@@ -12,6 +12,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from aelix_acp.stdio import StdinReader
 from aelix_acp.server import Server, Session
+from aelix_acp.session import PRE_AUTH_LIMIT
 
 
 class StdioTests(unittest.IsolatedAsyncioTestCase):
@@ -22,8 +23,11 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                 '--state-dir', state, env=dict(os.environ, PYTHONPATH=source, PYTHONIOENCODING='cp1252'),
                 stdin=-1, stdout=-1, stderr=-1)
             try:
+                process.stdin.write((json.dumps({'jsonrpc': '2.0', 'id': 0, 'method': 'initialize',
+                                                 'params': {'protocolVersion': 1}}) + '\n').encode('utf-8'))
                 process.stdin.write((json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': '한글'}) + '\n').encode('utf-8'))
                 await process.stdin.drain()
+                await asyncio.wait_for(process.stdout.readline(), 5)
                 answer = json.loads((await asyncio.wait_for(process.stdout.readline(), 5)).decode('utf-8'))
                 self.assertIn('한글', answer['error']['message'])
                 process.stdin.close()
@@ -88,25 +92,27 @@ class LoopbackTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.server = Server(SimpleNamespace(state_dir=self.temp.name, profile='coding'))
         self.session = Session(self.server, 'owned', self.temp.name)
-        self.session.permission_token = 'generation-one-private-token'
         self.events = []
         async def capture(event): self.events.append(event)
         self.server.send = capture
-        self.listener = await asyncio.start_server(self.session.permission, '127.0.0.1', 0, limit=65536)
-        self.port = self.listener.sockets[0].getsockname()[1]
-        self.session.permission_endpoint = f'tcp://127.0.0.1:{self.port}'
+        # The same authenticated loopback listener Windows workers use.
+        await self.session.listen(None, tcp=True)
+        self.port = int(self.session.permission_endpoint.rsplit(':', 1)[1])
 
     async def asyncTearDown(self):
-        self.listener.close()
-        await self.listener.wait_closed()
         await self.session.close()
         self.server.db.close()
         self.temp.cleanup()
 
-    async def request(self, token):
+    async def request(self, token, args=None):
+        if 'tool-one' not in self.session.tools:
+            # The bridge only answers for a tool native itself announced.
+            await self.session.event({'type': 'tool_execution_start', 'toolCallId': 'tool-one',
+                                      'toolName': 'write', 'args': {'path': 'owned.txt'}})
+            self.events.clear()
         reader, writer = await asyncio.open_connection('127.0.0.1', self.port)
-        packet = dict(toolCallId='tool-one', name='write', args={'path': 'owned.txt'})
-        if token is not None: packet['token'] = token
+        packet = dict(toolCallId='tool-one', name='write', args=args or {'path': 'owned.txt'})
+        writer.write((json.dumps({} if token is None else {'token': token}) + '\n').encode('utf-8'))
         writer.write((json.dumps(packet) + '\n').encode('utf-8'))
         await writer.drain()
         try:
@@ -117,16 +123,16 @@ class LoopbackTests(unittest.IsolatedAsyncioTestCase):
                 await writer.wait_closed()
 
     async def test_missing_or_wrong_token_cannot_reach_yolo_or_ui(self):
-        self.session.permission_mode = 'yolo'
+        self.session.controls.permission_mode = 'yolo'
         self.assertEqual(await self.request(None), {'allow': False})
         self.assertEqual(await self.request('wrong'), {'allow': False})
         self.assertEqual(self.events, [])
 
     async def test_valid_token_reaches_yolo_without_exposing_token(self):
-        self.session.permission_mode = 'yolo'
+        self.session.controls.permission_mode = 'yolo'
         token = self.session.permission_token
         self.assertEqual(await self.request(token), {'allow': True})
-        self.assertEqual(len(self.events), 2)
+        self.assertEqual([event['params']['update']['status'] for event in self.events], ['in_progress'])
         self.assertNotIn(token, json.dumps(self.events))
 
     async def test_stale_worker_token_and_cancelled_session_are_denied_before_ui(self):
@@ -137,13 +143,33 @@ class LoopbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.request(self.session.permission_token), {'allow': False})
         self.assertEqual(self.events, [])
 
+    async def test_oversized_line_before_authentication_is_refused_without_reading_it_whole(self):
+        reader, writer = await asyncio.open_connection('127.0.0.1', self.port)
+        try:
+            # More than the pre-auth limit and no newline: the peer is still
+            # "sending", so a refusal now means the line was never buffered whole.
+            writer.write(b'x' * (PRE_AUTH_LIMIT + 1))
+            await writer.drain()
+            self.assertEqual(json.loads(await asyncio.wait_for(reader.readline(), 2)), {'allow': False})
+            self.assertEqual(self.events, [])
+        finally:
+            writer.close()
+            with contextlib.suppress(ConnectionError):
+                await writer.wait_closed()
+
+    async def test_authenticated_request_may_exceed_the_pre_auth_limit(self):
+        self.session.controls.permission_mode = 'yolo'
+        content = 'y' * (4 * PRE_AUTH_LIMIT)
+        self.assertEqual(await self.request(self.session.permission_token, {'path': 'owned.txt', 'content': content}),
+                         {'allow': True})
+
     async def test_unauthenticated_connections_are_bounded_before_more_consent(self):
         connections = [await asyncio.open_connection('127.0.0.1', self.port) for _ in range(8)]
         try:
             for _ in range(100):
-                if len(self.session.permissions) == 8: break
+                if len(self.session.permission_connections) == 8: break
                 await asyncio.sleep(0.01)
-            self.assertEqual(len(self.session.permissions), 8)
+            self.assertEqual(len(self.session.permission_connections), 8)
             self.assertEqual(await self.request(self.session.permission_token), {'allow': False})
             self.assertEqual(self.events, [])
         finally:

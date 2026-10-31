@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aelix-acp"
-version = "0.1.0"
+version = "0.2.0a1"
 description = "ACP to Aelix RPC bridge for Aelix Studio and other ACP clients"
 readme = "README.md"
 license = {text = "Apache-2.0"}

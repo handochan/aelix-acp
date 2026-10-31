@@ -2,8 +2,6 @@
 import ctypes
 from ctypes import wintypes
 import os
-import importlib.util
-from pathlib import Path
 import subprocess
 import sys
 import threading
@@ -98,21 +96,4 @@ if __name__ == "__main__":
         deadline.join()
     if ready != b"\0" or len(sys.argv) < 2:
         raise SystemExit(2)
-    options = {}
-    reference = os.environ.get('AELIX_ACP_LEASE_REFERENCE')
-    expected = os.environ.get('AELIX_ACP_LEASE_ID')
-    if reference is not None or expected is not None:
-        # -I -S intentionally ignores PYTHONPATH/site-packages. Read only the
-        # adapter-owned helper at a fixed relative path, after Job release.
-        helper = Path(__file__).with_name('operations') / 'lease.py'
-        spec = importlib.util.spec_from_file_location('aelix_acp_gate_lease', helper)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        reference = int(reference)
-        if module.inherited_identity(reference) != expected:
-            raise SystemExit(2)
-        os.set_handle_inheritable(reference, True)
-        startup = subprocess.STARTUPINFO()
-        startup.lpAttributeList = {'handle_list': [reference]}
-        options = {'startupinfo': startup, 'close_fds': True}
-    raise SystemExit(subprocess.call(sys.argv[1:], shell=False, **options))
+    raise SystemExit(subprocess.call(sys.argv[1:], shell=False))

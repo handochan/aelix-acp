@@ -14,20 +14,21 @@ class PreviewTests(unittest.TestCase):
             root = Path(tmp)
             (root/'workspace/runs').mkdir(parents=True)
             (root/'workspace/assets').mkdir()
-            (root/'workspace/assets/workspace.css').write_text('body {color:navy}')
-            (root/'workspace/assets/plotly.min.js').write_text('window.Plotly={newPlot(){}};')
+            (root/'workspace/assets/workspace.css').write_text('body {color:navy}', encoding='utf-8')
+            (root/'workspace/assets/plotly.min.js').write_text('window.Plotly={newPlot(){}};', encoding='utf-8')
             source = root/'workspace/runs/fixture.html'
             original = ('<html data-plotly="../assets/plotly.min.js"><head>'
                         '<link rel="stylesheet" href="../assets/workspace.css?v=1">'
                         '<script src="../assets/workspace.js"></script></head><body>'
                         '<div class="plotly-chart" data-fig="fig1"></div>'
                         '<script type="application/json" id="fig1">{"data":[]}</script>'
-                        '<a href="../index.html">original</a></body></html>')
-            source.write_text(original)
-            output = bundle_run(root,'fixture').read_text(encoding="utf-8")
-            self.assertEqual(source.read_text(encoding="utf-8"),original)
+                        '<a href="../index.html">원본 보고서</a></body></html>')
+            source.write_text(original, encoding='utf-8')
+            output = bundle_run(root,'fixture').read_text(encoding='utf-8')
+            self.assertEqual(source.read_text(encoding='utf-8'),original)
             self.assertIn('<style>body {color:navy}</style>',output)
             self.assertIn('Plotly.newPlot',output)
+            self.assertIn('원본 보고서', output)
             self.assertLess(len(output.encode()), 1_000_000)
             self.assertNotIn('<script src=',output)
             self.assertIn(hashlib.sha256(original.encode()).hexdigest(),output)

@@ -1,5 +1,11 @@
 # Public beta.2 ACP qualification
 
+> Historical Preview baseline. These documents and receipts belong to the
+> Preview line, which ends at ACP main `569737168199c4be65eeee803851fcc961d52a74`
+> (Studio pins `117cf6c9d536c4aa98b1f3a6481c12464584960c`). ACP #20 moved main
+> to runtime-control v1 for the Beta and removed the beta.2 qualifiers,
+> managed-operation wiring and their CI jobs; reproduce from those commits.
+
 Issue [#6](https://github.com/handochan/aelix-acp/issues/6), 2026-10-25. This is a
 repeatable native/adapter baseline, not full Studio Preview acceptance. Shared
 product requirements remain in the [Studio design](https://github.com/handochan/aelix-studio/blob/main/docs/studio-release-train/README.md).
