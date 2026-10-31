@@ -51,10 +51,16 @@ also listed in `agentCapabilities._meta["aelix/errors"]`:
 | Code | `data` | Meaning |
 |---|---|---|
 | `-33001` | `{kind:"session_locked", sessionId, lockedBy:"native"\|"acp", holder:null, retryable:false}` | Another writer holds the session: the CLI or another native process (`native`), or another adapter process (`acp`). Show it; reopen after that writer closes. `holder` stays `null` until aelix-ai reports the lock holder (Studio request R7). |
-| `-33002` | `{kind:"turn_failed_after_dispatch", retryable:false, cause?}` | The turn failed after native accepted work. Model calls or tool effects may have happened; do not resend automatically. |
+| `-33002` | `{kind:"turn_failed_after_dispatch", retryable:false, cause?}` | The turn failed after native accepted work, where the failure would otherwise be `-32603`. Model calls or tool effects may have happened; do not resend automatically. |
 
 AionCore maps both to a non-retryable protocol error, so its automatic turn
-replay (only for `retryable == true`) does not run. The native lock is
+replay (only for `retryable == true`) does not run. After native work started,
+a failure with a more specific code keeps that code instead of `-33002`:
+`-32007` (native may have started work), `-32000`, `-32602`, `-32004`,
+`-32003`, `-32006`, `-32008` or `-33001`. AionCore treats all of them as
+non-retryable too. An adapter crash or closed transport has no adapter error at
+all; AionCore v0.2.2 replays that turn once until handochan/aelix-studio-host#6
+lands. The native lock is
 recognized from native's own refusal text until R7 provides a structured
 signal; the native transcript path is never copied into the error.
 
@@ -100,8 +106,10 @@ Offline updates need a recorded local source or configured local index.
 
 Create/load can return `_meta["aelix/recoveryWarnings"]`. Display these warnings
 alongside the effective selectors; warnings are also emitted as text. Missing
-model choices retain the native fallback. A failed saved profile resets its
-identity and returns to Ask. A saved profile or tool selection that the runtime
+model choices retain the native fallback. A saved agent profile that can no
+longer be loaded refuses the load with `-32004` and
+`{kind:"profile_unavailable", profile}`; the user restores or recreates that
+profile, or starts a new session. A saved tool selection that the runtime
 cannot enforce refuses the load (`-32004`, `kind:"restrictions_unenforceable"`).
 `_meta["aelix/permission"]` reports the native posture read back with
 `permissions/get` next to the client approval policy.

@@ -104,17 +104,25 @@ not prove a tool did nothing. Protect history as sensitive user data.
 
 The native `agent_end` closes a provider attempt. ACP prompt completion instead
 waits for native `get_state.isStreaming` to become false, including retries and
-closing compaction. Missing saved model/profile choices recover with visible
-warnings; a missing restricted profile returns to Ask. A saved profile or tool
-selection the runtime cannot enforce refuses the session instead of falling
-back to broader defaults.
+closing compaction. A missing saved model or other setting recovers to the
+native choice with a warning. A saved agent profile that cannot be applied
+refuses the session (`-32004`, `profile_unavailable`): the profile's tool and
+posture limits would be lost, and AionCore v0.2.2 does not show warnings sent
+during `session/load`. A saved tool selection the runtime cannot enforce
+refuses the session too (`restrictions_unenforceable`).
 
 Once a turn has sent native anything but a read-only request (the prompt, a
 mutating control or command, a worker restart or a package change), a failure
-is reported as `-33002` with `retryable:false`. A client or host must not
-replay it automatically: model calls and tool effects may already have run.
-AionCore's turn recovery replays only errors it classifies as retryable, and
-classifies this code as a non-retryable protocol error.
+that would otherwise be an internal error (`-32603`, or a session-not-found
+`-32001`) becomes `-33002` with `retryable:false`. A failure that already has a
+specific code keeps it: `-32007` (a native RPC timed out; native may have
+started work), `-32000` (busy), `-32602`, `-32004`, `-32003`, `-32006`, `-32008`
+and `-33001`. AionCore classifies every one of these as non-retryable, so its
+turn recovery, which replays only retryable errors, does not resend the turn.
+A client must not resend it automatically either. Recording the failure in the
+adapter's own store cannot replace that code. When the adapter process itself
+dies or the transport closes, there is no adapter error; that replay is the
+host's to prevent (planned in handochan/aelix-studio-host#6).
 
 A native writer-lock refusal ("already open in another terminal", whether at
 startup or on a session switch) and a second adapter's ACP lease become

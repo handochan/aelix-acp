@@ -41,9 +41,11 @@ native, with a structure-only wire tap and the host's own SQLite rows:
 Native-process coverage added for this change: Ask/Yolo effects and native
 posture read-back; refusal of Plan/Auto Edit/Auto; launch-owned extension
 disable refused while its command keeps running (#9); a disabled extension
-leaves native's inventory; seeded `agent=restricted-fixture`, `activeTools=[]`,
-`permission_mode=yolo` resumes in Ask with a warning and an actual model request
-that carries no tools (#10); a real native lock holder refuses `session/load`
+leaves native's inventory, and hard-link or case variants of a launch-owned
+extension are refused too; a deleted saved profile, or seeded
+`agent=restricted-fixture`, `activeTools=[]`, `permission_mode=yolo`, refuses
+the load with `profile_unavailable` so a later Yolo selection and prompt never
+reach a session with broader tools (#10); a real native lock holder refuses `session/load`
 with `-33001`; a provider failure with native retry off returns `-33002` after
 one model request; a parented child never uses `_aelix/subagent`.
 
@@ -55,9 +57,10 @@ dies, or the transport closes, after `session/prompt` was sent, there is no
 adapter error to mark. AionCore v0.2.2 classifies the closed transport as
 retryable and replays the turn once (reproduced: SIGKILL of the adapter
 mid-request, the model received the turn twice). By the user's decision of
-2026-10-31 the host fixes this in handochan/aelix-studio-host#6, and the
-adapter no longer carries the managed-operation contract that covered it for
-Preview ([ACP #20 decision](https://github.com/handochan/aelix-acp/issues/20#issuecomment-6536397248)).
+2026-10-31 the fix is planned in the host, handochan/aelix-studio-host#6, and
+the adapter no longer carries the managed-operation contract that covered it
+for Preview ([ACP #20 decision](https://github.com/handochan/aelix-acp/issues/20#issuecomment-6536397248)).
+Until #6 lands, the v0.2.2 host still replays such a turn once.
 A manual resend after a lost HTTP response is a new turn by the same decision.
 
 ## Development candidate — 2026-10-23 (historical)
