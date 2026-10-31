@@ -662,14 +662,23 @@ class Session:
             # Once native may have started work, a failure is final: an
             # automatic replay could repeat model calls and tool effects.
             error = after_dispatch(failure) if self.dispatched else failure
-            append_event(self.server.db, self.id, {"sessionUpdate": "agent_message_chunk",
-                         "content": {"type": "text", "text": "Request failed: " + str(error)}})
+            self.record(append_event, self.server.db, self.id, {"sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "Request failed: " + str(error)}})
             if error is failure:
                 raise
             raise error from None
         finally:
             self.turn_active = False
-            finish_turn(self.server.db, self.id, key, result, error)
+            # Bookkeeping must not replace the turn's own outcome (a marked
+            # -33002 would otherwise become a replayable internal error).
+            self.record(finish_turn, self.server.db, self.id, key, result, error)
+
+    @staticmethod
+    def record(write, *args):
+        try:
+            write(*args)
+        except Exception as failure:
+            print(f"[aelix-acp] Could not record the turn outcome: {type(failure).__name__}", file=sys.stderr)
 
     async def _prompt(self, blocks):
         if self.done and not self.done.done():

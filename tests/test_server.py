@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import json
 from pathlib import Path
 import sys
@@ -201,6 +202,18 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False})
         self.assertIn("provider rejected", str(caught.exception))
         self.assertEqual(written[0], "prompt")
+
+    async def test_bookkeeping_failure_keeps_the_not_retryable_marking(self):
+        self.native(failure="provider rejected the request")
+        record = __import__("aelix_acp.session", fromlist=["append_event"]).append_event
+        def broken(*args):
+            if not self.session.dispatched:
+                return record(*args)
+            raise sqlite3.OperationalError("database is locked")
+        with patch("aelix_acp.session.append_event", broken), patch("aelix_acp.session.finish_turn", broken):
+            with self.assertRaises(ProtocolError) as caught:
+                await self.session.prompt([{"type": "text", "text": "Respond"}])
+        self.assertEqual(caught.exception.code, TURN_FAILED_AFTER_DISPATCH)
 
     async def test_failure_before_anything_reaches_native_keeps_its_code(self):
         self.native(running=False)
