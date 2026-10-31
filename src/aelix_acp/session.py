@@ -47,6 +47,8 @@ READ_ONLY_CONTROLS = frozenset({"capabilities", "resources/list", "settings/get"
                                 "agents/list", "agents/show", "commands/cancel"})
 STDERR_TAIL = 16 * 1024
 FRAME_LIMIT = 16 * 1024 * 1024
+# An unauthenticated loopback peer gets one bounded line for its token.
+PRE_AUTH_LIMIT = 64 * 1024
 
 
 def tool_call(call_id, name, args, cwd, status="pending"):
@@ -57,6 +59,24 @@ def tool_call(call_id, name, args, cwd, status="pending"):
         p = Path(path).expanduser()
         result["locations"] = [{"path": str(p if p.is_absolute() else Path(cwd) / p)}]
     return result
+
+
+async def read_line(reader, limit):
+    """One newline-terminated line of at most `limit` bytes, read in chunks.
+
+    The stream's own limit stays small for the pre-authentication line, so a
+    larger line is assembled here instead of by `readline`.
+    """
+    line = bytearray()
+    while not line.endswith(b"\n"):
+        chunk = await reader.read(min(65536, limit + 1 - len(line)))
+        if not chunk:
+            break
+        newline = chunk.find(b"\n")
+        line += chunk if newline < 0 else chunk[:newline + 1]
+        if len(line) > limit:
+            raise ValueError("Permission request exceeds the frame limit")
+    return bytes(line)
 
 
 def text_content(content):
@@ -145,17 +165,7 @@ class Session:
         self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
         os.chmod(self.socket_dir, 0o700)
         socket_path = str(Path(self.socket_dir) / "bridge.sock")
-        self.permission_endpoint = None
-        self.permission_token = None
-        if sys.platform == "win32":
-            # Windows has no private Unix socket here: a per-worker token
-            # authenticates the loopback channel instead.
-            self.permission_token = secrets.token_urlsafe(32)
-            self.socket_server = await asyncio.start_server(self.permission, "127.0.0.1", 0, limit=FRAME_LIMIT, backlog=8)
-            self.permission_endpoint = f"tcp://127.0.0.1:{self.socket_server.sockets[0].getsockname()[1]}"
-        else:
-            self.socket_server = await asyncio.start_unix_server(self.permission, path=socket_path, limit=FRAME_LIMIT)
-            os.chmod(socket_path, 0o600)
+        await self.listen(socket_path, tcp=sys.platform == "win32")
         args = [self.server.args.aelix, *getattr(self.server.args, "aelix_arg", []), "--mode", "rpc", "--offline", "--no-extensions",
                 "--permission-mode", self.launch_mode,
                 "--append-system-prompt-file", str(PACKAGE / "profiles" / f"{self.server.args.profile}.md")]
@@ -273,6 +283,20 @@ class Session:
         if metadata.get("aelix/clientActions") is True and "ui/enable" in methods:
             await self.rpc("aelix_control", method="ui/enable", params={"enabled": True})
         self.save()
+
+    async def listen(self, socket_path, *, tcp):
+        """Open this worker's approval channel."""
+        self.permission_endpoint = None
+        self.permission_token = None
+        if tcp:
+            # Windows has no private Unix socket here: a per-worker token
+            # authenticates the loopback channel instead.
+            self.permission_token = secrets.token_urlsafe(32)
+            self.socket_server = await asyncio.start_server(self.permission, "127.0.0.1", 0, limit=PRE_AUTH_LIMIT, backlog=8)
+            self.permission_endpoint = f"tcp://127.0.0.1:{self.socket_server.sockets[0].getsockname()[1]}"
+        else:
+            self.socket_server = await asyncio.start_unix_server(self.permission, path=socket_path, limit=PRE_AUTH_LIMIT)
+            os.chmod(socket_path, 0o600)
 
     async def raise_if_locked(self):
         """Report native's writer-lock refusal as a structured, final error."""
@@ -526,14 +550,19 @@ class Session:
             if len(self.permission_connections) >= (8 if self.permission_endpoint else 32):
                 return
             self.permission_connections.add(owner)
-            async with asyncio.timeout(5 if self.permission_endpoint else 300):
-                request = json.loads(await reader.readline())
-            if not isinstance(request, dict):
-                return
             if self.permission_endpoint or self.permission_token is not None:
-                token = request.pop("token", None)
+                # The token arrives on its own line, read under the small
+                # stream limit; only an authenticated peer may send a large
+                # request (tool arguments can carry whole files).
+                async with asyncio.timeout(5):
+                    hello = json.loads(await reader.readline())
+                token = hello.get("token") if isinstance(hello, dict) else None
                 if not self.permission_token or not isinstance(token, str) or not hmac.compare_digest(token, self.permission_token):
                     return
+            async with asyncio.timeout(30 if self.permission_endpoint else 300):
+                request = json.loads(await read_line(reader, FRAME_LIMIT))
+            if not isinstance(request, dict):
+                return
             async with asyncio.timeout(300):
                 while request.get("toolCallId") not in self.tools:
                     self.tool_arrived.clear()

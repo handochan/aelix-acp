@@ -69,7 +69,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             for token, identifier, name in [("wrong", "t1", "write"), ("correct-secret", "unknown", "write"),
                                              ("correct-secret", "t1", "bash"), ("correct-secret", "t1", "write")]:
                 reader, writer = await asyncio.open_connection(*address)
-                writer.write((json.dumps({"token": token, "toolCallId": identifier, "name": name, "args": {}}) + "\n").encode())
+                writer.write((json.dumps({"token": token}) + "\n").encode())
+                writer.write((json.dumps({"toolCallId": identifier, "name": name, "args": {}}) + "\n").encode())
                 await writer.drain()
                 if token == "correct-secret" and identifier == "unknown":
                     await asyncio.sleep(0.02)
@@ -118,7 +119,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         listener = await asyncio.start_server(self.session.permission, "127.0.0.1", 0)
         reader, writer = await asyncio.open_connection(*listener.sockets[0].getsockname())
         try:
-            writer.write(b'{"token":"secret","toolCallId":"early","name":"write","args":{}}\n')
+            writer.write(b'{"token":"secret"}\n{"toolCallId":"early","name":"write","args":{}}\n')
             await writer.drain()
             received = asyncio.create_task(reader.readline())
             await asyncio.sleep(0.02)

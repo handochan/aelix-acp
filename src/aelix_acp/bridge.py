@@ -27,7 +27,8 @@ async def before_tool(event, ctx):
                 if target.scheme != "tcp" or target.hostname != "127.0.0.1" or not target.port or target.username or target.password or target.path or target.query or target.fragment or not token:
                     return ToolCallResult(block=True, reason="ACP permission channel is invalid")
                 reader, writer = await asyncio.open_connection("127.0.0.1", target.port, limit=65536)
-                request["token"] = token
+                # Authenticate on a short first line before sending arguments.
+                writer.write((json.dumps({"token": token}) + "\n").encode("utf-8"))
             else:
                 reader, writer = await asyncio.open_unix_connection(path)
             writer.write((json.dumps(request) + "\n").encode("utf-8"))
