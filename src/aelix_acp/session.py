@@ -25,7 +25,7 @@ from .wire.transport import StdoutWriter
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event,
                             insert_history, begin_turn, finish_turn)
-from .runtime.commands import BUILTINS, execute as execute_slash
+from .runtime.commands import BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND, execute as execute_slash
 from .runtime.extensions import extension_reference
 from .runtime.leases import acquire as acquire_lease, lease_path
 from .runtime.subagents import SubagentTracker
@@ -37,7 +37,7 @@ KINDS = {"read": "read", "grep": "search", "find": "search", "ls": "read",
 # Native history selectors. A launch prefix must not bypass session/load.
 SESSION_SELECTORS = ("--session", "--resume", "-r", "--continue", "-c", "--fork", "--no-session")
 NATIVE_ROUTE_ARGUMENTS = frozenset({
-    "--provider", "--model", "--agent", "--agent-file", "--api-key", "--require-registration-route",
+    "--provider", "--model", "--api-key", "--require-registration-route",
 })
 NATIVE_SESSION_SELECTORS = ("model", "thinking_level")
 # Native requests that never change the runtime (aelix-ai rpc/control.py
@@ -178,6 +178,8 @@ class Session:
             self.index_snapshot = None
         # Re-read under the acquired lease, not the constructor's stale snapshot.
         preferences = load_preferences(self.server.db, self.id) if fork_preferences is None else fork_preferences
+        saved_agent = preferences.get("agent")
+        resume_file = session_file if fork_source is None else fork_source["target"]
         self.restore_launch_preferences(preferences)
         self.stderr_tail = bytearray()  # A refusal from an earlier worker must not label this one.
         self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
@@ -201,7 +203,7 @@ class Session:
         args += ["-e", str(PACKAGE / "bridge.py")]
         # Adapter defaults must not suppress native resume. Explicit native
         # route arguments retain their original provider and model binding.
-        if not session_file or prefix_options & NATIVE_ROUTE_ARGUMENTS:
+        if not resume_file or prefix_options & NATIVE_ROUTE_ARGUMENTS:
             if self.server.args.provider:
                 args += ["--provider", self.server.args.provider]
             if self.server.args.model:
@@ -216,8 +218,12 @@ class Session:
         ready_file = Path(self.socket_dir) / "ready"
         env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
                    AELIX_ACP_READY_FILE=str(ready_file), AELIX_ACP_NONCE=nonce)
-        for name in ("AELIX_ACP_SOCKET", "AELIX_ACP_ENDPOINT", "AELIX_ACP_PERMISSION_TOKEN", "AELIX_ACP_FORK_SOURCE"):
+        for name in ("AELIX_ACP_SOCKET", "AELIX_ACP_ENDPOINT", "AELIX_ACP_PERMISSION_TOKEN", "AELIX_ACP_FORK_SOURCE",
+                     "AELIX_ACP_SELECTOR_STARTUP_FILE"):
             env.pop(name, None)
+        guard_selectors = bool(saved_agent and resume_file)
+        if guard_selectors:
+            env["AELIX_ACP_SELECTOR_STARTUP_FILE"] = str(Path(resume_file).resolve())
         if fork_source is not None:
             env["AELIX_ACP_FORK_SOURCE"] = json.dumps({
                 **fork_source, "projection": str(Path(self.socket_dir) / "fork-history.jsonl"),
@@ -260,7 +266,6 @@ class Session:
             raise
         if not ready_file.is_file() or ready_file.read_text() != nonce:
             raise ProtocolError("The tool approval bridge did not load; refusing this session", -32603)
-        saved_agent = preferences.get("agent")
         if fork_source is not None:
             if saved_agent:
                 try:
@@ -276,7 +281,7 @@ class Session:
         self.recovery_warnings = []
         # Read native selectors before applying an identity that may change
         # them. The empty branch still relies on its cached pre-turn choices.
-        native_has_history = session_file and self.state.get("messageCount", self.state.get("message_count")) != 0
+        native_has_history = resume_file and self.state.get("messageCount", self.state.get("message_count")) != 0
         restored_selectors = {
             option["id"]: option["currentValue"] for option in self.controls.options()
             if option["id"] in NATIVE_SESSION_SELECTORS
@@ -293,6 +298,8 @@ class Session:
             if "mcp/configure" not in methods:
                 raise ProtocolError("This Aelix runtime cannot accept client MCP servers; update its control API", -32004)
             await self.configure_mcp(self.client_mcp)
+        if guard_selectors:
+            await self.selector_startup(nonce, "begin")
         if saved_agent:
             try:
                 await self.rpc("aelix_control", method="agents/use", params={"name": saved_agent})
@@ -316,6 +323,9 @@ class Session:
                 option = next((entry for entry in self.controls.options() if entry["id"] == config_id), None)
                 if option is None or option["currentValue"] != value:
                     await self.controls.set(config_id, value, publish=False)
+            actual = {option["id"]: option["currentValue"] for option in self.controls.options()}
+            if any(actual.get(config_id) != value for config_id, value in restored_selectors.items()):
+                raise ProtocolError("Aelix did not restore the native session selectors", -32004)
         config = preferences.get("config", {})
         require_object(config, "saved session config")
         for config_id in (*NATIVE_SESSION_SELECTORS, "steeringMode", "followUpMode", "autoCompactionEnabled", "autoRetryEnabled"):
@@ -329,8 +339,18 @@ class Session:
         metadata = getattr(self.server, "client_capabilities", {}).get("_meta", {})
         if metadata.get("aelix/clientActions") is True and "ui/enable" in methods:
             await self.rpc("aelix_control", method="ui/enable", params={"enabled": True})
+        if guard_selectors:
+            await self.selector_startup(nonce, "finish")
         if fork_source is None:
             self.save()
+
+    async def selector_startup(self, nonce, operation):
+        result = await self.rpc("aelix_control", method="commands/run",
+                                params={"text": f"/{SELECTOR_STARTUP_COMMAND} {operation} {nonce}"})
+        messages = result.get("messages", [])
+        if (result.get("outcome") != "handled" or len(messages) != 1
+                or messages[0].get("text") != "selector-startup-ok"):
+            raise ProtocolError("Aelix did not confirm the selector startup guard", -32004)
 
     async def open_fork(self, nonce, source):
         result = await self.rpc("aelix_control", method="commands/run",
@@ -701,7 +721,7 @@ class Session:
             raise ProtocolError("The Analytics extension did not register its command; refusing this profile", -32603)
         catalog = [{"name": name, "description": description} for name, description in BUILTINS.items()]
         catalog.extend({"name": c["name"], "description": c.get("description") or c["name"]}
-                       for c in dynamic if c.get("name") not in BUILTINS)
+                       for c in dynamic if c.get("name") not in BUILTINS and c.get("name") not in PRIVATE_NATIVE_COMMANDS)
         await self.update({"sessionUpdate": "available_commands_update", "availableCommands": catalog})
 
     async def handle_ui(self, event):
