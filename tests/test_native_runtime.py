@@ -297,6 +297,7 @@ def setup(api):
 
     async def test_compaction_deadline_reports_unknown_and_reopens_the_same_session_without_replay(self):
         import sqlite3
+        await self.config("permission_mode", "yolo")
         await self.prompt("Prior context must remain")
         await self.prompt("More prior context")
         await self.client.close()
@@ -318,8 +319,32 @@ def setup(api):
         count = len(self.model_requests)
         with self.assertRaisesRegex(RuntimeError, "unresolved outcome"):
             await self.prompt("/compact", "deadline-compact")
+
+        profiles = self.root / "agent/agents"
+        profiles.mkdir(exist_ok=True)
+        (profiles / "current-owner.md").write_text(
+            "---\nname: current-owner\ndescription: Updated by the current owner\ntools: [read]\n---\nKeep the session."
+        )
+        contender = await AcpClient.start(self.root, EXECUTABLE)
+        try:
+            await contender.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+            await contender.request("_aelix/manage", {"sessionId": self.session, "action": "agents/use",
+                                                     "arguments": {"name": "current-owner"}})
+            await contender.request("session/set_config_option", {"sessionId": self.session,
+                "configId": "permission_mode", "value": "default"})
+            with self.assertRaises(RuntimeError) as locked:
+                await self.prompt("Try to resume while the session is owned")
+            self.assertEqual(json.loads(str(locked.exception))["code"], SESSION_LOCKED)
+            with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+                saved = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()[0])
+            self.assertEqual((saved["permission_mode"], saved["agent"]), ("default", "current-owner"))
+        finally:
+            await contender.close()
+
         self.assertEqual(await self.prompt("Continue this same session"), {"stopReason": "end_turn"})
         self.assertEqual(session_file(), saved_file)
+        self.assertEqual((await self.manage("permissions/get"))["mode"], "default")
+        self.assertEqual((await self.manage("resources/list"))["activeTools"], ["read"])
         self.assertEqual(len(self.model_requests), count + 1)
         self.assertIn("Prior context must remain", json.dumps(self.model_requests[-1]))
 

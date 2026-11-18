@@ -26,7 +26,7 @@ from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
 from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event,
                             begin_turn, finish_turn)
-from .runtime.commands import BUILTINS, compact_instructions, execute as execute_slash
+from .runtime.commands import BUILTINS, compact_instructions, execute as execute_slash, has_wrapped_compact
 from .runtime.extensions import extension_reference
 from .runtime.leases import acquire as acquire_lease
 from .runtime.subagents import SubagentTracker
@@ -164,6 +164,9 @@ class Session:
                 raise ProtocolError("Saved session changed before it could be opened; load it again", -32000)
             self.index_snapshot = None
         self.restore_launch_preferences()  # Re-read under the acquired lease, not the constructor's stale snapshot.
+        # A reused object may have an older Yolo policy. Startup approval
+        # remains Ask until native confirms the just-read policy below.
+        self.controls.permission_mode = "default"
         self.stderr_tail = bytearray()  # A refusal from an earlier worker must not label this one.
         self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
         os.chmod(self.socket_dir, 0o700)
@@ -392,7 +395,7 @@ class Session:
     async def publish_context_usage(self):
         try:
             await self.context.publish_usage()
-        except ProtocolError:
+        except (ProtocolError, ConnectionError):
             # An auxiliary snapshot must not replace the outcome of the turn.
             await self.context.invalidate_usage()
 
@@ -418,9 +421,10 @@ class Session:
         else:
             await self.context.finish_compaction("completed", result)
             await self.publish_context_usage()
-            with contextlib.suppress(ProtocolError):
+            with contextlib.suppress(ProtocolError, ConnectionError):
                 self.state = await self.rpc("get_state", _timeout=5)
-            self.record(self.save)
+            if self.lease is not None:
+                self.record(self.save)
 
     async def rpc(self, command, *, _timeout=45, **kwargs):
         request_id = uuid.uuid4().hex
@@ -684,11 +688,21 @@ class Session:
         held_lease = self.lease
         self.lease = None
         try:
-            filename = self.state.get("sessionFile")
-            if not filename or not Path(filename).is_file():
-                if preserve_history and self.state.get("messageCount", self.state.get("message_count")) != 0:
-                    raise ProtocolError("No persisted Aelix session file is available", -32004)
-                filename = None
+            if preserve_history:
+                if held_lease is None:
+                    held_lease = acquire_lease(self.server.args.state_dir, self.id)
+                row = self.server.db.execute("SELECT cwd,profile,file FROM sessions WHERE id=?", (self.id,)).fetchone()
+                if not row or (row[0], row[1]) != (self.cwd, self.server.args.profile):
+                    raise ProtocolError("Saved session does not match this workspace and profile", -32004)
+                filename = row[2]
+                if not filename or not Path(filename).is_file():
+                    if load_preferences(self.server.db, self.id).get("backendMessageCount") != 0:
+                        raise ProtocolError("No persisted Aelix session file is available", -32004)
+                    filename = None
+            else:
+                filename = self.state.get("sessionFile")
+                if filename and not Path(filename).is_file():
+                    filename = None
             await self.close()
             self.lease, held_lease = held_lease, None
             self.tasks = set()
@@ -702,20 +716,37 @@ class Session:
                 self.trust_project = trust_project
             if agents_enabled is not None:
                 self.agents_enabled = agents_enabled
-            self.save()
+            if not preserve_history:
+                self.save()
             await self.start(filename)
             await self.commands()
+            if preserve_history:
+                await self.update({"sessionUpdate": "current_mode_update",
+                                   "currentModeId": self.controls.permission_mode})
+                await self.update({"sessionUpdate": "config_option_update", "configOptions": self.controls.options()})
             await self.publish_context_usage()
             self.save()
             await self.publish_recovery_warnings()
             self.server.sessions[self.id] = self
         except BaseException:
             if held_lease is not None:
-                self.lease, held_lease = held_lease, None
+                if preserve_history:
+                    held_lease.close()
+                else:
+                    self.lease = held_lease
             await self.close()
             raise
         finally:
             self.server.starting_ids.discard(self.id)
+
+    async def recover_after_compaction(self):
+        if not self.compaction_recovery_needed:
+            return
+        try:
+            await self.restart(preserve_history=True)
+        finally:
+            self.server.sessions[self.id] = self
+        self.compaction_recovery_needed = False
 
     async def prompt(self, blocks, request_key=None):
         key = request_key or uuid.uuid4().hex
@@ -729,12 +760,7 @@ class Session:
         self.dispatched = False
         self.turn_active = True
         try:
-            if self.compaction_recovery_needed:
-                try:
-                    await self.restart(preserve_history=True)
-                finally:
-                    self.server.sessions[self.id] = self
-                self.compaction_recovery_needed = False
+            await self.recover_after_compaction()
             result = await self._prompt(blocks)
             return result
         except Exception as failure:
@@ -800,9 +826,15 @@ class Session:
         if not text.strip() and not images:
             raise ProtocolError("Prompt content is empty")
         text_only = all(block.get("type") == "text" for block in blocks)
-        instructions = compact_instructions(text) if blocks[0]["type"] == "text" else None
-        if instructions is not None and (not text_only or "[[AION_FILES]]" in map(str.strip, instructions.splitlines())):
-            raise ProtocolError("/compact accepts text instructions only")
+        instructions = None
+        if blocks[0]["type"] == "text":
+            instructions = compact_instructions(text)
+            # A pasted rules block and the host's first-message wrapper have
+            # identical wire shapes. Neither can authorize compaction, and an
+            # ambiguous command must never forward attachments to the model.
+            if instructions is not None or has_wrapped_compact(text):
+                if not text_only or "[[AION_FILES]]" in map(str.strip, text.splitlines()):
+                    raise ProtocolError("/compact accepts text instructions only")
         for block in blocks:
             append_event(self.server.db, self.id, {"sessionUpdate": "user_message_chunk", "content": block})
         self.server.db.commit()

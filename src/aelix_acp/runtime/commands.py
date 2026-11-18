@@ -50,15 +50,21 @@ CLIENT_ACTIONS = {"login", "logout", "trust", "agents", "statusline", "hotkeys",
 
 
 def compact_instructions(text: str) -> str | None:
-    """Recognize /compact at the user-input boundary of the pinned Studio host."""
-    if text.startswith("[Assistant Rules]\n"):
-        _prelude, boundary, user_text = text.partition("\n[/Assistant Rules]\n\n")
-        if boundary:
-            text = user_text
-    head, _, arguments = text.partition("/compact")
-    if head or not text.startswith("/compact") or (arguments and not arguments[0].isspace()):
+    """Recognize only an explicit command at the start of the ACP text."""
+    if not text.startswith("/compact"):
+        return None
+    arguments = text[len("/compact"):]
+    if arguments and not arguments[0].isspace():
         return None
     return arguments
+
+
+def has_wrapped_compact(text: str) -> bool:
+    """Identify ambiguous host-shaped text for attachment rejection only."""
+    if not text.startswith("[Assistant Rules]\n"):
+        return False
+    _, boundary, remainder = text.partition("\n[/Assistant Rules]\n\n")
+    return bool(boundary) and compact_instructions(remainder) is not None
 
 
 def split_command(text: str) -> tuple[str, str] | None:

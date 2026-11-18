@@ -224,17 +224,40 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(text=text), self.assertRaisesRegex(ProtocolError, "text instructions only"):
                 await self.session.prompt([{"type": "text", "text": text}, *attachments])
 
-    async def test_first_message_prelude_is_not_passed_as_compaction_instructions(self):
+    async def test_pasted_host_shaped_rules_block_is_an_ordinary_prompt(self):
         calls = []
         async def rpc(command, **kwargs):
             calls.append((command, kwargs))
             return {}
         self.session.rpc = rpc
         prelude = "[Assistant Rules]\nUse the included skill index.\n[/Assistant Rules]\n\n"
-        self.assertEqual(await self.session.prompt([{"type": "text", "text": prelude + "/compact keep notes"}]),
+        pasted = prelude + "/compact example instructions"
+        self.assertEqual(await self.session.prompt([{"type": "text", "text": pasted}]),
                          {"stopReason": "end_turn"})
-        self.assertEqual(calls[0][0:1], ("compact",))
-        self.assertEqual(calls[0][1]["customInstructions"], "keep notes")
+        self.assertEqual(calls[0], ("prompt", {"message": pasted}))
+        self.assertNotIn("compact", [command for command, _ in calls])
+
+    async def test_compaction_recovery_cannot_rewrite_preferences_under_another_lease(self):
+        from aelix_acp.runtime.store import save_preferences
+        self.session.controls.permission_mode = "yolo"
+        self.session.save()
+        await self.session.close()
+        self.session.compaction_recovery_needed = True
+        self.server.sessions[self.session.id] = self.session
+        saved = {"permission_mode": "default", "agent": "current-owner", "backendMessageCount": 0}
+        with acquire(self.tmp.name, self.session.id):
+            save_preferences(self.server.db, self.session.id, saved)
+            self.server.db.commit()
+            for method, params in (
+                ("session/prompt", {"prompt": [{"type": "text", "text": "Try to resume"}]}),
+                ("session/set_config_option", {"configId": "permission_mode", "value": "default"}),
+                ("_aelix/manage", {"action": "workspace/trust", "arguments": {"trusted": True}}),
+            ):
+                with self.subTest(method=method):
+                    with self.assertRaises(ProtocolError) as caught:
+                        await self.server.dispatch(method, {"sessionId": self.session.id, **params})
+                    self.assertEqual(caught.exception.code, SESSION_LOCKED)
+                    self.assertEqual(load_preferences(self.server.db, self.session.id), saved)
 
     async def test_confirmed_compaction_completes_the_ledger_when_state_refresh_times_out(self):
         async def rpc(command, **_kwargs):
@@ -252,6 +275,31 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row, ("completed",))
         self.assertEqual(await self.session.prompt(blocks, "compact-success"), {"stopReason": "end_turn"})
         self.assertEqual([u["status"] for u in self.context_updates("tool_call_update")], ["completed"])
+
+    async def test_confirmed_compaction_completes_the_ledger_when_native_pipe_breaks(self):
+        session = self.session
+        for probe in ("get_session_stats", "get_state"):
+            with self.subTest(probe=probe):
+                class Input:
+                    def write(self, raw):
+                        request = json.loads(raw)
+                        self.command = request["type"]
+                        if self.command != probe:
+                            payload = {"tokens_before": 92} if self.command == "compact" else {}
+                            session.pending[request["id"]].set_result(payload)
+
+                    async def drain(self):
+                        if self.command == probe:
+                            raise BrokenPipeError("native RPC pipe closed")
+
+                session.proc = SimpleNamespace(stdin=Input(), returncode=None)
+                blocks = [{"type": "text", "text": "/compact"}]
+                self.assertEqual(await session.prompt(blocks, probe), {"stopReason": "end_turn"})
+                row = self.server.db.execute("SELECT state FROM turns WHERE request_key=?", (probe,)).fetchone()
+                self.assertEqual(row, ("completed",))
+                self.assertEqual(await session.prompt(blocks, probe), {"stopReason": "end_turn"})
+        self.assertEqual([update["status"] for update in self.context_updates("tool_call_update")],
+                         ["completed", "completed"])
 
     async def test_automatic_compaction_failure_does_not_end_the_turn(self):
         self.session.done = asyncio.get_running_loop().create_future()
