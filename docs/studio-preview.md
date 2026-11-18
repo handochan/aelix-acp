@@ -27,7 +27,8 @@
 
 제품 작업 착수 때 Issue별 새 branch/worktree·현재 main SHA·기존 PR/claim·검증 계획을 기록한다.
 준비용 worktree를 제품 구현 Issue의 작업 공간으로 재사용하지 않는다. 공유 manifest/wire/lock은
-한 명이 직렬로 변경하고 독립 구현은 최대 두 개다. CLAUDE는 root `@AGENTS.md`를 통해 같은 기준을 읽는다.
+한 명이 직렬로 변경한다. 독립 구현의 동시 진행 수에는 제한이 없고(2026-11-18 사용자 결정), 착수 전에 다른 세션이
+진행 중인 작업과 겹치지 않는지 확인한다. CLAUDE는 root `@AGENTS.md`를 통해 같은 기준을 읽는다.
 
 ## 변경 경계
 
