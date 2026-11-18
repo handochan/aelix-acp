@@ -212,9 +212,46 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_compact_with_attachment_does_not_become_a_model_prompt(self):
         self.session.rpc = self.fail
-        with self.assertRaisesRegex(ProtocolError, "text instructions only"):
-            await self.session.prompt([{"type": "text", "text": "/compact keep notes"},
-                                       {"type": "resource_link", "uri": "file:///notes.txt"}])
+        prelude = "[Assistant Rules]\nUse the included skill index.\n[/Assistant Rules]\n\n"
+        image = {"type": "image", "mimeType": "image/png", "data": "AAAA", "uri": "file:///sample.png"}
+        for text, attachments in (
+            ("/compact", [{"type": "resource_link", "uri": "file:///notes.txt"}]),
+            ("/compact\n\n[[AION_FILES]]\n/sample.png", [image]),
+            ("/compact keep notes\n\n[[AION_FILES]]\n/notes.txt", []),
+            (prelude + "/compact\n\n[[AION_FILES]]\n/sample.png", [image]),
+            (prelude + "/compact keep notes\n\n[[AION_FILES]]\n/notes.txt", []),
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(ProtocolError, "text instructions only"):
+                await self.session.prompt([{"type": "text", "text": text}, *attachments])
+
+    async def test_first_message_prelude_is_not_passed_as_compaction_instructions(self):
+        calls = []
+        async def rpc(command, **kwargs):
+            calls.append((command, kwargs))
+            return {}
+        self.session.rpc = rpc
+        prelude = "[Assistant Rules]\nUse the included skill index.\n[/Assistant Rules]\n\n"
+        self.assertEqual(await self.session.prompt([{"type": "text", "text": prelude + "/compact keep notes"}]),
+                         {"stopReason": "end_turn"})
+        self.assertEqual(calls[0][0:1], ("compact",))
+        self.assertEqual(calls[0][1]["customInstructions"], "keep notes")
+
+    async def test_confirmed_compaction_completes_the_ledger_when_state_refresh_times_out(self):
+        async def rpc(command, **_kwargs):
+            if command == "compact":
+                self.session.dispatched = True
+                return {"tokens_before": 92}
+            if command == "get_state":
+                raise ProtocolError("state probe timed out", -32007)
+            return {}
+        self.session.proc = SimpleNamespace(returncode=None)
+        self.session.rpc = rpc
+        blocks = [{"type": "text", "text": "/compact"}]
+        self.assertEqual(await self.session.prompt(blocks, "compact-success"), {"stopReason": "end_turn"})
+        row = self.server.db.execute("SELECT state FROM turns WHERE request_key='compact-success'").fetchone()
+        self.assertEqual(row, ("completed",))
+        self.assertEqual(await self.session.prompt(blocks, "compact-success"), {"stopReason": "end_turn"})
+        self.assertEqual([u["status"] for u in self.context_updates("tool_call_update")], ["completed"])
 
     async def test_automatic_compaction_failure_does_not_end_the_turn(self):
         self.session.done = asyncio.get_running_loop().create_future()

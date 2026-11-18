@@ -295,6 +295,34 @@ def setup(api):
         progress = self.context_updates("tool_call_update")[-1]
         self.assertEqual(progress["_meta"]["aelix/compaction"], {"reason": "manual", "state": "failed"})
 
+    async def test_compaction_deadline_reports_unknown_and_reopens_the_same_session_without_replay(self):
+        import sqlite3
+        await self.prompt("Prior context must remain")
+        await self.prompt("More prior context")
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=["--command-timeout", "1"])
+        await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+        def session_file():
+            with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+                return db.execute("SELECT file FROM sessions WHERE id=?", (self.session,)).fetchone()[0]
+        saved_file = session_file()
+        self.assertTrue(Path(saved_file).is_file())
+        self.model_gate = asyncio.Event()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "compaction outcome is unknown") as caught:
+                await self.prompt("/compact", "deadline-compact")
+        finally:
+            self.model_gate.set()
+        self.assertEqual(json.loads(str(caught.exception))["code"], TURN_FAILED_AFTER_DISPATCH)
+        self.assertEqual(self.context_updates("tool_call_update")[-1]["_meta"]["aelix/compaction"]["state"], "unknown")
+        count = len(self.model_requests)
+        with self.assertRaisesRegex(RuntimeError, "unresolved outcome"):
+            await self.prompt("/compact", "deadline-compact")
+        self.assertEqual(await self.prompt("Continue this same session"), {"stopReason": "end_turn"})
+        self.assertEqual(session_file(), saved_file)
+        self.assertEqual(len(self.model_requests), count + 1)
+        self.assertIn("Prior context must remain", json.dumps(self.model_requests[-1]))
+
     async def test_threshold_compaction_finishes_before_the_deduplicated_turn_returns(self):
         await self.prompt("Earlier context")
         await self.prompt("Recent context")

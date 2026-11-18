@@ -26,7 +26,7 @@ from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
 from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event,
                             begin_turn, finish_turn)
-from .runtime.commands import BUILTINS, execute as execute_slash
+from .runtime.commands import BUILTINS, compact_instructions, execute as execute_slash
 from .runtime.extensions import extension_reference
 from .runtime.leases import acquire as acquire_lease
 from .runtime.subagents import SubagentTracker
@@ -121,6 +121,7 @@ class Session:
         self.stderr_tail = bytearray()
         self.controls = SessionControls(self)
         self.context = SessionContext(self)
+        self.compaction_recovery_needed = False
         self.mutation_lock = asyncio.Lock()
         self.restore_launch_preferences()
         self.analytics_project = Path(cwd) if (Path(cwd) / "analytics.json").is_file() else None
@@ -401,19 +402,25 @@ class Session:
             result = await self.rpc("compact", _timeout=getattr(self.server.args, "command_timeout", 600) or None,
                                     **({"customInstructions": instructions} if instructions.strip() else {}))
         except ProtocolError as error:
-            await self.context.finish_compaction("failed")
             if error.code == -32007:
-                # A timed-out compact can still own the native worker. Retire
-                # it before accepting another operation on this ACP session.
-                await self.context.invalidate_usage()
                 await self.close()
+                # Keep the accepted ACP id and mutation lock. The next distinct
+                # prompt reopens the saved native file without replaying work.
+                self.compaction_recovery_needed = True
+                self.server.sessions[self.id] = self
+                await self.context.invalidate_usage()
+                await self.context.finish_compaction("unknown")
                 raise after_dispatch(ProtocolError("Aelix compaction outcome is unknown after the deadline", -32603,
                                                    error.data)) from error
+            await self.context.finish_compaction("failed")
             await self.publish_context_usage()
             raise
         else:
-            await self.publish_context_usage()
             await self.context.finish_compaction("completed", result)
+            await self.publish_context_usage()
+            with contextlib.suppress(ProtocolError):
+                self.state = await self.rpc("get_state", _timeout=5)
+            self.record(self.save)
 
     async def rpc(self, command, *, _timeout=45, **kwargs):
         request_id = uuid.uuid4().hex
@@ -668,7 +675,7 @@ class Session:
             self.proc.stdin.write((json.dumps({"type": "extension_ui_response", "id": event.get("id"), **answer}) + "\n").encode())
             await self.proc.stdin.drain()
 
-    async def restart(self, *, extensions=None, trust_project=None, agents_enabled=None):
+    async def restart(self, *, extensions=None, trust_project=None, agents_enabled=None, preserve_history=False):
         if self.id in self.server.starting_ids:
             raise ProtocolError("Session is already starting", -32000)
         self.server.starting_ids.add(self.id)
@@ -678,7 +685,9 @@ class Session:
         self.lease = None
         try:
             filename = self.state.get("sessionFile")
-            if filename and not Path(filename).is_file():
+            if not filename or not Path(filename).is_file():
+                if preserve_history and self.state.get("messageCount", self.state.get("message_count")) != 0:
+                    raise ProtocolError("No persisted Aelix session file is available", -32004)
                 filename = None
             await self.close()
             self.lease, held_lease = held_lease, None
@@ -720,6 +729,12 @@ class Session:
         self.dispatched = False
         self.turn_active = True
         try:
+            if self.compaction_recovery_needed:
+                try:
+                    await self.restart(preserve_history=True)
+                finally:
+                    self.server.sessions[self.id] = self
+                self.compaction_recovery_needed = False
             result = await self._prompt(blocks)
             return result
         except Exception as failure:
@@ -785,12 +800,15 @@ class Session:
         if not text.strip() and not images:
             raise ProtocolError("Prompt content is empty")
         text_only = all(block.get("type") == "text" for block in blocks)
-        first = blocks[0]
-        if not text_only and first["type"] == "text" and first["text"].partition(" ")[0] == "/compact":
+        instructions = compact_instructions(text) if blocks[0]["type"] == "text" else None
+        if instructions is not None and (not text_only or "[[AION_FILES]]" in map(str.strip, instructions.splitlines())):
             raise ProtocolError("/compact accepts text instructions only")
         for block in blocks:
             append_event(self.server.db, self.id, {"sessionUpdate": "user_message_chunk", "content": block})
         self.server.db.commit()
+        if instructions is not None:
+            await self.compact(instructions.removeprefix(" "))
+            return {"stopReason": "end_turn"}
         if text.startswith("/") and text_only:
             try:
                 handled, prepared = await execute_slash(self, text)

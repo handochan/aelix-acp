@@ -10,7 +10,6 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import Server, Session, ProtocolError
 from aelix_acp.runtime.commands import split_command
-from aelix_acp.runtime.commands import execute
 from aelix_acp.runtime.extensions import extension_reference, run_extension_action, same_extension
 from support import process_alive
 
@@ -120,7 +119,7 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         self.session.rpc = rpc
         for timeout in (147, 0):
             self.server.args.command_timeout = timeout
-            await execute(self.session, "/compact")
+            await self.session.prompt([{"type": "text", "text": "/compact"}])
             await run_extension_action(self.server, self.session, "reload")
             compact = next(arguments for command, arguments in reversed(calls) if command == "compact")
             reload = next(arguments for command, arguments in reversed(calls) if command == "aelix_control" and arguments.get("method") == "resources/reload")

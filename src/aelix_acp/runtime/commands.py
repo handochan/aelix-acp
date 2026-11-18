@@ -49,6 +49,18 @@ ALIASES = {"rename": "name", "exit": "quit"}
 CLIENT_ACTIONS = {"login", "logout", "trust", "agents", "statusline", "hotkeys", "expand", "import"}
 
 
+def compact_instructions(text: str) -> str | None:
+    """Recognize /compact at the user-input boundary of the pinned Studio host."""
+    if text.startswith("[Assistant Rules]\n"):
+        _prelude, boundary, user_text = text.partition("\n[/Assistant Rules]\n\n")
+        if boundary:
+            text = user_text
+    head, _, arguments = text.partition("/compact")
+    if head or not text.startswith("/compact") or (arguments and not arguments[0].isspace()):
+        return None
+    return arguments
+
+
 def split_command(text: str) -> tuple[str, str] | None:
     # Leading whitespace and ordinary prose do not turn into control messages.
     if not text.startswith("/") or text.startswith("//"):
@@ -105,12 +117,6 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         session.state = await session.rpc("get_state")
         session.save()
         await output(session.state.get("sessionName") or "Unnamed session")
-    elif name == "compact":
-        await session.compact(raw)
-        if session.proc and session.proc.returncode is None and not session.rpc_closed:
-            session.state = await session.rpc("get_state")
-            session.save()
-        return True, None
     elif name == "export":
         await output(await session.rpc("export_html", **({"outputPath": args} if args else {})))
     elif name == "copy":
