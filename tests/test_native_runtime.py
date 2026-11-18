@@ -100,9 +100,18 @@ def setup(api):
             with contextlib.suppress(ConnectionError):
                 await writer.wait_closed()
 
-    async def prompt(self, text, key=None):
+    async def prompt(self, text, key=None, fork_head=None):
+        metadata = {}
+        if key:
+            metadata["aelix/requestId"] = key
+        if fork_head:
+            metadata["aelix/forkHead"] = fork_head
         return await self.client.request("session/prompt", {"sessionId": self.session,
-            "prompt": [{"type": "text", "text": text}], **({"_meta": {"aelix/requestId": key}} if key else {})})
+            "prompt": [{"type": "text", "text": text}], "_meta": metadata})
+
+    def fork_params(self, anchor, mcp_servers=()):
+        return {"cwd": str(self.root), "sessionId": self.session, "mcpServers": list(mcp_servers),
+                "_meta": {"aelix/expectedHead": anchor}}
 
     async def config(self, key, value):
         return await self.client.request("session/set_config_option", {"sessionId": self.session, "configId": key, "value": value})
@@ -497,6 +506,178 @@ def setup(api):
             holder.wait(10)
         result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}, timeout=60)
         self.assertIn("configOptions", result)
+
+    async def test_standard_head_fork_opens_child_in_a_second_adapter(self):
+        import sqlite3
+
+        def session_file(identifier):
+            with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+                filename = db.execute("SELECT file FROM sessions WHERE id=?", (identifier,)).fetchone()[0]
+            return Path(filename)
+
+        await self.prompt("FIRST_PARENT_TURN", fork_head="first")
+        self.model_gate = asyncio.Event()
+        second = asyncio.create_task(self.prompt("SECOND_PARENT_TURN", fork_head="second"))
+        fork_client = await AcpClient.start(self.root, EXECUTABLE)
+        self.addAsyncCleanup(fork_client.close)
+        params = self.fork_params("second")
+        try:
+            async with asyncio.timeout(30):
+                while len(self.model_requests) < 2:
+                    await asyncio.sleep(0.01)
+            with self.assertRaisesRegex(RuntimeError, "-32000"):
+                await fork_client.request("session/fork", params)
+        finally:
+            self.model_gate.set()
+            await second
+
+        try:
+            parent = session_file(self.session)
+            parent_bytes = parent.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "fork_head_changed"):
+                await fork_client.request("session/fork", self.fork_params("first"))
+            self.assertEqual(set(parent.parent.glob("*.jsonl")), {parent})
+            result = await fork_client.request("session/fork", params)
+            fork_id = result["sessionId"]
+            child = session_file(fork_id)
+            parent_header = json.loads(parent_bytes.splitlines()[0])
+            child_header = json.loads(child.read_text(encoding="utf-8").splitlines()[0])
+            self.assertNotEqual(fork_id, self.session)
+            self.assertNotEqual(child_header["id"], parent_header["id"])
+            self.assertEqual(Path(child_header["parentSession"]), parent)
+            self.assertEqual(parent.read_bytes(), parent_bytes)
+            self.assertEqual(fork_client.text(), "")
+            prompt = {"sessionId": fork_id, "prompt": [{"type": "text", "text": "CHILD_NEXT"}]}
+            await fork_client.request("session/prompt", prompt)
+            self.assertIn("SECOND_PARENT_TURN", json.dumps(self.model_requests[-1]["messages"]))
+        finally:
+            await fork_client.close()
+        reopened = await AcpClient.start(self.root, EXECUTABLE)
+        try:
+            await reopened.request("session/load", {**params, "sessionId": fork_id})
+            self.assertIn("SECOND_PARENT_TURN", reopened.text())
+            self.assertIn("CHILD_NEXT", reopened.text())
+            await reopened.request("session/prompt", {**prompt, "prompt": [{"type": "text", "text": "AFTER_RESTART"}]})
+            self.assertIn("SECOND_PARENT_TURN", json.dumps(self.model_requests[-1]["messages"]))
+            self.assertEqual(parent.read_bytes(), parent_bytes)
+        finally:
+            await reopened.close()
+
+    async def test_standard_head_fork_refuses_an_older_live_adapter_lease(self):
+        from aelix_acp.runtime.leases import acquire
+
+        await self.prompt("PARENT_TURN", fork_head="parent")
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        params = self.fork_params("parent")
+        with acquire(self.root / "state", self.session):
+            with self.assertRaisesRegex(RuntimeError, "-33001"):
+                await self.client.request("session/fork", params)
+        result = await self.client.request("session/fork", params)
+        self.assertNotEqual(result["sessionId"], self.session)
+
+    def native_session_file(self, session_id):
+        import sqlite3
+
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            return Path(db.execute("SELECT file FROM sessions WHERE id=?", (session_id,)).fetchone()[0])
+
+    async def test_standard_head_fork_replays_text_from_two_large_images_after_restart(self):
+        import base64
+        import sqlite3
+        import struct
+        import zlib
+
+        def chunk(kind, payload):
+            return (struct.pack(">I", len(payload)) + kind + payload +
+                    struct.pack(">I", zlib.crc32(kind + payload)))
+
+        width, height = 1536, 1472
+        png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+               chunk(b"IDAT", zlib.compress(bytes((1 + width * 3) * height), level=0)) + chunk(b"IEND", b""))
+        image = base64.b64encode(png).decode()
+        self.assertLess(len(png), 8 * 1024 * 1024)
+        self.assertGreater(len(image) * 2, 16 * 1024 * 1024)
+        await self.config("autoCompactionEnabled", "false")
+        for label in ("IMAGE_ONE", "IMAGE_TWO"):
+            await self.client.request("session/prompt", {"sessionId": self.session, "prompt": [
+                {"type": "text", "text": label}, {"type": "image", "mimeType": "image/png", "data": image},
+            ], "_meta": {"aelix/forkHead": label}}, timeout=90)
+
+        parent = self.native_session_file(self.session)
+        parent_bytes = parent.read_bytes()
+        params = self.fork_params("IMAGE_TWO")
+        fork = await self.client.request("session/fork", params, timeout=90)
+        child = self.native_session_file(fork["sessionId"])
+        self.assertNotEqual(child, parent)
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        await self.client.request("session/load", {**params, "sessionId": fork["sessionId"]}, timeout=90)
+        self.assertIn("IMAGE_ONE", self.client.text())
+        self.assertIn("IMAGE_TWO", self.client.text())
+        await self.client.request("session/prompt", {"sessionId": fork["sessionId"], "prompt": [
+            {"type": "text", "text": "CHILD_AFTER_IMAGES"},
+        ]}, timeout=90)
+        content_blocks = (block for message in self.model_requests[-1]["messages"]
+                          if isinstance(message.get("content"), list) for block in message["content"])
+        self.assertEqual(sum(block.get("type") == "image_url" for block in content_blocks), 2)
+        self.assertEqual(parent.read_bytes(), parent_bytes)
+        await self.client.close()
+        # Exercise a completed projection with zero text rows. It must not
+        # fall back to the oversized aggregate native messages response.
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db, db:
+            db.execute("DELETE FROM events WHERE session_id=?", (fork["sessionId"],))
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        await self.client.request("session/load", {**params, "sessionId": fork["sessionId"]}, timeout=90)
+        self.assertEqual(self.client.text(), "")
+
+    async def test_standard_head_fork_rejects_missing_profile_on_every_open(self):
+        import sqlite3
+
+        await self.prompt("PARENT_TURN", fork_head="parent")
+        folder = self.native_session_file(self.session).parent
+        originals = set(folder.glob("*.jsonl*")) - set(folder.glob("*.lock"))
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db, db:
+            saved = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()[0])
+            saved["agent"] = "unavailable-fork-profile"
+            db.execute("UPDATE preferences SET value=? WHERE session_id=?", (json.dumps(saved), self.session))
+        params = self.fork_params("parent")
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "profile_unavailable"):
+                await self.client.request("session/fork", params)
+            self.assertEqual(set(folder.glob("*.jsonl*")) - set(folder.glob("*.lock")), originals)
+        result = await self.client.request("session/list", {"cwd": str(self.root)})
+        self.assertEqual([row["sessionId"] for row in result["sessions"]], [self.session])
+
+    async def test_standard_head_fork_removes_a_draft_after_worker_startup_fails(self):
+        await self.prompt("PARENT_TURN", fork_head="parent")
+        parent = self.native_session_file(self.session)
+        original = parent.read_bytes()
+        params = self.fork_params("parent", [
+            {"name": "missing", "command": str(self.root / "missing-mcp-command"), "args": [], "env": []},
+        ])
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "MCP"):
+                await self.client.request("session/fork", params, timeout=90)
+            self.assertEqual(set(parent.parent.glob("*.jsonl")), {parent})
+            self.assertEqual(list(parent.parent.glob("*.jsonl.tmp")), [])
+        self.assertEqual(parent.read_bytes(), original)
+        fork = await self.client.request("session/fork", {**params, "mcpServers": []})
+        self.assertTrue(self.native_session_file(fork["sessionId"]).is_file())
+
+    async def test_standard_head_fork_rejects_missing_reference_and_changed_native_snapshot(self):
+        await self.prompt("PARENT_TURN", fork_head="parent")
+        parent = self.native_session_file(self.session)
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        params = self.fork_params("parent")
+        with self.assertRaisesRegex(RuntimeError, "fork_head_changed"):
+            await self.client.request("session/fork", {**params, "_meta": {}})
+        with parent.open("ab") as stream:
+            stream.write(b'\n')
+        with self.assertRaisesRegex(RuntimeError, "fork_head_changed"):
+            await self.client.request("session/fork", params)
+        self.assertEqual(set(parent.parent.glob("*.jsonl")), {parent})
 
     async def test_failure_after_native_dispatch_is_not_retryable(self):
         await self.config("autoRetryEnabled", "false")

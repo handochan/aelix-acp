@@ -64,6 +64,39 @@ lands. The native lock is
 recognized from native's own refusal text until R7 provides a structured
 signal; the native transcript path is never copied into the error.
 
+## HEAD fork
+
+The ACP `session/fork` capability takes the registered parent ID, the same
+workspace, the client's MCP servers and `_meta["aelix/expectedHead"]`. The host
+sends a turn reference in `session/prompt` as `_meta["aelix/forkHead"]`. ACP
+binds it to the saved native snapshot when the turn settles. The fork compares
+the expected reference and the captured snapshot before writing a child. A
+missing or stale reference returns `-33003` with `kind: "fork_head_changed"`.
+See the [Host #43 wire examples](https://github.com/handochan/aelix-studio-host/issues/43).
+
+A matching request opens a child with a new ACP ID and
+returns its selectors. The native repository copies the active path through the
+current leaf and records the parent. The parent can stay open in a compatible
+ACP worker while idle. An active parent returns `-32000`. A writer running an
+older adapter or an independently owned native session returns `-33001`.
+
+The fork response omits historical replay. The host copies its message
+projection first and uses the same reference on child startup. Later `session/load`
+replays the inherited native text followed by the child's own ACP events. The
+native worker projects text from the captured cut before publication. Image
+payloads stay in the native transcript and remain available to the model.
+
+The adapter reserves one native destination before calling the worker and
+clears the reservation in the SQLite transaction that binds the child. A
+failed open closes the worker and removes its reserved transcript and staging
+file. Cleanup verifies the generated transcript's digest before deleting it,
+so a draft changed by a writer is preserved. An interrupted adapter leaves a
+reservation for recovery on the next initialize or fork. If cleanup cannot
+finish, another fork of that parent returns `-32006` with `kind:
+"fork_cleanup_pending"`. The reservation covers ACP binding. The fixed host
+does not send an operation ID to recover an already successful ACP fork whose
+response the host lost before recording the new child ID.
+
 ## Management
 
 `_aelix/capabilities` takes `{sessionId}` and returns `version:1`, native

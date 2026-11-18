@@ -6,6 +6,7 @@ from __future__ import annotations
 # as generic failures; AionCore maps them to a non-retryable protocol error.
 SESSION_LOCKED = -33001
 TURN_FAILED_AFTER_DISPATCH = -33002
+FORK_HEAD_CHANGED = -33003
 
 # Native's own refusal when another process holds the session's writer lock
 # (aelix-ai cli/entry.py `_session_owned_message` and the runtime's swap path).
@@ -50,6 +51,11 @@ def session_locked(session_id: str, locked_by: str) -> ProtocolError:
     return ProtocolError(f"This session is open in {where}. Close it there, then open it again.",
                          SESSION_LOCKED, {"kind": "session_locked", "sessionId": session_id,
                                           "lockedBy": locked_by, "holder": None, "retryable": False})
+
+
+def fork_head_changed() -> ProtocolError:
+    return ProtocolError("The native fork point changed", FORK_HEAD_CHANGED,
+                         {"kind": "fork_head_changed", "retryable": False})
 
 
 def after_dispatch(error: BaseException) -> ProtocolError:
