@@ -45,7 +45,7 @@ def discard(db, state_dir, session_id):
                     header = json.loads(stream.readline(65536))
                     stream.seek(0)
                     digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                if (header.get("type") != "session" or header.get("id") != native_id
+                if (not isinstance(header, dict) or header.get("type") != "session" or header.get("id") != native_id
                         or not receipt.is_file() or receipt.is_symlink()
                         or receipt.read_text(encoding="ascii") != digest):
                     raise ValueError("Pending fork changed after publication")

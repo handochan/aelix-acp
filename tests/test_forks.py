@@ -35,7 +35,7 @@ class PendingForkTests(unittest.TestCase):
             self.assertFalse(staged.exists())
             self.assertIsNone(db.execute("SELECT 1 FROM pending_forks").fetchone())
 
-    def test_recovery_keeps_a_published_fork_that_another_writer_changed(self):
+    def test_recovery_keeps_a_published_fork_with_changed_or_damaged_contents(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.closing(open_store(directory)) as db:
             parent = Path(directory) / "parent.jsonl"
             parent.touch()
@@ -45,7 +45,10 @@ class PendingForkTests(unittest.TestCase):
                 header = json.dumps({"type": "session", "id": draft["nativeId"]}).encode() + b"\n"
                 Path(draft["receipt"]).write_text(hashlib.sha256(header).hexdigest(), encoding="ascii")
                 updated = header + b'{"type":"message","message":"new turn"}\n'
-                target.write_bytes(updated)
-            with self.assertRaisesRegex(ProtocolError, "needs cleanup"):
-                forks.recover(db, directory, "parent")
-            self.assertEqual(target.read_bytes(), updated)
+            for contents in (updated, b"[]\n"):
+                with self.subTest(contents=contents):
+                    target.write_bytes(contents)
+                    forks.recover(db, directory)
+                    with self.assertRaisesRegex(ProtocolError, "needs cleanup"):
+                        forks.recover(db, directory, "parent")
+                    self.assertEqual(target.read_bytes(), contents)
