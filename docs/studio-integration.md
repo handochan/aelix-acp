@@ -77,13 +77,20 @@ The fork response does not replay the inherited transcript. Studio's current
 host copies its message projection first, then starts the child in a separate
 request. This flow requires the parent HEAD to remain unchanged between those
 requests because the host sends only the parent ACP ID. Later `session/load`
-replays the inherited native text followed by the child's own ACP events.
+replays the inherited native text followed by the child's own ACP events. The
+native worker projects text from the captured cut before publication. Image
+payloads stay in the native transcript and remain available to the model.
 
-If the adapter confirms native publication and cannot finish binding the child,
-it returns `-32006` with `kind: "fork_unbound"`. The native child file is
-retained for recovery and the adapter does not register a child session. The
-caller must check the outcome before attempting a new fork. Loss of the native
-reply during publication leaves the outcome unknown.
+The adapter reserves one native destination before calling the worker and
+clears the reservation in the SQLite transaction that binds the child. A
+failed open closes the worker and removes its reserved transcript and staging
+file. Cleanup verifies the generated transcript's digest before deleting it,
+so a draft changed by a writer is preserved. An interrupted adapter leaves a
+reservation for recovery on the next initialize or fork. If cleanup cannot
+finish, another fork of that parent returns `-32006` with `kind:
+"fork_cleanup_pending"`. The reservation covers ACP binding. The fixed host
+does not send an operation ID to recover an already successful ACP fork whose
+response the host lost before recording the new child ID.
 
 ## Management
 

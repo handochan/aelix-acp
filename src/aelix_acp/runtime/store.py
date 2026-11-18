@@ -18,6 +18,7 @@ def open_store(directory: str) -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=FULL")
     db.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, cwd TEXT, profile TEXT, file TEXT, title TEXT, updated INTEGER)")
+    db.execute("CREATE TABLE IF NOT EXISTS pending_forks (session_id TEXT PRIMARY KEY, parent_id TEXT NOT NULL, native_id TEXT NOT NULL, file TEXT NOT NULL)")
     db.execute("CREATE TABLE IF NOT EXISTS preferences (session_id TEXT PRIMARY KEY, value TEXT NOT NULL)")
     db.execute("CREATE TABLE IF NOT EXISTS turns (session_id TEXT NOT NULL, request_key TEXT NOT NULL, state TEXT NOT NULL, result TEXT, fingerprint TEXT, PRIMARY KEY(session_id,request_key))")
     if "fingerprint" not in {row[1] for row in db.execute("PRAGMA table_info(turns)")}:

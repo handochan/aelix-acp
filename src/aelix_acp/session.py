@@ -27,7 +27,7 @@ from .runtime.store import (save_preferences, load_preferences, legacy_permissio
                             insert_history, begin_turn, finish_turn)
 from .runtime.commands import BUILTINS, execute as execute_slash
 from .runtime.extensions import extension_reference
-from .runtime.leases import acquire as acquire_lease
+from .runtime.leases import acquire as acquire_lease, lease_path
 from .runtime.subagents import SubagentTracker
 
 PACKAGE = Path(__file__).resolve().parent
@@ -85,6 +85,12 @@ def text_content(content):
     return "\n".join(c.get("text", "") for c in content or [] if c.get("type") == "text")
 
 
+def profile_unavailable(name):
+    return ProtocolError(f"This session uses the agent profile '{name}', which could not be loaded. "
+                         "Restore or recreate that profile, then open the session again; or start a new session.",
+                         -32004, {"kind": "profile_unavailable", "profile": name})
+
+
 class Session:
     def __init__(self, server, session_id, cwd, *, initial_mode=None):
         self.server, self.id, self.cwd = server, session_id, cwd
@@ -109,7 +115,6 @@ class Session:
         self._close_task = None
         self.lease = None
         self.fork_peer_lease = None
-        self.fork_published = False
         self.index_snapshot = None
         self.client_mcp = []  # Runtime-only: server URLs, environment and headers may contain credentials.
         self.state = {}
@@ -128,6 +133,7 @@ class Session:
     def restore_launch_preferences(self, preferences=None):
         if preferences is None:
             preferences = load_preferences(self.server.db, self.id)
+        self.fork_projection = preferences.get("forkProjection") is True
         self.active_tools = preferences.get("activeTools")
         if self.active_tools is not None and (not isinstance(self.active_tools, list) or any(not isinstance(name, str) for name in self.active_tools)):
             raise ProtocolError("Invalid saved tool selection")
@@ -204,7 +210,10 @@ class Session:
         for name in ("AELIX_ACP_SOCKET", "AELIX_ACP_ENDPOINT", "AELIX_ACP_PERMISSION_TOKEN", "AELIX_ACP_FORK_SOURCE"):
             env.pop(name, None)
         if fork_source is not None:
-            env["AELIX_ACP_FORK_SOURCE"] = json.dumps({key: fork_source[key] for key in ("file", "peer")})
+            env["AELIX_ACP_FORK_SOURCE"] = json.dumps({
+                **fork_source, "projection": str(Path(self.socket_dir) / "fork-history.jsonl"),
+                "workerLease": str(lease_path(self.server.args.state_dir, self.id, "fork-peer-v1").resolve()),
+            })
         if self.permission_endpoint:
             env.update(AELIX_ACP_ENDPOINT=self.permission_endpoint, AELIX_ACP_PERMISSION_TOKEN=self.permission_token)
         else:
@@ -242,15 +251,20 @@ class Session:
             raise
         if not ready_file.is_file() or ready_file.read_text() != nonce:
             raise ProtocolError("The tool approval bridge did not load; refusing this session", -32603)
+        saved_agent = preferences.get("agent")
         if fork_source is not None:
-            await self.open_fork(nonce, fork_source["sessionId"])
+            if saved_agent:
+                try:
+                    await self.rpc("aelix_control", method="agents/show", params={"name": saved_agent})
+                except BackendError:
+                    raise profile_unavailable(saved_agent) from None
+            await self.open_fork(nonce, fork_source)
         await self.controls.refresh()
         if self.controls.capabilities.get("version") != 1:
             raise ProtocolError("Aelix runtime control v1 is required; update Aelix", -32004,
                                 {"kind": "runtime_control_required", "required": 1})
         methods = self.controls.capabilities.get("methods", [])
         self.recovery_warnings = []
-        saved_agent = preferences.get("agent")
         # A saved profile or tool selection restricts authority. Refuse rather
         # than resume with the runtime's broader defaults; check before client
         # MCP setup, which already needs tools/set_active.
@@ -270,9 +284,7 @@ class Session:
                 # The profile's tool and posture limits cannot be applied, and a
                 # warning during session/load is not shown by AionCore v0.2.2.
                 # Refuse instead of resuming with broader defaults.
-                raise ProtocolError(f"This session uses the agent profile '{saved_agent}', which could not be loaded. "
-                                    "Restore or recreate that profile, then open the session again; or start a new session.",
-                                    -32004, {"kind": "profile_unavailable", "profile": saved_agent}) from None
+                raise profile_unavailable(saved_agent) from None
             await self.controls.refresh()
         config = preferences.get("config", {})
         require_object(config, "saved session config")
@@ -296,7 +308,7 @@ class Session:
         if fork_source is None:
             self.save()
 
-    async def open_fork(self, nonce, parent_id):
+    async def open_fork(self, nonce, source):
         result = await self.rpc("aelix_control", method="commands/run",
                                 params={"text": f"/aelix-acp-fork-head {nonce}"})
         try:
@@ -306,21 +318,27 @@ class Session:
         if not isinstance(reply, dict):
             reply = {}
         if reply.get("error") == "locked":
-            raise session_locked(parent_id, "native")
+            raise session_locked(source["sessionId"], "native")
         if reply.get("error") == "peer_locked":
-            raise session_locked(parent_id, "acp")
+            raise session_locked(source["sessionId"], "acp")
         if reply.get("error") == "changed":
             raise ProtocolError("Parent session changed while preparing the fork", -32000)
         filename = reply.get("file")
-        if not isinstance(filename, str) or not filename:
+        if filename != source["target"]:
             raise ProtocolError("Aelix could not create the native fork", -32004)
-        self.fork_published = True
         switched = await self.rpc("switch_session", session_path=filename)
         if switched.get("cancelled"):
             raise ProtocolError("Aelix did not open the native fork", -32004)
         self.state = await self.rpc("get_state")
         if self.state.get("sessionFile") != filename:
             raise ProtocolError("Aelix did not open the native fork", -32004)
+
+    def fork_history(self):
+        path = Path(self.socket_dir) / "fork-history.jsonl"
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                yield json.loads(line)
+        path.unlink()
 
     async def listen(self, socket_path, *, tcp):
         """Open this worker's approval channel."""
@@ -398,7 +416,9 @@ class Session:
         # A profile owns its live filter and must be re-evaluated after edits.
         self.active_tools = None
 
-    def save(self, inherited_history=()):
+    def save(self, inherited_history=None):
+        if inherited_history is not None:
+            self.fork_projection = True
         self.server.db.execute(
             "INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?,?)",
             (self.id, self.cwd, self.server.args.profile, self.state.get("sessionFile"),
@@ -407,10 +427,12 @@ class Session:
             "config": {option["id"]: option["currentValue"] for option in self.controls.options()},
             "agent": self.controls.capabilities.get("activeAgent"),
             "activeTools": self.active_tools,
+            "forkProjection": self.fork_projection,
             "trustProject": self.trust_project, "agentsEnabled": self.agents_enabled,
             "backendMessageCount": self.state.get("messageCount", self.state.get("message_count", 0))})
-        if inherited_history:
+        if inherited_history is not None:
             insert_history(self.server.db, self.id, inherited_history)
+            self.server.db.execute("DELETE FROM pending_forks WHERE session_id=?", (self.id,))
         self.server.db.commit()
 
     def selectors(self):

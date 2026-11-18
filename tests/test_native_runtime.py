@@ -564,20 +564,94 @@ def setup(api):
         result = await self.client.request("session/fork", params)
         self.assertNotEqual(result["sessionId"], self.session)
 
-    async def test_standard_head_fork_reports_published_child_that_could_not_open(self):
+    def native_session_file(self, session_id):
+        import sqlite3
+
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            return Path(db.execute("SELECT file FROM sessions WHERE id=?", (session_id,)).fetchone()[0])
+
+    async def test_standard_head_fork_replays_text_from_two_large_images_after_restart(self):
+        import base64
+        import sqlite3
+        import struct
+        import zlib
+
+        def chunk(kind, payload):
+            return (struct.pack(">I", len(payload)) + kind + payload +
+                    struct.pack(">I", zlib.crc32(kind + payload)))
+
+        width, height = 1536, 1472
+        png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+               chunk(b"IDAT", zlib.compress(bytes((1 + width * 3) * height), level=0)) + chunk(b"IEND", b""))
+        image = base64.b64encode(png).decode()
+        self.assertLess(len(png), 8 * 1024 * 1024)
+        self.assertGreater(len(image) * 2, 16 * 1024 * 1024)
+        await self.config("autoCompactionEnabled", "false")
+        for label in ("IMAGE_ONE", "IMAGE_TWO"):
+            await self.client.request("session/prompt", {"sessionId": self.session, "prompt": [
+                {"type": "text", "text": label}, {"type": "image", "mimeType": "image/png", "data": image},
+            ]}, timeout=90)
+
+        parent = self.native_session_file(self.session)
+        parent_bytes = parent.read_bytes()
+        params = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        fork = await self.client.request("session/fork", params, timeout=90)
+        child = self.native_session_file(fork["sessionId"])
+        self.assertNotEqual(child, parent)
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        await self.client.request("session/load", {**params, "sessionId": fork["sessionId"]}, timeout=90)
+        self.assertIn("IMAGE_ONE", self.client.text())
+        self.assertIn("IMAGE_TWO", self.client.text())
+        await self.client.request("session/prompt", {"sessionId": fork["sessionId"], "prompt": [
+            {"type": "text", "text": "CHILD_AFTER_IMAGES"},
+        ]}, timeout=90)
+        content_blocks = (block for message in self.model_requests[-1]["messages"]
+                          if isinstance(message.get("content"), list) for block in message["content"])
+        self.assertEqual(sum(block.get("type") == "image_url" for block in content_blocks), 2)
+        self.assertEqual(parent.read_bytes(), parent_bytes)
+        await self.client.close()
+        # Exercise a completed projection with zero text rows. It must not
+        # fall back to the oversized aggregate native messages response.
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db, db:
+            db.execute("DELETE FROM events WHERE session_id=?", (fork["sessionId"],))
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        await self.client.request("session/load", {**params, "sessionId": fork["sessionId"]}, timeout=90)
+        self.assertEqual(self.client.text(), "")
+
+    async def test_standard_head_fork_rejects_missing_profile_on_every_open(self):
         import sqlite3
 
         await self.prompt("PARENT_TURN")
+        folder = self.native_session_file(self.session).parent
+        originals = set(folder.glob("*.jsonl*")) - set(folder.glob("*.lock"))
         with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db, db:
             saved = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()[0])
             saved["agent"] = "unavailable-fork-profile"
             db.execute("UPDATE preferences SET value=? WHERE session_id=?", (json.dumps(saved), self.session))
-        with self.assertRaises(RuntimeError) as caught:
-            await self.client.request("session/fork", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
-        error = json.loads(str(caught.exception))
-        self.assertEqual(error["data"], {"kind": "fork_unbound", "retryable": False})
+        params = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "profile_unavailable"):
+                await self.client.request("session/fork", params)
+            self.assertEqual(set(folder.glob("*.jsonl*")) - set(folder.glob("*.lock")), originals)
         result = await self.client.request("session/list", {"cwd": str(self.root)})
         self.assertEqual([row["sessionId"] for row in result["sessions"]], [self.session])
+
+    async def test_standard_head_fork_removes_a_draft_after_worker_startup_fails(self):
+        await self.prompt("PARENT_TURN")
+        parent = self.native_session_file(self.session)
+        original = parent.read_bytes()
+        params = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": [
+            {"name": "missing", "command": str(self.root / "missing-mcp-command"), "args": [], "env": []},
+        ]}
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "MCP"):
+                await self.client.request("session/fork", params, timeout=90)
+            self.assertEqual(set(parent.parent.glob("*.jsonl")), {parent})
+            self.assertEqual(list(parent.parent.glob("*.jsonl.tmp")), [])
+        self.assertEqual(parent.read_bytes(), original)
+        fork = await self.client.request("session/fork", {**params, "mcpServers": []})
+        self.assertTrue(self.native_session_file(fork["sessionId"]).is_file())
 
     async def test_failure_after_native_dispatch_is_not_retryable(self):
         await self.config("autoRetryEnabled", "false")

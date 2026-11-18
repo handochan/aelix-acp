@@ -26,6 +26,7 @@ from .wire.transport import decode_frame, StdoutWriter
 from .runtime.extensions import run_extension_action, require_consent
 from .runtime.leases import acquire as acquire_lease
 from .runtime.leases import lease_path
+from .runtime import forks
 
 from .session import Session, text_content, tool_call
 
@@ -94,6 +95,7 @@ class Server:
         identifier = str(uuid.uuid4())
         preferences = load_preferences(self.db, session.id)
         preferences.pop("config", None)
+        preferences.pop("forkProjection", None)
         preferences["backendMessageCount"] = 1
         with self.db:
             self.db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?)", (identifier, session.cwd, self.args.profile,
@@ -131,6 +133,7 @@ class Server:
             raise ProtocolError("No persisted Aelix session file is available to fork")
         if len(self.sessions) + len(self.starting_ids) >= getattr(self.args, "max_sessions", 16):
             raise ProtocolError("Session limit reached; close a session first", -32000)
+        forks.recover(self.db, self.args.state_dir, parent)
 
         identifier = str(uuid.uuid4())
         session = Session(self, identifier, cwd)
@@ -151,22 +154,35 @@ class Server:
                 peer = str(lease_path(self.args.state_dir, parent, "fork-peer-v1").resolve())
             self.starting_ids.add(identifier)
             try:
-                await session.start(fork_source={"file": filename, "peer": peer, "sessionId": parent},
+                session.lease = acquire_lease(self.args.state_dir, identifier)
+                draft = forks.reserve(self.db, self.args.state_dir, identifier, parent, filename)
+                await session.start(fork_source={**draft, "file": filename, "peer": peer, "sessionId": parent},
                                     fork_preferences=preferences)
-                inherited_history = await self.native_history(session)
                 await session.commands()
+                result = {"sessionId": identifier, **session.selectors()}
                 with self.db:
-                    session.save(inherited_history)
+                    session.save(session.fork_history())
                 self.sessions[identifier] = session
-            except BaseException as error:
-                await session.close()
-                if session.fork_published and isinstance(error, Exception):
-                    raise ProtocolError("The native fork exists but its ACP session could not be opened",
-                                        -32006, {"kind": "fork_unbound", "retryable": False}) from None
+                try:
+                    forks.receipt_path(self.args.state_dir, identifier).unlink(missing_ok=True)
+                except OSError:
+                    print("[aelix-acp] Could not remove committed fork receipt", file=sys.stderr)
+            except BaseException:
+                # Retain the draft's lifetime lease through shutdown and rollback.
+                lease, session.lease = session.lease, None
+                try:
+                    await session.close()
+                    if lease is not None:
+                        forks.discard(self.db, self.args.state_dir, identifier)
+                except (OSError, ValueError, sqlite3.Error, ProtocolError):
+                    raise forks.cleanup_pending() from None
+                finally:
+                    if lease is not None:
+                        lease.close()
                 raise
             finally:
                 self.starting_ids.discard(identifier)
-        return {"sessionId": identifier, **session.selectors()}
+        return result
 
     async def dispatch(self, method, params):
         require_object(params)
@@ -193,6 +209,7 @@ class Server:
             require_object(capabilities, "clientCapabilities")
             if capabilities.get("_meta") is not None:
                 require_object(capabilities["_meta"], "clientCapabilities._meta")
+            forks.recover(self.db, self.args.state_dir)
             self.initialized = True
             self.client_capabilities = capabilities
             return {"protocolVersion": 1,
@@ -252,7 +269,7 @@ class Server:
                     if recorded:
                         for update in recorded:
                             await self.send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
-                    else:
+                    elif not session.fork_projection:
                         for update in await self.native_history(session):
                             await session.update(update)
                 await session.publish_recovery_warnings()

@@ -5,6 +5,7 @@ authenticated Windows loopback channel; absent/broken channels block the tool.
 """
 import asyncio
 import errno
+import hashlib
 import hmac
 import json
 import os
@@ -72,12 +73,12 @@ def compatible_fork_peer(marker):
 
 async def fork_native_head(source, cwd):
     """Freeze a source read and let the pinned native repository publish its HEAD."""
+    from aelix_agent_core.session.context import build_session_context
     from aelix_agent_core.session.fs import LocalFileSystem
     from aelix_agent_core.session.jsonl_repo import JsonlSessionRepo
-    from aelix_agent_core.session.jsonl_storage import load_jsonl_session_metadata
-    from aelix_agent_core.session.repo_utils import ForkOptions, fork_at_leaf
+    from aelix_agent_core.session.jsonl_storage import JsonlSessionStorage, load_jsonl_session_metadata
+    from aelix_agent_core.session.repo_utils import fork_at_leaf, get_entries_to_fork
     from aelix_agent_core.session.session_lock import SessionWriterLock
-    from aelix_coding_agent.cli.config import get_session_dir
 
     path = Path(source["file"]).resolve(strict=True)
     peer = source["peer"]
@@ -116,15 +117,53 @@ async def fork_native_head(source, cwd):
                     return [snapshot.partition("\n")[0]]
                 return await super().read_text_lines(filename, max_lines=max_lines)
 
+            async def rename_file(self, source_file, target_file):
+                if target_file == source["target"]:
+                    with open(source_file, "rb") as stream:
+                        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                    with open(source["receipt"], "x", encoding="ascii") as receipt:
+                        receipt.write(digest)
+                        receipt.flush()
+                        os.fsync(receipt.fileno())
+                await super().rename_file(source_file, target_file)
+
         fs = SnapshotFileSystem()
-        repo = JsonlSessionRepo(fs=fs, sessions_root=get_session_dir())
+        repo = JsonlSessionRepo(fs=fs)
         metadata = await load_jsonl_session_metadata(fs, str(path))
         parent = await repo.open(metadata)
-        branch = await repo.fork(metadata, ForkOptions(
-            cwd=cwd, entry_id=fork_at_leaf(await parent.get_leaf_id()), position="at"))
-        return {"file": branch.session_file}
+        entries = await get_entries_to_fork(parent.get_storage(), fork_at_leaf(await parent.get_leaf_id()), "at")
     finally:
         lock.release()
+
+    # Project the same native cut without sending image bodies through RPC.
+    with open(source["projection"], "x", encoding="utf-8") as projection:
+        for message in build_session_context(entries).messages:
+            if message.role not in ("user", "assistant"):
+                continue
+            content = message.content
+            text = content if isinstance(content, str) else "\n".join(
+                block.text for block in content if block.type == "text")
+            for offset in range(0, len(text), 16384):
+                update = {"sessionUpdate": "user_message_chunk" if message.role == "user" else "agent_message_chunk",
+                          "content": {"type": "text", "text": text[offset:offset + 16384]}}
+                projection.write(json.dumps(update, ensure_ascii=False) + "\n")
+
+    # The adapter knows this path even if the RPC reply never arrives.
+    # Check that the original worker's ACP lease still exists while holding
+    # the target lock used by both native writers and draft recovery.
+    target = Path(source["target"])
+    target_lock = SessionWriterLock(str(target))
+    try:
+        if not target_lock.try_acquire() or not target_lock.held:
+            return {"error": "unavailable"}
+        if not compatible_fork_peer(source["workerLease"]) or target.exists() or target.is_symlink():
+            return {"error": "unavailable"}
+        await JsonlSessionStorage.create(
+            fs, str(target), cwd=cwd, session_id=source["nativeId"],
+            parent_session_path=str(path), entries=entries)
+        return {"file": str(target)}
+    finally:
+        target_lock.release()
 
 
 def setup(aelix):

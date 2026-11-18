@@ -18,6 +18,15 @@ def lease_path(directory: str, session_id: str, purpose: str = "") -> Path:
 def acquire(directory: str, session_id: str, *, purpose: str = ""):
     filename = lease_path(directory, session_id, purpose)
     filename.parent.mkdir(mode=0o700, exist_ok=True)
+    try:
+        return acquire_file(filename)
+    except BlockingIOError:
+        if purpose == "activity":
+            raise ProtocolError("Session is busy", -32000) from None
+        raise session_locked(session_id, "acp") from None
+
+
+def acquire_file(filename: Path):
     if filename.is_symlink():
         raise ProtocolError("Session lease must not be a symbolic link")
     stream = filename.open("a+b")
@@ -40,9 +49,7 @@ def acquire(directory: str, session_id: str, *, purpose: str = ""):
                 contended.update({errno.EACCES, errno.EDEADLK})
             if error.errno not in contended:
                 raise
-            if purpose == "activity":
-                raise ProtocolError("Session is busy", -32000) from None
-            raise session_locked(session_id, "acp") from None
+            raise BlockingIOError(errno.EAGAIN, "Session file is locked") from None
     except BaseException:
         stream.close()
         raise
