@@ -25,7 +25,7 @@ from .wire.transport import StdoutWriter
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
 from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event,
-                            begin_turn, finish_turn)
+                            begin_turn, finish_turn, recorded_turn)
 from .runtime.commands import BUILTINS, compact_instructions, execute as execute_slash, has_wrapped_compact
 from .runtime.extensions import extension_reference
 from .runtime.leases import acquire as acquire_lease
@@ -753,6 +753,14 @@ class Session:
         if not isinstance(key, str) or not key or len(key) > 256:
             raise ProtocolError("Request id must be a non-empty string of at most 256 characters")
         fingerprint = hashlib.sha256(json.dumps(blocks, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+        if self.compaction_recovery_needed:
+            # Check old keys before recovery without claiming a new request.
+            prior = recorded_turn(self.server.db, self.id, key, fingerprint)
+            if prior is not None:
+                return prior
+            # A rejected reopen has not started this turn. Claim the key
+            # only after recovery holds the lease, with a fresh replay check.
+            await self.recover_after_compaction()
         prior = begin_turn(self.server.db, self.id, key, fingerprint)
         if prior is not None:
             return prior
@@ -760,7 +768,6 @@ class Session:
         self.dispatched = False
         self.turn_active = True
         try:
-            await self.recover_after_compaction()
             result = await self._prompt(blocks)
             return result
         except Exception as failure:

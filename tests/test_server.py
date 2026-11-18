@@ -247,9 +247,15 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         saved = {"permission_mode": "default", "agent": "current-owner", "backendMessageCount": 0}
         with acquire(self.tmp.name, self.session.id):
             save_preferences(self.server.db, self.session.id, saved)
+            self.server.db.execute("INSERT INTO events(session_id,value) VALUES(?,?)",
+                                   (self.session.id, '{"sessionUpdate":"agent_message_chunk"}'))
             self.server.db.commit()
+            before_history = self.server.db.execute(
+                "SELECT sequence, value FROM events WHERE session_id=? ORDER BY sequence", (self.session.id,)
+            ).fetchall()
             for method, params in (
-                ("session/prompt", {"prompt": [{"type": "text", "text": "Try to resume"}]}),
+                ("session/prompt", {"prompt": [{"type": "text", "text": "Try to resume"}],
+                                    "_meta": {"aelix/requestId": "contended-resume"}}),
                 ("session/set_config_option", {"configId": "permission_mode", "value": "default"}),
                 ("_aelix/manage", {"action": "workspace/trust", "arguments": {"trusted": True}}),
             ):
@@ -258,6 +264,12 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                         await self.server.dispatch(method, {"sessionId": self.session.id, **params})
                     self.assertEqual(caught.exception.code, SESSION_LOCKED)
                     self.assertEqual(load_preferences(self.server.db, self.session.id), saved)
+            self.assertEqual(self.server.db.execute(
+                "SELECT sequence, value FROM events WHERE session_id=? ORDER BY sequence", (self.session.id,)
+            ).fetchall(), before_history)
+            self.assertIsNone(self.server.db.execute(
+                "SELECT state FROM turns WHERE session_id=? AND request_key='contended-resume'", (self.session.id,)
+            ).fetchone())
 
     async def test_confirmed_compaction_completes_the_ledger_when_state_refresh_times_out(self):
         async def rpc(command, **_kwargs):

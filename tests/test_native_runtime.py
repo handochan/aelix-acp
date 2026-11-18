@@ -326,6 +326,8 @@ def setup(api):
             "---\nname: current-owner\ndescription: Updated by the current owner\ntools: [read]\n---\nKeep the session."
         )
         contender = await AcpClient.start(self.root, EXECUTABLE)
+        resume_prompt = "Continue this same session"
+        resume_key = "retry-after-owner-releases"
         try:
             await contender.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
             await contender.request("_aelix/manage", {"sessionId": self.session, "action": "agents/use",
@@ -333,15 +335,18 @@ def setup(api):
             await contender.request("session/set_config_option", {"sessionId": self.session,
                 "configId": "permission_mode", "value": "default"})
             with self.assertRaises(RuntimeError) as locked:
-                await self.prompt("Try to resume while the session is owned")
+                await self.prompt(resume_prompt, resume_key)
             self.assertEqual(json.loads(str(locked.exception))["code"], SESSION_LOCKED)
+            with self.assertRaisesRegex(RuntimeError, "unresolved outcome"):
+                await self.prompt("/compact", "deadline-compact")
             with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
                 saved = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()[0])
             self.assertEqual((saved["permission_mode"], saved["agent"]), ("default", "current-owner"))
         finally:
             await contender.close()
 
-        self.assertEqual(await self.prompt("Continue this same session"), {"stopReason": "end_turn"})
+        self.assertEqual(await self.prompt(resume_prompt, resume_key), {"stopReason": "end_turn"})
+        self.assertEqual(await self.prompt(resume_prompt, resume_key), {"stopReason": "end_turn"})
         self.assertEqual(session_file(), saved_file)
         self.assertEqual((await self.manage("permissions/get"))["mode"], "default")
         self.assertEqual((await self.manage("resources/list"))["activeTools"], ["read"])

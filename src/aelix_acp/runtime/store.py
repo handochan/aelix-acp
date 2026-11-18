@@ -67,7 +67,8 @@ def history(db: sqlite3.Connection, session_id: str):
         yield json.loads(row[0])
 
 
-def begin_turn(db: sqlite3.Connection, session_id: str, request_key: str, fingerprint: str | None = None) -> dict | None:
+def recorded_turn(db: sqlite3.Connection, session_id: str, request_key: str, fingerprint: str | None = None) -> dict | None:
+    """Read an existing turn's outcome without claiming an unseen request."""
     from ..wire.errors import ProtocolError
     row = db.execute("SELECT state,result,fingerprint FROM turns WHERE session_id=? AND request_key=?", (session_id, request_key)).fetchone()
     if row:
@@ -80,6 +81,13 @@ def begin_turn(db: sqlite3.Connection, session_id: str, request_key: str, finger
             return json.loads(row[1])
         raise ProtocolError("Previous request has an unresolved outcome; it will not be executed again", -32006,
                             {"kind": "unresolved_turn", "requestId": request_key, "state": row[0]})
+    return None
+
+
+def begin_turn(db: sqlite3.Connection, session_id: str, request_key: str, fingerprint: str | None = None) -> dict | None:
+    prior = recorded_turn(db, session_id, request_key, fingerprint)
+    if prior is not None:
+        return prior
     with db:
         db.execute("INSERT INTO turns(session_id,request_key,state,result,fingerprint) VALUES(?,?,?,NULL,?)", (session_id, request_key, "running", fingerprint))
     return None
