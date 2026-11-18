@@ -64,6 +64,27 @@ lands. The native lock is
 recognized from native's own refusal text until R7 provides a structured
 signal; the native transcript path is never copied into the error.
 
+## HEAD fork
+
+The ACP `session/fork` capability takes the registered parent ID, the same
+workspace and the client's MCP servers. It opens a child with a new ACP ID and
+returns its selectors. The native repository copies the active path through the
+current leaf and records the parent. The parent can stay open in a compatible
+ACP worker while idle. An active parent returns `-32000`. A writer running an
+older adapter or an independently owned native session returns `-33001`.
+
+The fork response does not replay the inherited transcript. Studio's current
+host copies its message projection first, then starts the child in a separate
+request. This flow requires the parent HEAD to remain unchanged between those
+requests because the host sends only the parent ACP ID. Later `session/load`
+replays the inherited native text followed by the child's own ACP events.
+
+If the adapter confirms native publication and cannot finish binding the child,
+it returns `-32006` with `kind: "fork_unbound"`. The native child file is
+retained for recovery and the adapter does not register a child session. The
+caller must check the outcome before attempting a new fork. Loss of the native
+reply during publication leaves the outcome unknown.
+
 ## Management
 
 `_aelix/capabilities` takes `{sessionId}` and returns `version:1`, native

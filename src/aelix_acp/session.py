@@ -24,7 +24,7 @@ from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event,
-                            begin_turn, finish_turn)
+                            insert_history, begin_turn, finish_turn)
 from .runtime.commands import BUILTINS, execute as execute_slash
 from .runtime.extensions import extension_reference
 from .runtime.leases import acquire as acquire_lease
@@ -108,6 +108,8 @@ class Session:
         self.management_task = None
         self._close_task = None
         self.lease = None
+        self.fork_peer_lease = None
+        self.fork_published = False
         self.index_snapshot = None
         self.client_mcp = []  # Runtime-only: server URLs, environment and headers may contain credentials.
         self.state = {}
@@ -123,8 +125,9 @@ class Session:
         self.restore_launch_preferences()
         self.analytics_project = Path(cwd) if (Path(cwd) / "analytics.json").is_file() else None
 
-    def restore_launch_preferences(self):
-        preferences = load_preferences(self.server.db, self.id)
+    def restore_launch_preferences(self, preferences=None):
+        if preferences is None:
+            preferences = load_preferences(self.server.db, self.id)
         self.active_tools = preferences.get("activeTools")
         if self.active_tools is not None and (not isinstance(self.active_tools, list) or any(not isinstance(name, str) for name in self.active_tools)):
             raise ProtocolError("Invalid saved tool selection")
@@ -149,18 +152,21 @@ class Session:
                                 {"kind": "unsupported_saved_mode", "mode": str(mode)[:64], "supported": sorted(MODE_IDS)})
         self.launch_mode = mode
 
-    async def start(self, session_file=None):
+    async def start(self, session_file=None, *, fork_source=None, fork_preferences=None):
         for argument in getattr(self.server.args, "aelix_arg", []):
             if argument.split("=", 1)[0] in SESSION_SELECTORS:
                 raise ProtocolError("Adapter launch cannot override native session selection")
         if self.lease is None:
             self.lease = acquire_lease(self.server.args.state_dir, self.id)
+        self.fork_peer_lease = acquire_lease(self.server.args.state_dir, self.id, purpose="fork-peer-v1")
         if self.index_snapshot is not None:
             current = self.server.db.execute("SELECT cwd,profile,file FROM sessions WHERE id=?", (self.id,)).fetchone()
             if current != self.index_snapshot:
                 raise ProtocolError("Saved session changed before it could be opened; load it again", -32000)
             self.index_snapshot = None
-        self.restore_launch_preferences()  # Re-read under the acquired lease, not the constructor's stale snapshot.
+        # Re-read under the acquired lease, not the constructor's stale snapshot.
+        preferences = load_preferences(self.server.db, self.id) if fork_preferences is None else fork_preferences
+        self.restore_launch_preferences(preferences)
         self.stderr_tail = bytearray()  # A refusal from an earlier worker must not label this one.
         self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
         os.chmod(self.socket_dir, 0o700)
@@ -189,12 +195,16 @@ class Session:
             if not Path(session_file).is_file():
                 raise ProtocolError("The Aelix session file no longer exists")
             args += ["--session", session_file]
+        if fork_source is not None:
+            args += ["--no-session"]
         nonce = uuid.uuid4().hex
         ready_file = Path(self.socket_dir) / "ready"
         env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
                    AELIX_ACP_READY_FILE=str(ready_file), AELIX_ACP_NONCE=nonce)
-        for name in ("AELIX_ACP_SOCKET", "AELIX_ACP_ENDPOINT", "AELIX_ACP_PERMISSION_TOKEN"):
+        for name in ("AELIX_ACP_SOCKET", "AELIX_ACP_ENDPOINT", "AELIX_ACP_PERMISSION_TOKEN", "AELIX_ACP_FORK_SOURCE"):
             env.pop(name, None)
+        if fork_source is not None:
+            env["AELIX_ACP_FORK_SOURCE"] = json.dumps({key: fork_source[key] for key in ("file", "peer")})
         if self.permission_endpoint:
             env.update(AELIX_ACP_ENDPOINT=self.permission_endpoint, AELIX_ACP_PERMISSION_TOKEN=self.permission_token)
         else:
@@ -232,13 +242,14 @@ class Session:
             raise
         if not ready_file.is_file() or ready_file.read_text() != nonce:
             raise ProtocolError("The tool approval bridge did not load; refusing this session", -32603)
+        if fork_source is not None:
+            await self.open_fork(nonce, fork_source["sessionId"])
         await self.controls.refresh()
         if self.controls.capabilities.get("version") != 1:
             raise ProtocolError("Aelix runtime control v1 is required; update Aelix", -32004,
                                 {"kind": "runtime_control_required", "required": 1})
         methods = self.controls.capabilities.get("methods", [])
         self.recovery_warnings = []
-        preferences = load_preferences(self.server.db, self.id)
         saved_agent = preferences.get("agent")
         # A saved profile or tool selection restricts authority. Refuse rather
         # than resume with the runtime's broader defaults; check before client
@@ -282,7 +293,34 @@ class Session:
         metadata = getattr(self.server, "client_capabilities", {}).get("_meta", {})
         if metadata.get("aelix/clientActions") is True and "ui/enable" in methods:
             await self.rpc("aelix_control", method="ui/enable", params={"enabled": True})
-        self.save()
+        if fork_source is None:
+            self.save()
+
+    async def open_fork(self, nonce, parent_id):
+        result = await self.rpc("aelix_control", method="commands/run",
+                                params={"text": f"/aelix-acp-fork-head {nonce}"})
+        try:
+            reply = json.loads(result["messages"][0]["text"]) if result["outcome"] == "handled" else {}
+        except (KeyError, IndexError, ValueError, TypeError):
+            reply = {}
+        if not isinstance(reply, dict):
+            reply = {}
+        if reply.get("error") == "locked":
+            raise session_locked(parent_id, "native")
+        if reply.get("error") == "peer_locked":
+            raise session_locked(parent_id, "acp")
+        if reply.get("error") == "changed":
+            raise ProtocolError("Parent session changed while preparing the fork", -32000)
+        filename = reply.get("file")
+        if not isinstance(filename, str) or not filename:
+            raise ProtocolError("Aelix could not create the native fork", -32004)
+        self.fork_published = True
+        switched = await self.rpc("switch_session", session_path=filename)
+        if switched.get("cancelled"):
+            raise ProtocolError("Aelix did not open the native fork", -32004)
+        self.state = await self.rpc("get_state")
+        if self.state.get("sessionFile") != filename:
+            raise ProtocolError("Aelix did not open the native fork", -32004)
 
     async def listen(self, socket_path, *, tcp):
         """Open this worker's approval channel."""
@@ -360,7 +398,7 @@ class Session:
         # A profile owns its live filter and must be re-evaluated after edits.
         self.active_tools = None
 
-    def save(self):
+    def save(self, inherited_history=()):
         self.server.db.execute(
             "INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?,?)",
             (self.id, self.cwd, self.server.args.profile, self.state.get("sessionFile"),
@@ -371,6 +409,8 @@ class Session:
             "activeTools": self.active_tools,
             "trustProject": self.trust_project, "agentsEnabled": self.agents_enabled,
             "backendMessageCount": self.state.get("messageCount", self.state.get("message_count", 0))})
+        if inherited_history:
+            insert_history(self.server.db, self.id, inherited_history)
         self.server.db.commit()
 
     def selectors(self):
@@ -862,6 +902,9 @@ class Session:
             self.socket_server.close()
             await self.socket_server.wait_closed()
             self.socket_server = None
+        if self.fork_peer_lease:
+            self.fork_peer_lease.close()
+            self.fork_peer_lease = None
         if self.lease:
             self.lease.close()
             self.lease = None

@@ -498,6 +498,87 @@ def setup(api):
         result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}, timeout=60)
         self.assertIn("configOptions", result)
 
+    async def test_standard_head_fork_opens_child_in_a_second_adapter(self):
+        import sqlite3
+
+        def session_file(identifier):
+            with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+                filename = db.execute("SELECT file FROM sessions WHERE id=?", (identifier,)).fetchone()[0]
+            return Path(filename)
+
+        await self.prompt("FIRST_PARENT_TURN")
+        self.model_gate = asyncio.Event()
+        second = asyncio.create_task(self.prompt("SECOND_PARENT_TURN"))
+        fork_client = await AcpClient.start(self.root, EXECUTABLE)
+        self.addAsyncCleanup(fork_client.close)
+        params = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        try:
+            async with asyncio.timeout(30):
+                while len(self.model_requests) < 2:
+                    await asyncio.sleep(0.01)
+            with self.assertRaisesRegex(RuntimeError, "-32000"):
+                await fork_client.request("session/fork", params)
+        finally:
+            self.model_gate.set()
+            await second
+
+        try:
+            parent = session_file(self.session)
+            parent_bytes = parent.read_bytes()
+            result = await fork_client.request("session/fork", params)
+            fork_id = result["sessionId"]
+            child = session_file(fork_id)
+            parent_header = json.loads(parent_bytes.splitlines()[0])
+            child_header = json.loads(child.read_text(encoding="utf-8").splitlines()[0])
+            self.assertNotEqual(fork_id, self.session)
+            self.assertNotEqual(child_header["id"], parent_header["id"])
+            self.assertEqual(Path(child_header["parentSession"]), parent)
+            self.assertEqual(parent.read_bytes(), parent_bytes)
+            self.assertEqual(fork_client.text(), "")
+            prompt = {"sessionId": fork_id, "prompt": [{"type": "text", "text": "CHILD_NEXT"}]}
+            await fork_client.request("session/prompt", prompt)
+            self.assertIn("SECOND_PARENT_TURN", json.dumps(self.model_requests[-1]["messages"]))
+        finally:
+            await fork_client.close()
+        reopened = await AcpClient.start(self.root, EXECUTABLE)
+        try:
+            await reopened.request("session/load", {**params, "sessionId": fork_id})
+            self.assertIn("SECOND_PARENT_TURN", reopened.text())
+            self.assertIn("CHILD_NEXT", reopened.text())
+            await reopened.request("session/prompt", {**prompt, "prompt": [{"type": "text", "text": "AFTER_RESTART"}]})
+            self.assertIn("SECOND_PARENT_TURN", json.dumps(self.model_requests[-1]["messages"]))
+            self.assertEqual(parent.read_bytes(), parent_bytes)
+        finally:
+            await reopened.close()
+
+    async def test_standard_head_fork_refuses_an_older_live_adapter_lease(self):
+        from aelix_acp.runtime.leases import acquire
+
+        await self.prompt("PARENT_TURN")
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        params = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        with acquire(self.root / "state", self.session):
+            with self.assertRaisesRegex(RuntimeError, "-33001"):
+                await self.client.request("session/fork", params)
+        result = await self.client.request("session/fork", params)
+        self.assertNotEqual(result["sessionId"], self.session)
+
+    async def test_standard_head_fork_reports_published_child_that_could_not_open(self):
+        import sqlite3
+
+        await self.prompt("PARENT_TURN")
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db, db:
+            saved = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()[0])
+            saved["agent"] = "unavailable-fork-profile"
+            db.execute("UPDATE preferences SET value=? WHERE session_id=?", (json.dumps(saved), self.session))
+        with self.assertRaises(RuntimeError) as caught:
+            await self.client.request("session/fork", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+        error = json.loads(str(caught.exception))
+        self.assertEqual(error["data"], {"kind": "fork_unbound", "retryable": False})
+        result = await self.client.request("session/list", {"cwd": str(self.root)})
+        self.assertEqual([row["sessionId"] for row in result["sessions"]], [self.session])
+
     async def test_failure_after_native_dispatch_is_not_retryable(self):
         await self.config("autoRetryEnabled", "false")
         self.failures = 1

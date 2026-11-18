@@ -18,16 +18,20 @@ import math
 
 from . import __version__
 from .wire.errors import ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH, require_object, require_string
-from .runtime.store import open_store, load_preferences, history
+from .runtime.store import open_store, load_preferences, history, legacy_permission_mode, save_preferences
 from .runtime.controls import MODE_IDS
 from .runtime.subagents import META_KEY as SUBAGENTS_META
 from .stdio import StdinReader
 from .wire.transport import decode_frame, StdoutWriter
 from .runtime.extensions import run_extension_action, require_consent
+from .runtime.leases import acquire as acquire_lease
+from .runtime.leases import lease_path
 
 from .session import Session, text_content, tool_call
 
 __all__ = ["Server", "Session", "ProtocolError", "main", "tool_call", "text_content"]
+SESSION_MUTATIONS = {"session/load", "session/fork", "session/delete", "session/prompt",
+                     "session/set_mode", "session/set_model", "session/set_config_option", "_aelix/manage"}
 
 
 class Server:
@@ -91,7 +95,6 @@ class Server:
         preferences = load_preferences(self.db, session.id)
         preferences.pop("config", None)
         preferences["backendMessageCount"] = 1
-        from .runtime.store import save_preferences
         with self.db:
             self.db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?)", (identifier, session.cwd, self.args.profile,
                             filename, result.get("title") or "Aelix branch", int(time.time())))
@@ -101,8 +104,86 @@ class Server:
         session.save()
         return {"sessionId": identifier, "parentSessionId": session.id}
 
+    async def native_history(self, session):
+        backend = await session.rpc("get_messages")
+        updates = []
+        for message in backend.get("messages", []):
+            role = message.get("role")
+            text = text_content(message.get("content"))
+            if role in ("user", "assistant") and text:
+                updates.append({"sessionUpdate": "user_message_chunk" if role == "user" else "agent_message_chunk",
+                                "content": {"type": "text", "text": text}})
+        return updates
+
+    async def fork_head(self, params):
+        parent = require_string(params.get("sessionId"), "sessionId")
+        cwd = str(Path(require_string(params.get("cwd"), "cwd")).expanduser().resolve())
+        mcp = params.get("mcpServers", [])
+        if not isinstance(mcp, list):
+            raise ProtocolError("mcpServers must be an array")
+        if any(key in params for key in ("entryId", "lastTurnId", "anchor")):
+            raise ProtocolError("Only HEAD forks are supported")
+        row = self.db.execute("SELECT cwd,profile,file FROM sessions WHERE id=?", (parent,)).fetchone()
+        if not row or row[:2] != (cwd, self.args.profile) or not Path(cwd).is_dir():
+            raise ProtocolError("Saved session does not match this workspace and profile")
+        filename = row[2]
+        if not filename or not Path(filename).is_file():
+            raise ProtocolError("No persisted Aelix session file is available to fork")
+        if len(self.sessions) + len(self.starting_ids) >= getattr(self.args, "max_sessions", 16):
+            raise ProtocolError("Session limit reached; close a session first", -32000)
+
+        identifier = str(uuid.uuid4())
+        session = Session(self, identifier, cwd)
+        session.client_mcp = mcp
+        preferences = load_preferences(self.db, parent)
+        saved_mode = legacy_permission_mode(self.db, parent)
+        if saved_mode is not None:
+            preferences.setdefault("permission_mode", saved_mode)
+        with contextlib.ExitStack() as stack:
+            peer = None
+            try:
+                stack.enter_context(acquire_lease(self.args.state_dir, parent))
+            except ProtocolError as error:
+                if error.code != SESSION_LOCKED:
+                    raise
+                # A sibling ACP worker can retain the writer lease while idle.
+                # Native checks the compatible marker at the snapshot boundary.
+                peer = str(lease_path(self.args.state_dir, parent, "fork-peer-v1").resolve())
+            self.starting_ids.add(identifier)
+            try:
+                await session.start(fork_source={"file": filename, "peer": peer, "sessionId": parent},
+                                    fork_preferences=preferences)
+                inherited_history = await self.native_history(session)
+                await session.commands()
+                with self.db:
+                    session.save(inherited_history)
+                self.sessions[identifier] = session
+            except BaseException as error:
+                await session.close()
+                if session.fork_published and isinstance(error, Exception):
+                    raise ProtocolError("The native fork exists but its ACP session could not be opened",
+                                        -32006, {"kind": "fork_unbound", "retryable": False}) from None
+                raise
+            finally:
+                self.starting_ids.discard(identifier)
+        return {"sessionId": identifier, **session.selectors()}
+
     async def dispatch(self, method, params):
         require_object(params)
+        if method in SESSION_MUTATIONS:
+            session_id = require_string(params.get("sessionId"), "sessionId")
+            if method in ("session/load", "session/delete") and session_id in self.starting_ids:
+                raise ProtocolError("Session is already starting", -32000)
+            registered = session_id in self.sessions or self.db.execute(
+                "SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if registered:
+                with acquire_lease(self.args.state_dir, session_id, purpose="activity"):
+                    return await self.dispatch_request(method, params)
+            if method == "session/fork":
+                raise ProtocolError("Saved session does not match this workspace and profile")
+        return await self.dispatch_request(method, params)
+
+    async def dispatch_request(self, method, params):
         if method == "initialize":
             if self.initialized:
                 raise ProtocolError("Already initialized", -32600)
@@ -118,11 +199,13 @@ class Server:
                     "agentInfo": {"name": "aelix-acp", "title": f"Aelix {self.args.profile.title()}", "version": __version__},
                     "agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True, "image": True},
                                           "mcpCapabilities": {"http": True, "sse": True},
-                                          "sessionCapabilities": {"list": {}, "delete": {}},
+                                          "sessionCapabilities": {"list": {}, "delete": {}, "fork": {}},
                                           "_meta": {SUBAGENTS_META: {"version": 1, "on": "tool_call_update"},
                                                     "aelix/errors": {"sessionLocked": SESSION_LOCKED, "turnFailedAfterDispatch": TURN_FAILED_AFTER_DISPATCH}}},
                     "_meta": {"aelix/control": {"version": 1, "methods": ["_aelix/capabilities", "_aelix/manage"],
                               "clientActionCapability": "aelix/clientActions"}}, "authMethods": []}
+        if method == "session/fork":
+            return await self.fork_head(params)
         if method in ("session/new", "session/load"):
             cwd = str(Path(require_string(params.get("cwd"), "cwd")).expanduser().resolve())
             if not isinstance(params.get("mcpServers", []), list):
@@ -146,8 +229,6 @@ class Server:
                         raise ProtocolError("No persisted Aelix session file is available")
             else:
                 session_id = str(uuid.uuid4())
-            if session_id in self.starting_ids:
-                raise ProtocolError("Session is already starting", -32000)
             if session_id not in self.sessions and len(self.sessions) + len(self.starting_ids) >= getattr(self.args, "max_sessions", 16):
                 raise ProtocolError("Session limit reached; close a session first", -32000)
             previous = self.sessions.get(session_id)
@@ -168,15 +249,12 @@ class Server:
                 await session.commands()
                 if method == "session/load":
                     recorded = list(history(self.db, session_id))
-                    for update in recorded:
-                        await self.send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
-                    backend_history = {} if recorded else await session.rpc("get_messages")
-                    for message in backend_history.get("messages", []):
-                        if message.get("role") in ("user", "assistant"):
-                            text = text_content(message.get("content"))
-                            if text:
-                                await session.update({"sessionUpdate": "user_message_chunk" if message["role"] == "user"
-                                    else "agent_message_chunk", "content": {"type": "text", "text": text}})
+                    if recorded:
+                        for update in recorded:
+                            await self.send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
+                    else:
+                        for update in await self.native_history(session):
+                            await session.update(update)
                 await session.publish_recovery_warnings()
             except BaseException:
                 self.sessions.pop(session_id, None)
@@ -188,15 +266,12 @@ class Server:
             return {**session.selectors(), **({"sessionId": session_id} if method.endswith("new") else {})}
         if method == "session/delete":
             session_id = require_string(params.get("sessionId"), "sessionId")
-            if session_id in self.starting_ids:
-                raise ProtocolError("Session is starting", -32000)
             row = self.db.execute("SELECT profile FROM sessions WHERE id=?", (session_id,)).fetchone()
             if row is None or row[0] != self.args.profile:
                 raise ProtocolError("Unknown session")
             live = self.sessions.get(session_id)
             if live and live.mutation_lock.locked():
                 raise ProtocolError("Session is busy; cancel its turn before deleting", -32000)
-            from .runtime.leases import acquire as acquire_lease
             lease = live.lease if live and live.lease else acquire_lease(self.args.state_dir, session_id)
             if live:
                 live.lease = None  # Hold the lease across native close and SQL deletion.
@@ -335,7 +410,7 @@ class Server:
             if request_id is not None:
                 await self.send({"jsonrpc": "2.0", "id": request_id, "result": result})
                 replied = True
-                if message["method"] in ("session/new", "session/load"):
+                if message["method"] in ("session/new", "session/load", "session/fork"):
                     session = self.sessions.get(result.get("sessionId") or message.get("params", {}).get("sessionId"))
                     if session:
                         # Follows the open response, so a host that applies its

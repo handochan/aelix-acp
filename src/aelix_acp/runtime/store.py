@@ -58,8 +58,12 @@ def append_event(db: sqlite3.Connection, session_id: str, update: dict) -> None:
         # A stream must not retain the database's sole writer slot until turn
         # completion and block other adapter processes for the model's latency.
         with db:
-            db.execute("INSERT INTO events(session_id,value) VALUES(?,?)",
-                       (session_id, json.dumps(update, ensure_ascii=False, allow_nan=False)))
+            insert_history(db, session_id, (update,))
+
+
+def insert_history(db: sqlite3.Connection, session_id: str, updates) -> None:
+    db.executemany("INSERT INTO events(session_id,value) VALUES(?,?)",
+                   ((session_id, json.dumps(update, ensure_ascii=False, allow_nan=False)) for update in updates))
 
 
 def history(db: sqlite3.Connection, session_id: str):
