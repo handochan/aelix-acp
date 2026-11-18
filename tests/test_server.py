@@ -212,14 +212,11 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_compact_with_attachment_does_not_become_a_model_prompt(self):
         self.session.rpc = self.fail
-        prelude = "[Assistant Rules]\nUse the included skill index.\n[/Assistant Rules]\n\n"
         image = {"type": "image", "mimeType": "image/png", "data": "AAAA", "uri": "file:///sample.png"}
         for text, attachments in (
             ("/compact", [{"type": "resource_link", "uri": "file:///notes.txt"}]),
             ("/compact\n\n[[AION_FILES]]\n/sample.png", [image]),
             ("/compact keep notes\n\n[[AION_FILES]]\n/notes.txt", []),
-            (prelude + "/compact\n\n[[AION_FILES]]\n/sample.png", [image]),
-            (prelude + "/compact keep notes\n\n[[AION_FILES]]\n/notes.txt", []),
         ):
             with self.subTest(text=text), self.assertRaisesRegex(ProtocolError, "text instructions only"):
                 await self.session.prompt([{"type": "text", "text": text}, *attachments])
@@ -231,11 +228,14 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             return {}
         self.session.rpc = rpc
         prelude = "[Assistant Rules]\nUse the included skill index.\n[/Assistant Rules]\n\n"
-        pasted = prelude + "/compact example instructions"
-        self.assertEqual(await self.session.prompt([{"type": "text", "text": pasted}]),
-                         {"stopReason": "end_turn"})
-        self.assertEqual(calls[0], ("prompt", {"message": pasted}))
-        self.assertNotIn("compact", [command for command, _ in calls])
+        for suffix in ("", "\n\n[[AION_FILES]]\n/notes.txt"):
+            with self.subTest(suffix=suffix):
+                pasted = prelude + "/compact example instructions" + suffix
+                calls.clear()
+                self.assertEqual(await self.session.prompt([{"type": "text", "text": pasted}]),
+                                 {"stopReason": "end_turn"})
+                self.assertEqual(calls[0], ("prompt", {"message": pasted}))
+                self.assertNotIn("compact", [command for command, _ in calls])
 
     async def test_compaction_recovery_cannot_rewrite_preferences_under_another_lease(self):
         from aelix_acp.runtime.store import save_preferences

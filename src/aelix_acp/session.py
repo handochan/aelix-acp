@@ -26,7 +26,7 @@ from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
 from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event,
                             begin_turn, finish_turn, recorded_turn)
-from .runtime.commands import BUILTINS, compact_instructions, execute as execute_slash, has_wrapped_compact
+from .runtime.commands import BUILTINS, compact_instructions, execute as execute_slash
 from .runtime.extensions import extension_reference
 from .runtime.leases import acquire as acquire_lease
 from .runtime.subagents import SubagentTracker
@@ -833,15 +833,10 @@ class Session:
         if not text.strip() and not images:
             raise ProtocolError("Prompt content is empty")
         text_only = all(block.get("type") == "text" for block in blocks)
-        instructions = None
-        if blocks[0]["type"] == "text":
-            instructions = compact_instructions(text)
-            # A pasted rules block and the host's first-message wrapper have
-            # identical wire shapes. Neither can authorize compaction, and an
-            # ambiguous command must never forward attachments to the model.
-            if instructions is not None or has_wrapped_compact(text):
-                if not text_only or "[[AION_FILES]]" in map(str.strip, text.splitlines()):
-                    raise ProtocolError("/compact accepts text instructions only")
+        instructions = compact_instructions(text) if blocks[0]["type"] == "text" else None
+        if instructions is not None and (
+                not text_only or "[[AION_FILES]]" in map(str.strip, instructions.splitlines())):
+            raise ProtocolError("/compact accepts text instructions only")
         for block in blocks:
             append_event(self.server.db, self.id, {"sessionUpdate": "user_message_chunk", "content": block})
         self.server.db.commit()

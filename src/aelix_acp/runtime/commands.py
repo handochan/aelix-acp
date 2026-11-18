@@ -59,14 +59,6 @@ def compact_instructions(text: str) -> str | None:
     return arguments
 
 
-def has_wrapped_compact(text: str) -> bool:
-    """Identify ambiguous host-shaped text for attachment rejection only."""
-    if not text.startswith("[Assistant Rules]\n"):
-        return False
-    _, boundary, remainder = text.partition("\n[/Assistant Rules]\n\n")
-    return bool(boundary) and compact_instructions(remainder) is not None
-
-
 def split_command(text: str) -> tuple[str, str] | None:
     # Leading whitespace and ordinary prose do not turn into control messages.
     if not text.startswith("/") or text.startswith("//"):
