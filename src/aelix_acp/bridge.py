@@ -100,11 +100,15 @@ async def fork_native_head(source, cwd):
             return current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns
 
         before = revision()
-        snapshot = await asyncio.to_thread(path.read_text, encoding="utf-8")
-        if not snapshot.endswith("\n") or revision() != before:
+        raw_snapshot = await asyncio.to_thread(path.read_bytes)
+        if not raw_snapshot.endswith(b"\n") or revision() != before:
             return {"error": "changed"}
         if not acquired and not compatible_fork_peer(peer):
             return {"error": "peer_locked"}
+        if hashlib.sha256(raw_snapshot).hexdigest() != source["expectedSha256"]:
+            return {"error": "head_changed"}
+        snapshot = raw_snapshot.decode("utf-8")
+        del raw_snapshot
 
         class SnapshotFileSystem(LocalFileSystem):
             async def read_text_file(self, filename):

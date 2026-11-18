@@ -67,16 +67,21 @@ signal; the native transcript path is never copied into the error.
 ## HEAD fork
 
 The ACP `session/fork` capability takes the registered parent ID, the same
-workspace and the client's MCP servers. It opens a child with a new ACP ID and
+workspace, the client's MCP servers and `_meta["aelix/expectedHead"]`. The host
+sends a turn reference in `session/prompt` as `_meta["aelix/forkHead"]`. ACP
+binds it to the saved native snapshot when the turn settles. The fork compares
+the expected reference and the captured snapshot before writing a child. A
+missing or stale reference returns `-33003` with `kind: "fork_head_changed"`.
+See the [Host #43 wire examples](https://github.com/handochan/aelix-studio-host/issues/43).
+
+A matching request opens a child with a new ACP ID and
 returns its selectors. The native repository copies the active path through the
 current leaf and records the parent. The parent can stay open in a compatible
 ACP worker while idle. An active parent returns `-32000`. A writer running an
 older adapter or an independently owned native session returns `-33001`.
 
-The fork response does not replay the inherited transcript. Studio's current
-host copies its message projection first, then starts the child in a separate
-request. This flow requires the parent HEAD to remain unchanged between those
-requests because the host sends only the parent ACP ID. Later `session/load`
+The fork response omits historical replay. The host copies its message
+projection first and uses the same reference on child startup. Later `session/load`
 replays the inherited native text followed by the child's own ACP events. The
 native worker projects text from the captured cut before publication. Image
 payloads stay in the native transcript and remain available to the model.

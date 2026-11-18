@@ -18,7 +18,7 @@ import tempfile
 import time
 import uuid
 
-from .wire.errors import (ProtocolError, BackendError, after_dispatch, is_native_session_locked,
+from .wire.errors import (ProtocolError, BackendError, after_dispatch, fork_head_changed, is_native_session_locked,
                           require_object, require_string, session_locked)
 from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter
@@ -134,6 +134,7 @@ class Session:
         if preferences is None:
             preferences = load_preferences(self.server.db, self.id)
         self.fork_projection = preferences.get("forkProjection") is True
+        self.fork_head = preferences.get("forkHead")
         self.active_tools = preferences.get("activeTools")
         if self.active_tools is not None and (not isinstance(self.active_tools, list) or any(not isinstance(name, str) for name in self.active_tools)):
             raise ProtocolError("Invalid saved tool selection")
@@ -323,6 +324,8 @@ class Session:
             raise session_locked(source["sessionId"], "acp")
         if reply.get("error") == "changed":
             raise ProtocolError("Parent session changed while preparing the fork", -32000)
+        if reply.get("error") == "head_changed":
+            raise fork_head_changed()
         filename = reply.get("file")
         if filename != source["target"]:
             raise ProtocolError("Aelix could not create the native fork", -32004)
@@ -428,6 +431,7 @@ class Session:
             "agent": self.controls.capabilities.get("activeAgent"),
             "activeTools": self.active_tools,
             "forkProjection": self.fork_projection,
+            "forkHead": self.fork_head,
             "trustProject": self.trust_project, "agentsEnabled": self.agents_enabled,
             "backendMessageCount": self.state.get("messageCount", self.state.get("message_count", 0))})
         if inherited_history is not None:
@@ -735,7 +739,7 @@ class Session:
         finally:
             self.server.starting_ids.discard(self.id)
 
-    async def prompt(self, blocks, request_key=None):
+    async def prompt(self, blocks, request_key=None, fork_anchor=None):
         key = request_key or uuid.uuid4().hex
         if not isinstance(key, str) or not key or len(key) > 256:
             raise ProtocolError("Request id must be a non-empty string of at most 256 characters")
@@ -748,6 +752,8 @@ class Session:
         self.turn_active = True
         try:
             result = await self._prompt(blocks)
+            if fork_anchor is not None and result["stopReason"] == "end_turn":
+                await self.record_fork_head(fork_anchor)
             return result
         except Exception as failure:
             # Once native may have started work, a failure is final: an
@@ -763,6 +769,24 @@ class Session:
             # Bookkeeping must not replace the turn's own outcome (a marked
             # -33002 would otherwise become a replayable internal error).
             self.record(finish_turn, self.server.db, self.id, key, result, error)
+
+    async def record_fork_head(self, anchor):
+        def capture(filename):
+            with open(filename, "rb") as stream:
+                return hashlib.file_digest(stream, "sha256").hexdigest()
+
+        # Query again for command turns, which can return without the model
+        # path's idle-state refresh. A failed capture cannot authorize a fork.
+        self.fork_head = None
+        try:
+            self.state = await self.rpc("get_state")
+            filename = self.state.get("sessionFile")
+            if filename and not self.state.get("isStreaming", self.state.get("is_streaming", False)):
+                digest = await asyncio.to_thread(capture, filename)
+                self.fork_head = {"id": anchor, "sha256": digest}
+            self.save()
+        except (OSError, ProtocolError):
+            pass
 
     @staticmethod
     def record(write, *args):

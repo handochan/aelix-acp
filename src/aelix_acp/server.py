@@ -17,7 +17,8 @@ import time
 import math
 
 from . import __version__
-from .wire.errors import ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH, require_object, require_string
+from .wire.errors import (ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH,
+                          fork_head_changed, require_object, require_string)
 from .runtime.store import open_store, load_preferences, history, legacy_permission_mode, save_preferences
 from .runtime.controls import MODE_IDS
 from .runtime.subagents import META_KEY as SUBAGENTS_META
@@ -96,6 +97,7 @@ class Server:
         preferences = load_preferences(self.db, session.id)
         preferences.pop("config", None)
         preferences.pop("forkProjection", None)
+        preferences.pop("forkHead", None)
         preferences["backendMessageCount"] = 1
         with self.db:
             self.db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?)", (identifier, session.cwd, self.args.profile,
@@ -125,6 +127,10 @@ class Server:
             raise ProtocolError("mcpServers must be an array")
         if any(key in params for key in ("entryId", "lastTurnId", "anchor")):
             raise ProtocolError("Only HEAD forks are supported")
+        metadata = require_object(params.get("_meta") or {}, "_meta")
+        expected_head = metadata.get("aelix/expectedHead")
+        if not isinstance(expected_head, str) or not expected_head or len(expected_head) > 128:
+            raise fork_head_changed()
         row = self.db.execute("SELECT cwd,profile,file FROM sessions WHERE id=?", (parent,)).fetchone()
         if not row or row[:2] != (cwd, self.args.profile) or not Path(cwd).is_dir():
             raise ProtocolError("Saved session does not match this workspace and profile")
@@ -139,6 +145,9 @@ class Server:
         session = Session(self, identifier, cwd)
         session.client_mcp = mcp
         preferences = load_preferences(self.db, parent)
+        head = preferences.pop("forkHead", None)
+        if not isinstance(head, dict) or head.get("id") != expected_head or not isinstance(head.get("sha256"), str):
+            raise fork_head_changed()
         saved_mode = legacy_permission_mode(self.db, parent)
         if saved_mode is not None:
             preferences.setdefault("permission_mode", saved_mode)
@@ -156,7 +165,8 @@ class Server:
             try:
                 session.lease = acquire_lease(self.args.state_dir, identifier)
                 draft = forks.reserve(self.db, self.args.state_dir, identifier, parent, filename)
-                await session.start(fork_source={**draft, "file": filename, "peer": peer, "sessionId": parent},
+                await session.start(fork_source={**draft, "file": filename, "peer": peer, "sessionId": parent,
+                                                 "expectedSha256": head["sha256"]},
                                     fork_preferences=preferences)
                 await session.commands()
                 result = {"sessionId": identifier, **session.selectors()}
@@ -216,7 +226,8 @@ class Server:
                     "agentInfo": {"name": "aelix-acp", "title": f"Aelix {self.args.profile.title()}", "version": __version__},
                     "agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True, "image": True},
                                           "mcpCapabilities": {"http": True, "sse": True},
-                                          "sessionCapabilities": {"list": {}, "delete": {}, "fork": {}},
+                                          "sessionCapabilities": {"list": {}, "delete": {},
+                                                                  "fork": {"_meta": {"aelix/expectedHead": 1}}},
                                           "_meta": {SUBAGENTS_META: {"version": 1, "on": "tool_call_update"},
                                                     "aelix/errors": {"sessionLocked": SESSION_LOCKED, "turnFailedAfterDispatch": TURN_FAILED_AFTER_DISPATCH}}},
                     "_meta": {"aelix/control": {"version": 1, "methods": ["_aelix/capabilities", "_aelix/manage"],
@@ -344,7 +355,10 @@ class Server:
             async with session.mutation_lock:
                 metadata = params.get("_meta") or {}
                 require_object(metadata, "_meta")
-                return await session.prompt(params.get("prompt"), metadata.get("aelix/requestId"))
+                anchor = metadata.get("aelix/forkHead")
+                if anchor is not None and (not isinstance(anchor, str) or not anchor or len(anchor) > 128):
+                    raise ProtocolError("Invalid native fork reference")
+                return await session.prompt(params.get("prompt"), metadata.get("aelix/requestId"), anchor)
         if method == "session/cancel":
             await self.session(params).cancel()
             return {}

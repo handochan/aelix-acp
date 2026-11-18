@@ -100,9 +100,18 @@ def setup(api):
             with contextlib.suppress(ConnectionError):
                 await writer.wait_closed()
 
-    async def prompt(self, text, key=None):
+    async def prompt(self, text, key=None, fork_head=None):
+        metadata = {}
+        if key:
+            metadata["aelix/requestId"] = key
+        if fork_head:
+            metadata["aelix/forkHead"] = fork_head
         return await self.client.request("session/prompt", {"sessionId": self.session,
-            "prompt": [{"type": "text", "text": text}], **({"_meta": {"aelix/requestId": key}} if key else {})})
+            "prompt": [{"type": "text", "text": text}], "_meta": metadata})
+
+    def fork_params(self, anchor, mcp_servers=()):
+        return {"cwd": str(self.root), "sessionId": self.session, "mcpServers": list(mcp_servers),
+                "_meta": {"aelix/expectedHead": anchor}}
 
     async def config(self, key, value):
         return await self.client.request("session/set_config_option", {"sessionId": self.session, "configId": key, "value": value})
@@ -506,12 +515,12 @@ def setup(api):
                 filename = db.execute("SELECT file FROM sessions WHERE id=?", (identifier,)).fetchone()[0]
             return Path(filename)
 
-        await self.prompt("FIRST_PARENT_TURN")
+        await self.prompt("FIRST_PARENT_TURN", fork_head="first")
         self.model_gate = asyncio.Event()
-        second = asyncio.create_task(self.prompt("SECOND_PARENT_TURN"))
+        second = asyncio.create_task(self.prompt("SECOND_PARENT_TURN", fork_head="second"))
         fork_client = await AcpClient.start(self.root, EXECUTABLE)
         self.addAsyncCleanup(fork_client.close)
-        params = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        params = self.fork_params("second")
         try:
             async with asyncio.timeout(30):
                 while len(self.model_requests) < 2:
@@ -525,6 +534,9 @@ def setup(api):
         try:
             parent = session_file(self.session)
             parent_bytes = parent.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "fork_head_changed"):
+                await fork_client.request("session/fork", self.fork_params("first"))
+            self.assertEqual(set(parent.parent.glob("*.jsonl")), {parent})
             result = await fork_client.request("session/fork", params)
             fork_id = result["sessionId"]
             child = session_file(fork_id)
@@ -554,10 +566,10 @@ def setup(api):
     async def test_standard_head_fork_refuses_an_older_live_adapter_lease(self):
         from aelix_acp.runtime.leases import acquire
 
-        await self.prompt("PARENT_TURN")
+        await self.prompt("PARENT_TURN", fork_head="parent")
         await self.client.close()
         self.client = await AcpClient.start(self.root, EXECUTABLE)
-        params = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        params = self.fork_params("parent")
         with acquire(self.root / "state", self.session):
             with self.assertRaisesRegex(RuntimeError, "-33001"):
                 await self.client.request("session/fork", params)
@@ -590,11 +602,11 @@ def setup(api):
         for label in ("IMAGE_ONE", "IMAGE_TWO"):
             await self.client.request("session/prompt", {"sessionId": self.session, "prompt": [
                 {"type": "text", "text": label}, {"type": "image", "mimeType": "image/png", "data": image},
-            ]}, timeout=90)
+            ], "_meta": {"aelix/forkHead": label}}, timeout=90)
 
         parent = self.native_session_file(self.session)
         parent_bytes = parent.read_bytes()
-        params = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        params = self.fork_params("IMAGE_TWO")
         fork = await self.client.request("session/fork", params, timeout=90)
         child = self.native_session_file(fork["sessionId"])
         self.assertNotEqual(child, parent)
@@ -622,14 +634,14 @@ def setup(api):
     async def test_standard_head_fork_rejects_missing_profile_on_every_open(self):
         import sqlite3
 
-        await self.prompt("PARENT_TURN")
+        await self.prompt("PARENT_TURN", fork_head="parent")
         folder = self.native_session_file(self.session).parent
         originals = set(folder.glob("*.jsonl*")) - set(folder.glob("*.lock"))
         with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db, db:
             saved = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()[0])
             saved["agent"] = "unavailable-fork-profile"
             db.execute("UPDATE preferences SET value=? WHERE session_id=?", (json.dumps(saved), self.session))
-        params = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        params = self.fork_params("parent")
         for _ in range(2):
             with self.assertRaisesRegex(RuntimeError, "profile_unavailable"):
                 await self.client.request("session/fork", params)
@@ -638,12 +650,12 @@ def setup(api):
         self.assertEqual([row["sessionId"] for row in result["sessions"]], [self.session])
 
     async def test_standard_head_fork_removes_a_draft_after_worker_startup_fails(self):
-        await self.prompt("PARENT_TURN")
+        await self.prompt("PARENT_TURN", fork_head="parent")
         parent = self.native_session_file(self.session)
         original = parent.read_bytes()
-        params = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": [
+        params = self.fork_params("parent", [
             {"name": "missing", "command": str(self.root / "missing-mcp-command"), "args": [], "env": []},
-        ]}
+        ])
         for _ in range(2):
             with self.assertRaisesRegex(RuntimeError, "MCP"):
                 await self.client.request("session/fork", params, timeout=90)
@@ -652,6 +664,20 @@ def setup(api):
         self.assertEqual(parent.read_bytes(), original)
         fork = await self.client.request("session/fork", {**params, "mcpServers": []})
         self.assertTrue(self.native_session_file(fork["sessionId"]).is_file())
+
+    async def test_standard_head_fork_rejects_missing_reference_and_changed_native_snapshot(self):
+        await self.prompt("PARENT_TURN", fork_head="parent")
+        parent = self.native_session_file(self.session)
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        params = self.fork_params("parent")
+        with self.assertRaisesRegex(RuntimeError, "fork_head_changed"):
+            await self.client.request("session/fork", {**params, "_meta": {}})
+        with parent.open("ab") as stream:
+            stream.write(b'\n')
+        with self.assertRaisesRegex(RuntimeError, "fork_head_changed"):
+            await self.client.request("session/fork", params)
+        self.assertEqual(set(parent.parent.glob("*.jsonl")), {parent})
 
     async def test_failure_after_native_dispatch_is_not_retryable(self):
         await self.config("autoRetryEnabled", "false")
