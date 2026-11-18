@@ -23,6 +23,7 @@ from .wire.errors import (ProtocolError, BackendError, after_dispatch, is_native
 from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter
 from .runtime.controls import SessionControls, MODE_IDS
+from .runtime.context import SessionContext
 from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event,
                             begin_turn, finish_turn)
 from .runtime.commands import BUILTINS, execute as execute_slash
@@ -119,6 +120,7 @@ class Session:
         self.stderr_task = None
         self.stderr_tail = bytearray()
         self.controls = SessionControls(self)
+        self.context = SessionContext(self)
         self.mutation_lock = asyncio.Lock()
         self.restore_launch_preferences()
         self.analytics_project = Path(cwd) if (Path(cwd) / "analytics.json").is_file() else None
@@ -239,6 +241,7 @@ class Session:
         methods = self.controls.capabilities.get("methods", [])
         self.recovery_warnings = []
         preferences = load_preferences(self.server.db, self.id)
+        self.context.restore(preferences.get("lastContextMeasurement"))
         saved_agent = preferences.get("agent")
         # A saved profile or tool selection restricts authority. Refuse rather
         # than resume with the runtime's broader defaults; check before client
@@ -367,6 +370,7 @@ class Session:
              self.state.get("sessionName") or f"Aelix {self.server.args.profile}", int(time.time())))
         save_preferences(self.server.db, self.id, {"permission_mode": self.controls.permission_mode, "extensions": self.extra_extensions,
             "config": {option["id"]: option["currentValue"] for option in self.controls.options()},
+            "lastContextMeasurement": self.context.last_measurement,
             "agent": self.controls.capabilities.get("activeAgent"),
             "activeTools": self.active_tools,
             "trustProject": self.trust_project, "agentsEnabled": self.agents_enabled,
@@ -383,6 +387,33 @@ class Session:
         for warning in self.recovery_warnings:
             await self.update({"sessionUpdate": "agent_message_chunk", "content": {
                 "type": "text", "text": "Session recovery: " + warning["message"]}})
+
+    async def publish_context_usage(self):
+        try:
+            await self.context.publish_usage()
+        except ProtocolError:
+            # An auxiliary snapshot must not replace the outcome of the turn.
+            await self.context.invalidate_usage()
+
+    async def compact(self, instructions):
+        await self.context.start_compaction("manual")
+        try:
+            result = await self.rpc("compact", _timeout=getattr(self.server.args, "command_timeout", 600) or None,
+                                    **({"customInstructions": instructions} if instructions.strip() else {}))
+        except ProtocolError as error:
+            await self.context.finish_compaction("failed")
+            if error.code == -32007:
+                # A timed-out compact can still own the native worker. Retire
+                # it before accepting another operation on this ACP session.
+                await self.context.invalidate_usage()
+                await self.close()
+                raise after_dispatch(ProtocolError("Aelix compaction outcome is unknown after the deadline", -32603,
+                                                   error.data)) from error
+            await self.publish_context_usage()
+            raise
+        else:
+            await self.publish_context_usage()
+            await self.context.finish_compaction("completed", result)
 
     async def rpc(self, command, *, _timeout=45, **kwargs):
         request_id = uuid.uuid4().hex
@@ -462,7 +493,9 @@ class Session:
 
     async def event(self, event):
         kind = event.get("type")
-        if kind == "message_start" and (event.get("message") or {}).get("role") == "assistant":
+        if kind in ("compaction_start", "compaction_end"):
+            await self.context.native_compaction_event(event)
+        elif kind == "message_start" and (event.get("message") or {}).get("role") == "assistant":
             self.failure = None
         elif kind == "message_update":
             update = event.get("assistantMessageEvent") or event.get("assistant_message_event") or {}
@@ -663,6 +696,8 @@ class Session:
             self.save()
             await self.start(filename)
             await self.commands()
+            await self.publish_context_usage()
+            self.save()
             await self.publish_recovery_warnings()
             self.server.sessions[self.id] = self
         except BaseException:
@@ -749,10 +784,14 @@ class Session:
         text = "\n\n".join(parts)
         if not text.strip() and not images:
             raise ProtocolError("Prompt content is empty")
+        text_only = all(block.get("type") == "text" for block in blocks)
+        first = blocks[0]
+        if not text_only and first["type"] == "text" and first["text"].partition(" ")[0] == "/compact":
+            raise ProtocolError("/compact accepts text instructions only")
         for block in blocks:
             append_event(self.server.db, self.id, {"sessionUpdate": "user_message_chunk", "content": block})
         self.server.db.commit()
-        if text.startswith("/") and all(block.get("type") == "text" for block in blocks):
+        if text.startswith("/") and text_only:
             try:
                 handled, prepared = await execute_slash(self, text)
             except ProtocolError:
@@ -776,6 +815,8 @@ class Session:
                 if self.cancelled:
                     await self.cancel()
                 await self.wait_until_idle()
+            await self.context.finish_compaction("failed")
+            await self.publish_context_usage()
             if self.failure and not self.cancelled:
                 raise ProtocolError(self.failure, -32603)
             self.save()
@@ -786,6 +827,7 @@ class Session:
         finally:
             if self.done and not self.done.done():
                 self.done.cancel()
+            await self.context.finish_compaction("failed")
 
     async def wait_until_idle(self):
         # agent_end closes one provider attempt, not the enclosing prompt's
@@ -802,6 +844,10 @@ class Session:
             await asyncio.sleep(0.05)
 
     async def cancel(self):
+        if self.context.manual_compaction:
+            # Classic RPC abort only interrupts native turns and retries.
+            # Keep waiting for the actual manual compaction outcome.
+            return
         self.cancelled = True
         self.tool_arrived.set()
         if self.management_task and not self.management_task.done():

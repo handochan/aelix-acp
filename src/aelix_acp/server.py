@@ -177,6 +177,8 @@ class Server:
                             if text:
                                 await session.update({"sessionUpdate": "user_message_chunk" if message["role"] == "user"
                                     else "agent_message_chunk", "content": {"type": "text", "text": text}})
+                    await session.publish_context_usage()
+                    session.save()
                 await session.publish_recovery_warnings()
             except BaseException:
                 self.sessions.pop(session_id, None)

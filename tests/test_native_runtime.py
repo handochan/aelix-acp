@@ -24,6 +24,7 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.write_path = self.root / "approved.txt"
         self.failures = 0
         self.model_gate = None
+        self.prompt_tokens = 23
         self.listener = await asyncio.start_server(self.model, "127.0.0.1", 0)
         port = self.listener.sockets[0].getsockname()[1]
         models = {"providers": {"fixture": {"baseUrl": f"http://127.0.0.1:{port}/v1", "api": "openai-completions",
@@ -33,7 +34,8 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 {"id": "two", "name": "Fixture Two", "reasoning": False, "input": ["text"],
                  "contextWindow": 32768, "maxTokens": 2048}]}}}
         (self.root / "agent/models.json").write_text(json.dumps(models))
-        (self.root / "agent/settings.json").write_text(json.dumps({"defaultProvider": "fixture", "defaultModel": "one"}))
+        (self.root / "agent/settings.json").write_text(json.dumps({"defaultProvider": "fixture", "defaultModel": "one",
+                                                                  "compaction": {"keepRecentTokens": 0}}))
         extension = self.root / "commands.py"
         extension.write_text('''import asyncio
 async def echo(args, ctx): return "echo:" + args
@@ -85,7 +87,9 @@ def setup(api):
                 delta, stop = {"role": "assistant", "content": "NATIVE_OK"}, "stop"
             def event(delta, finish):
                 return "data: " + json.dumps({"id": "fixture", "object": "chat.completion.chunk", "created": 0,
-                    "model": request.get("model", "one"), "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
+                    "model": request.get("model", "one"), "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                    **({"usage": {"prompt_tokens": self.prompt_tokens, "completion_tokens": 3,
+                                  "total_tokens": self.prompt_tokens + 3}} if finish else {})}) + "\n\n"
             body = (event(delta, None) + event({}, stop) + "data: [DONE]\n\n").encode()
             if self.failures:
                 self.failures -= 1
@@ -252,6 +256,57 @@ def setup(api):
         self.assertEqual(await self.prompt("Respond briefly"), {"stopReason": "end_turn"})
         self.assertIn("NATIVE_OK", self.client.text())
         self.assertEqual(self.model_requests[-1]["model"], "two")
+
+    def context_updates(self, kind):
+        return [message["params"]["update"] for message in self.client.updates
+                if message.get("method") == "session/update" and message["params"]["update"]["sessionUpdate"] == kind]
+
+    async def test_manual_compaction_updates_context_and_preserves_native_history(self):
+        for text in ("Remember the first detail.", "Remember the next detail.", "Remember the latest detail."):
+            await self.prompt(text)
+        known = self.context_updates("usage_update")[-1]
+        self.assertEqual((known["used"], known["size"]), (26, 32768))
+        self.assertNotIn("cost", known)
+
+        before = len(self.model_requests)
+        self.assertEqual(await self.prompt("/compact Preserve only decisions"), {"stopReason": "end_turn"})
+        progress = self.context_updates("tool_call")[-1]
+        result = self.context_updates("tool_call_update")[-1]
+        self.assertEqual(result["toolCallId"], progress["toolCallId"])
+        self.assertEqual(result["_meta"]["aelix/compaction"]["state"], "completed")
+        self.assertGreater(result["_meta"]["aelix/compaction"]["tokensBefore"], 0)
+        summarized_request = json.dumps(self.model_requests[before:])
+        self.assertIn("Preserve only decisions", summarized_request)
+        self.assertNotIn("/compact", summarized_request)
+        self.assertEqual(self.context_updates("usage_update")[-1]["_meta"], {"aelix/contextUnknown": True})
+
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+        self.assertIn("Remember the first detail.", self.client.text())
+        self.assertEqual(self.context_updates("usage_update")[-1]["_meta"], {"aelix/contextUnknown": True})
+        await self.prompt("Continue after compaction")
+        self.assertEqual(self.context_updates("usage_update")[-1], known)
+
+    async def test_compaction_with_no_history_reports_failure_without_a_model_request(self):
+        with self.assertRaisesRegex(RuntimeError, "Nothing to compact"):
+            await self.prompt("/compact")
+        self.assertEqual(self.model_requests, [])
+        progress = self.context_updates("tool_call_update")[-1]
+        self.assertEqual(progress["_meta"]["aelix/compaction"], {"reason": "manual", "state": "failed"})
+
+    async def test_threshold_compaction_finishes_before_the_deduplicated_turn_returns(self):
+        await self.prompt("Earlier context")
+        await self.prompt("Recent context")
+        self.prompt_tokens = 18000
+        self.assertEqual(await self.prompt("Trigger threshold compaction", "threshold-turn"), {"stopReason": "end_turn"})
+        self.assertEqual(self.context_updates("tool_call")[-1]["_meta"]["aelix/compaction"],
+                         {"reason": "threshold", "state": "running"})
+        completed = self.context_updates("tool_call_update")[-1]["_meta"]["aelix/compaction"]
+        self.assertEqual((completed["reason"], completed["state"]), ("threshold", "completed"))
+        requests = len(self.model_requests)
+        await self.prompt("Trigger threshold compaction", "threshold-turn")
+        self.assertEqual(len(self.model_requests), requests)
 
     async def test_native_retry_settles_before_the_prompt_response(self):
         self.failures = 1

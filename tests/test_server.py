@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import ProtocolError, Server, Session
 from aelix_acp.wire.errors import SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH, after_dispatch, is_native_session_locked
 from aelix_acp.runtime.leases import acquire
+from aelix_acp.runtime.store import load_preferences
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -161,6 +162,68 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.session.rpc = rpc
         self.assertEqual(await self.session.prompt([{"type": "text", "text": "Respond"}]), {"stopReason": "end_turn"})
         self.assertEqual(len(states), 3)
+
+    def context_updates(self, update_type):
+        return [event["params"]["update"] for event in self.events
+                if event["params"]["update"]["sessionUpdate"] == update_type]
+
+    async def test_context_snapshot_clears_last_measurement_without_inventing_tokens(self):
+        used = 18432
+        async def rpc(command, **_kwargs):
+            self.assertEqual(command, "get_session_stats")
+            return {"contextUsage": {"tokens": used, "contextWindow": 32768}, "cost": 2}
+        self.session.rpc = rpc
+        await self.session.publish_context_usage()
+        self.session.save()
+        restored = Session(self.server, self.session.id, self.tmp.name)
+        restored.context.restore(load_preferences(self.server.db, restored.id)["lastContextMeasurement"])
+        restored.rpc = rpc
+        used = None
+        await restored.publish_context_usage()
+        self.assertEqual(self.context_updates("usage_update"), [
+            {"sessionUpdate": "usage_update", "used": 18432, "size": 32768},
+            {"sessionUpdate": "usage_update", "used": 18432, "size": 32768,
+             "_meta": {"aelix/contextUnknown": True}},
+        ])
+
+    async def test_manual_compact_passes_instructions_and_waits_for_native_outcome(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        calls = []
+        async def rpc(command, **kwargs):
+            calls.append((command, kwargs))
+            if command == "compact":
+                started.set()
+                await release.wait()
+                return {"tokens_before": 10, "summary": "The summary stays in native history."}
+            return {"contextUsage": {"tokens": None, "contextWindow": 32768}}
+        self.session.rpc = rpc
+        task = asyncio.create_task(self.session.prompt([{"type": "text", "text": "/compact keep decisions"}]))
+        await asyncio.wait_for(started.wait(), 2)
+        try:
+            await self.session.cancel()
+            self.assertFalse(task.done())
+        finally:
+            release.set()
+        self.assertEqual(await task, {"stopReason": "end_turn"})
+        self.assertEqual(calls[0], ("compact", {"_timeout": 600, "customInstructions": "keep decisions"}))
+        self.assertNotIn("prompt", [command for command, _ in calls])
+        self.assertEqual(self.context_updates("tool_call_update")[0]["_meta"]["aelix/compaction"],
+                         {"reason": "manual", "state": "completed", "tokensBefore": 10})
+
+    async def test_compact_with_attachment_does_not_become_a_model_prompt(self):
+        self.session.rpc = self.fail
+        with self.assertRaisesRegex(ProtocolError, "text instructions only"):
+            await self.session.prompt([{"type": "text", "text": "/compact keep notes"},
+                                       {"type": "resource_link", "uri": "file:///notes.txt"}])
+
+    async def test_automatic_compaction_failure_does_not_end_the_turn(self):
+        self.session.done = asyncio.get_running_loop().create_future()
+        await self.session.event({"type": "compaction_start", "reason": "threshold"})
+        await self.session.event({"type": "compaction_end", "reason": "threshold", "aborted": False,
+                                  "result": None, "error_message": "summary failed"})
+        self.assertFalse(self.session.done.done())
+        self.assertEqual(self.context_updates("tool_call_update")[0]["status"], "failed")
+        self.session.done.cancel()
 
     async def test_compaction_deadline_sends_native_abort_before_returning(self):
         calls = []
