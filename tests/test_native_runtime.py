@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -226,6 +227,66 @@ def setup(api):
         result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
         self.assertEqual(result["modes"]["currentModeId"], "yolo")
         self.assertEqual(result["models"]["currentModelId"], "fixture/two")
+
+    async def test_native_file_selectors_win_over_saved_adapter_preferences(self):
+        await self.config("thinking_level", "low")
+        await self.prompt("Seed the native session")
+        await self.client.close()
+
+        state_dir = self.root / "state/sessions.sqlite3"
+        with contextlib.closing(sqlite3.connect(state_dir)) as db:
+            filename, = db.execute("SELECT file FROM sessions WHERE id=?", (self.session,)).fetchone()
+            saved, = db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()
+        self.assertEqual(json.loads(saved)["config"]["model"], "fixture/one")
+        self.assertEqual(json.loads(saved)["config"]["thinking_level"], "low")
+
+        models_path = self.root / "agent/models.json"
+        models = json.loads(models_path.read_text(encoding="utf-8"))
+        models["providers"]["fixture"]["models"][1]["reasoning"] = True
+        models_path.write_text(json.dumps(models), encoding="utf-8")
+
+        env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP") if key in os.environ}
+        env.update(HOME=str(self.root / "home"), USERPROFILE=str(self.root / "home"),
+                   AELIX_CODING_AGENT_DIR=str(self.root / "agent"),
+                   AELIX_SETTINGS_PATH=str(self.root / "agent/settings.json"))
+        native = await asyncio.create_subprocess_exec(
+            EXECUTABLE, "--mode", "rpc", "--offline", "--no-extensions", "--session", filename,
+            cwd=self.root, env=env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+        try:
+            for request in (
+                {"id": "model", "type": "set_model", "provider": "fixture", "modelId": "two"},
+                {"id": "level", "type": "set_thinking_level", "level": "high"},
+            ):
+                native.stdin.write((json.dumps(request) + "\n").encode())
+                await native.stdin.drain()
+                async with asyncio.timeout(30):
+                    while line := await native.stdout.readline():
+                        response = json.loads(line)
+                        if response.get("id") == request["id"] and response.get("type") == "response":
+                            self.assertTrue(response["success"], response)
+                            break
+                    else:
+                        self.fail(f"Native RPC closed while handling {request['type']}")
+        finally:
+            native.stdin.close()
+            try:
+                await asyncio.wait_for(native.wait(), 10)
+            except TimeoutError:
+                native.kill()
+                await native.wait()
+        self.assertEqual(native.returncode, 0)
+
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        restored = await self.client.request(
+            "session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}, timeout=120)
+        options = {option["id"]: option["currentValue"] for option in restored["configOptions"]}
+        self.assertEqual((options["model"], options["thinking_level"]), ("fixture/two", "high"))
+        self.assertEqual(await self.prompt("Use the restored model"), {"stopReason": "end_turn"})
+        self.assertEqual([request["model"] for request in self.model_requests], ["one", "two"])
+        with contextlib.closing(sqlite3.connect(state_dir)) as db:
+            persisted, = db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()
+        config = json.loads(persisted)["config"]
+        self.assertEqual((config["model"], config["thinking_level"]), ("fixture/two", "high"))
 
     async def test_live_session_lease_blocks_other_adapters_and_close_preserves_history(self):
         other = await AcpClient.start(self.root, EXECUTABLE)

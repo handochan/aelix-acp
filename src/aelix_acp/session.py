@@ -265,13 +265,16 @@ class Session:
             await self.controls.refresh()
         config = preferences.get("config", {})
         require_object(config, "saved session config")
+        # Native restores the session model from a branch with messages. An
+        # empty branch still needs the adapter's pre-turn selector choices.
+        native_has_history = session_file and self.state.get("messageCount", self.state.get("message_count")) != 0
         for config_id in ("model", "thinking_level", "steeringMode", "followUpMode", "autoCompactionEnabled", "autoRetryEnabled"):
             option = next((entry for entry in self.controls.options() if entry["id"] == config_id), None)
             if config_id in config and (not option or config[config_id] != option["currentValue"]):
                 if not option or config[config_id] not in [entry["value"] for entry in option["options"]]:
                     self.recovery_warnings.append({"kind": "config_unavailable", "configId": config_id,
                         "previousValue": config[config_id], "message": f"Saved {config_id} is unavailable; using the native runtime's current selection."})
-                else:
+                elif not (native_has_history and config_id in ("model", "thinking_level")):
                     await self.controls.set(config_id, config[config_id], publish=False)
         restored = self.launch_mode
         await self.controls.observe_permission()
