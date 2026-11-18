@@ -417,6 +417,12 @@ class Session:
                                                    error.data)) from error
             await self.context.finish_compaction("failed")
             await self.publish_context_usage()
+            if isinstance(error, BackendError) and error.data["command"] == "compact" and str(error) == "Nothing to compact":
+                # Pinned native reports this explicit no-op before starting the
+                # summary. Complete the ACP turn so the host keeps its prelude.
+                await self.update({"sessionUpdate": "agent_message_chunk",
+                                   "content": {"type": "text", "text": str(error)}})
+                return
             raise
         else:
             await self.context.finish_compaction("completed", result)

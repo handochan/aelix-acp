@@ -288,10 +288,10 @@ def setup(api):
         await self.prompt("Continue after compaction")
         self.assertEqual(self.context_updates("usage_update")[-1], known)
 
-    async def test_compaction_with_no_history_reports_failure_without_a_model_request(self):
-        with self.assertRaisesRegex(RuntimeError, "Nothing to compact"):
-            await self.prompt("/compact")
+    async def test_compaction_with_no_history_reports_no_work_without_a_model_request(self):
+        self.assertEqual(await self.prompt("/compact"), {"stopReason": "end_turn"})
         self.assertEqual(self.model_requests, [])
+        self.assertIn("Nothing to compact", self.client.text())
         progress = self.context_updates("tool_call_update")[-1]
         self.assertEqual(progress["_meta"]["aelix/compaction"], {"reason": "manual", "state": "failed"})
 

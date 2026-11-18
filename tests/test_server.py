@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import ProtocolError, Server, Session
-from aelix_acp.wire.errors import SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH, after_dispatch, is_native_session_locked
+from aelix_acp.wire.errors import BackendError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH, after_dispatch, is_native_session_locked
 from aelix_acp.runtime.leases import acquire
 from aelix_acp.runtime.store import load_preferences
 
@@ -321,6 +321,16 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.session.done.done())
         self.assertEqual(self.context_updates("tool_call_update")[0]["status"], "failed")
         self.session.done.cancel()
+
+    async def test_compact_provider_failure_still_fails_the_acp_turn(self):
+        async def rpc(command, **_kwargs):
+            if command == "compact":
+                raise BackendError("Summarization provider failed", "compact")
+            return {}
+        self.session.rpc = rpc
+        with self.assertRaisesRegex(BackendError, "Summarization provider failed"):
+            await self.session.prompt([{"type": "text", "text": "/compact"}])
+        self.assertEqual(self.context_updates("tool_call_update")[-1]["status"], "failed")
 
     async def test_compaction_deadline_sends_native_abort_before_returning(self):
         calls = []
