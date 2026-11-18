@@ -22,6 +22,7 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         (self.root / "home").mkdir()
         (self.root / "agent").mkdir()
         self.model_requests = []
+        self.model_authorizations = []
         self.write_path = self.root / "approved.txt"
         self.failures = 0
         self.model_gate = None
@@ -65,6 +66,9 @@ def setup(api):
             length = int(next(line.split(":", 1)[1].strip() for line in header.split("\r\n") if line.lower().startswith("content-length:")))
             request = json.loads(await reader.readexactly(length))
             self.model_requests.append(request)
+            self.model_authorizations.append(next(
+                (line.split(":", 1)[1].strip() for line in header.split("\r\n")
+                 if line.lower().startswith("authorization:")), None))
             if self.model_gate is not None:
                 await self.model_gate.wait()
             messages = request.get("messages", [])
@@ -288,6 +292,105 @@ def setup(api):
         config = json.loads(persisted)["config"]
         self.assertEqual((config["model"], config["thinking_level"]), ("fixture/two", "high"))
 
+    async def test_launch_model_is_only_a_default_for_sessions(self):
+        launch = ["--provider", "fixture", "--model", "two"]
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=launch)
+        new = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []})
+        self.session = new["sessionId"]
+        self.assertEqual(new["models"]["currentModelId"], "fixture/two")
+        await self.config("model", "fixture/one")
+        await self.config("thinking_level", "high")
+        await self.prompt("Use the explicit selector")
+        await self.client.close()
+
+        self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=launch)
+        restored = await self.client.request("session/load", {
+            "cwd": str(self.root), "sessionId": self.session, "mcpServers": [],
+        })
+        options = {option["id"]: option["currentValue"] for option in restored["configOptions"]}
+        self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
+        await self.prompt("Use the resumed selectors")
+        self.assertEqual([request["model"] for request in self.model_requests], ["one", "one"])
+
+    async def test_profile_restore_keeps_native_selectors_and_enforces_tool_filter(self):
+        profiles = self.root / "agent/agents"
+        profiles.mkdir()
+        (profiles / "restricted.md").write_text(
+            "---\nname: restricted\ndescription: Restricted\nprovider: fixture\nmodel: two\n"
+            "thinking: 'off'\ntools: [read]\n---\nRead only.\n", encoding="utf-8")
+        await self.manage("agents/use", {"name": "restricted"})
+        await self.config("model", "fixture/one")
+        await self.config("thinking_level", "high")
+        await self.config("permission_mode", "yolo")
+        await self.prompt("Seed the restricted session")
+        await self.client.close()
+
+        state_dir = self.root / "state/sessions.sqlite3"
+        with contextlib.closing(sqlite3.connect(state_dir)) as db, db:
+            saved, = db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()
+            preferences = json.loads(saved)
+            self.assertEqual(preferences["agent"], "restricted")
+            preferences["config"].update(model="fixture/two", thinking_level="off")
+            db.execute("UPDATE preferences SET value=? WHERE session_id=?", (json.dumps(preferences), self.session))
+
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        restored = await self.client.request("session/load", {
+            "cwd": str(self.root), "sessionId": self.session, "mcpServers": [],
+        })
+        options = {option["id"]: option["currentValue"] for option in restored["configOptions"]}
+        self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
+        self.assertEqual(restored["modes"]["currentModeId"], "yolo")
+        self.assertEqual((await self.manage("resources/list"))["activeTools"], ["read"])
+        # The provider deliberately proposes a write even though it was not
+        # offered this tool. Restored Yolo must not bypass the profile filter.
+        await self.prompt("WRITE_TEST")
+        self.assertTrue(all(request["model"] == "one" for request in self.model_requests))
+        self.assertGreaterEqual(len(self.model_requests), 2)
+        self.assertEqual([tool["function"]["name"] for tool in self.model_requests[-1]["tools"]], ["read"])
+        self.assertFalse(self.write_path.exists())
+        with contextlib.closing(sqlite3.connect(state_dir)) as db:
+            saved, = db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()
+        config = json.loads(saved)["config"]
+        self.assertEqual((config["model"], config["thinking_level"]), ("fixture/one", "high"))
+
+    async def test_resume_does_not_rebind_a_typed_key_to_another_provider(self):
+        await self.client.close()
+        models_path = self.root / "agent/models.json"
+        models = json.loads(models_path.read_text(encoding="utf-8"))
+        models["providers"]["alternate"] = {
+            **models["providers"]["fixture"], "apiKey": "synthetic-alternate-key",
+            "models": [{"id": "alternate-model", "name": "Alternate", "reasoning": False,
+                        "input": ["text"], "contextWindow": 32768, "maxTokens": 2048}],
+        }
+        models_path.write_text(json.dumps(models), encoding="utf-8")
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        created = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []})
+        self.session = created["sessionId"]
+        await self.config("model", "alternate/alternate-model")
+        await self.prompt("Record the alternate provider in history")
+        await self.client.close()
+        (self.root / "agent/settings.json").write_text(json.dumps({
+            "defaultProvider": "alternate", "defaultModel": "alternate-model",
+        }), encoding="utf-8")
+
+        typed_key = "synthetic-typed-launch-key"
+        launch = ["--provider", "fixture", "--model", "one"]
+        self.client = await AcpClient.start(
+            self.root, EXECUTABLE, prefix=["--api-key", typed_key], adapter_args=launch)
+        restored = await self.client.request("session/load", {
+            "cwd": str(self.root), "sessionId": self.session, "mcpServers": [],
+        })
+        self.assertEqual(restored["models"]["currentModelId"], "fixture/one")
+        self.assertNotIn(typed_key, json.dumps(restored))
+        await self.prompt("Use the credential-bound launch route")
+        await self.config("model", "alternate/alternate-model")
+        await self.prompt("Select the other provider")
+        self.assertEqual([request["model"] for request in self.model_requests], ["alternate-model", "one", "alternate-model"])
+        self.assertEqual(self.model_authorizations, [
+            "Bearer synthetic-alternate-key", f"Bearer {typed_key}", "Bearer synthetic-alternate-key",
+        ])
+
     async def test_live_session_lease_blocks_other_adapters_and_close_preserves_history(self):
         other = await AcpClient.start(self.root, EXECUTABLE)
         try:
@@ -430,6 +533,10 @@ def setup(api):
         # What a host replays from its saved preference must not reach a session.
         with self.assertRaises(RuntimeError):
             await self.client.request("session/set_mode", {"sessionId": self.session, "modeId": "yolo"})
+        with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+            await self.config("model", "fixture/two")
+        with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+            await self.manage("agents/use", {"name": "--none"})
         with self.assertRaises(RuntimeError):
             await self.prompt("WRITE_TEST")
         self.assertFalse(self.write_path.exists())

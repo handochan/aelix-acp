@@ -36,6 +36,10 @@ KINDS = {"read": "read", "grep": "search", "find": "search", "ls": "read",
          "analytics_status": "read", "analytics_query": "read"}
 # Native history selectors. A launch prefix must not bypass session/load.
 SESSION_SELECTORS = ("--session", "--resume", "-r", "--continue", "-c", "--fork", "--no-session")
+NATIVE_ROUTE_ARGUMENTS = frozenset({
+    "--provider", "--model", "--agent", "--agent-file", "--api-key", "--require-registration-route",
+})
+NATIVE_SESSION_SELECTORS = ("model", "thinking_level")
 # Native requests that never change the runtime (aelix-ai rpc/control.py
 # CLASSIC_READ_ONLY and READ_ONLY_METHODS). Anything else sent during a turn
 # may have started work, so a later failure must not be replayed.
@@ -150,9 +154,10 @@ class Session:
         self.launch_mode = mode
 
     async def start(self, session_file=None):
-        for argument in getattr(self.server.args, "aelix_arg", []):
-            if argument.split("=", 1)[0] in SESSION_SELECTORS:
-                raise ProtocolError("Adapter launch cannot override native session selection")
+        launch_prefix = getattr(self.server.args, "aelix_arg", [])
+        prefix_options = {argument.split("=", 1)[0] for argument in launch_prefix}
+        if prefix_options.intersection(SESSION_SELECTORS):
+            raise ProtocolError("Adapter launch cannot override native session selection")
         if self.lease is None:
             self.lease = acquire_lease(self.server.args.state_dir, self.id)
         if self.index_snapshot is not None:
@@ -166,7 +171,7 @@ class Session:
         os.chmod(self.socket_dir, 0o700)
         socket_path = str(Path(self.socket_dir) / "bridge.sock")
         await self.listen(socket_path, tcp=sys.platform == "win32")
-        args = [self.server.args.aelix, *getattr(self.server.args, "aelix_arg", []), "--mode", "rpc", "--offline", "--no-extensions",
+        args = [self.server.args.aelix, *launch_prefix, "--mode", "rpc", "--offline", "--no-extensions",
                 "--permission-mode", self.launch_mode,
                 "--append-system-prompt-file", str(PACKAGE / "profiles" / f"{self.server.args.profile}.md")]
         args += ["--agents" if self.agents_enabled else "--no-agents"]
@@ -181,10 +186,13 @@ class Session:
             args += ["-e", extension_reference(extension, self.cwd)]
         # Consent sees arguments after other trusted extension hooks.
         args += ["-e", str(PACKAGE / "bridge.py")]
-        if self.server.args.provider:
-            args += ["--provider", self.server.args.provider]
-        if self.server.args.model:
-            args += ["--model", self.server.args.model]
+        # Adapter defaults must not suppress native resume. Explicit native
+        # route arguments retain their original provider and model binding.
+        if not session_file or prefix_options & NATIVE_ROUTE_ARGUMENTS:
+            if self.server.args.provider:
+                args += ["--provider", self.server.args.provider]
+            if self.server.args.model:
+                args += ["--model", self.server.args.model]
         if session_file:
             if not Path(session_file).is_file():
                 raise ProtocolError("The Aelix session file no longer exists")
@@ -240,6 +248,13 @@ class Session:
         self.recovery_warnings = []
         preferences = load_preferences(self.server.db, self.id)
         saved_agent = preferences.get("agent")
+        # Read native selectors before applying an identity that may change
+        # them. The empty branch still relies on its cached pre-turn choices.
+        native_has_history = session_file and self.state.get("messageCount", self.state.get("message_count")) != 0
+        restored_selectors = {
+            option["id"]: option["currentValue"] for option in self.controls.options()
+            if option["id"] in NATIVE_SESSION_SELECTORS
+        } if native_has_history else {}
         # A saved profile or tool selection restricts authority. Refuse rather
         # than resume with the runtime's broader defaults; check before client
         # MCP setup, which already needs tools/set_active.
@@ -263,25 +278,30 @@ class Session:
                                     "Restore or recreate that profile, then open the session again; or start a new session.",
                                     -32004, {"kind": "profile_unavailable", "profile": saved_agent}) from None
             await self.controls.refresh()
-        config = preferences.get("config", {})
-        require_object(config, "saved session config")
-        # Native restores the session model from a branch with messages. An
-        # empty branch still needs the adapter's pre-turn selector choices.
-        native_has_history = session_file and self.state.get("messageCount", self.state.get("message_count")) != 0
-        for config_id in ("model", "thinking_level", "steeringMode", "followUpMode", "autoCompactionEnabled", "autoRetryEnabled"):
-            option = next((entry for entry in self.controls.options() if entry["id"] == config_id), None)
-            if config_id in config and (not option or config[config_id] != option["currentValue"]):
-                if not option or config[config_id] not in [entry["value"] for entry in option["options"]]:
-                    self.recovery_warnings.append({"kind": "config_unavailable", "configId": config_id,
-                        "previousValue": config[config_id], "message": f"Saved {config_id} is unavailable; using the native runtime's current selection."})
-                elif not (native_has_history and config_id in ("model", "thinking_level")):
-                    await self.controls.set(config_id, config[config_id], publish=False)
         restored = self.launch_mode
         await self.controls.observe_permission()
         if self.controls.native_mode != restored:
             await self.controls.apply_permission(restored, persist=False)
         self.controls.permission_mode = restored
         await self.restore_tools()
+
+        if saved_agent:
+            # Keep the profile's prompt and authority, then restore the live
+            # model first so native can validate reasoning for that model.
+            for config_id, value in restored_selectors.items():
+                option = next((entry for entry in self.controls.options() if entry["id"] == config_id), None)
+                if option is None or option["currentValue"] != value:
+                    await self.controls.set(config_id, value, publish=False)
+        config = preferences.get("config", {})
+        require_object(config, "saved session config")
+        for config_id in (*NATIVE_SESSION_SELECTORS, "steeringMode", "followUpMode", "autoCompactionEnabled", "autoRetryEnabled"):
+            option = next((entry for entry in self.controls.options() if entry["id"] == config_id), None)
+            if config_id in config and (not option or config[config_id] != option["currentValue"]):
+                if not option or config[config_id] not in [entry["value"] for entry in option["options"]]:
+                    self.recovery_warnings.append({"kind": "config_unavailable", "configId": config_id,
+                        "previousValue": config[config_id], "message": f"Saved {config_id} is unavailable; using the native runtime's current selection."})
+                elif not (native_has_history and config_id in NATIVE_SESSION_SELECTORS):
+                    await self.controls.set(config_id, config[config_id], publish=False)
         metadata = getattr(self.server, "client_capabilities", {}).get("_meta", {})
         if metadata.get("aelix/clientActions") is True and "ui/enable" in methods:
             await self.rpc("aelix_control", method="ui/enable", params={"enabled": True})
