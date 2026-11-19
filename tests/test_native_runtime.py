@@ -459,28 +459,31 @@ def setup(api):
             await rejected_peer.close()
 
         peer = await AcpClient.start(self.root, EXECUTABLE, adapter_args=launch)
-        self.addAsyncCleanup(peer.close)
-        forked = await peer.request("session/fork", self.fork_params("selectors"))
-        child = forked["sessionId"]
-        options = {option["id"]: option["currentValue"] for option in forked["configOptions"]}
-        self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
-        self.assertEqual(forked["modes"]["currentModeId"], "yolo")
-        await peer.close()
+        try:
+            forked = await peer.request("session/fork", self.fork_params("selectors"))
+            child = forked["sessionId"]
+            options = {option["id"]: option["currentValue"] for option in forked["configOptions"]}
+            self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
+            self.assertEqual(forked["modes"]["currentModeId"], "yolo")
+        finally:
+            await peer.close()
 
         peer = await AcpClient.start(self.root, EXECUTABLE, adapter_args=launch)
-        self.addAsyncCleanup(peer.close)
-        reopened = await peer.request("session/load", {
-            "cwd": str(self.root), "sessionId": child, "mcpServers": [],
-        })
-        options = {option["id"]: option["currentValue"] for option in reopened["configOptions"]}
-        self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
-        await peer.request("session/prompt", {"sessionId": child, "prompt": [{"type": "text", "text": "WRITE_TEST"}]})
-        request = self.model_requests[-1]
-        self.assertEqual(request["model"], "one")
-        self.assertIn("FORKED_PARENT_TURN", json.dumps(request["messages"]))
-        self.assertEqual([tool["function"]["name"] for tool in request["tools"]], ["read"])
-        self.assertFalse(self.write_path.exists())
-        self.assertTrue(parent.read_bytes() == parent_bytes)
+        try:
+            reopened = await peer.request("session/load", {
+                "cwd": str(self.root), "sessionId": child, "mcpServers": [],
+            })
+            options = {option["id"]: option["currentValue"] for option in reopened["configOptions"]}
+            self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
+            await peer.request("session/prompt", {"sessionId": child, "prompt": [{"type": "text", "text": "WRITE_TEST"}]})
+            request = self.model_requests[-1]
+            self.assertEqual(request["model"], "one")
+            self.assertIn("FORKED_PARENT_TURN", json.dumps(request["messages"]))
+            self.assertEqual([tool["function"]["name"] for tool in request["tools"]], ["read"])
+            self.assertFalse(self.write_path.exists())
+            self.assertTrue(parent.read_bytes() == parent_bytes)
+        finally:
+            await peer.close()
 
     async def test_profile_restore_keeps_native_selectors_and_enforces_tool_filter(self):
         profiles = self.root / "agent/agents"
