@@ -37,6 +37,7 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.write_path = self.root / "approved.txt"
         self.failures = 0
         self.model_gate = None
+        self.prompt_tokens = 23
         self.listener = await asyncio.start_server(self.model, "127.0.0.1", 0)
         port = self.listener.sockets[0].getsockname()[1]
         models = {"providers": {"fixture": {"baseUrl": f"http://127.0.0.1:{port}/v1", "api": "openai-completions",
@@ -46,7 +47,8 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 {"id": "two", "name": "Fixture Two", "reasoning": False, "input": ["text"],
                  "contextWindow": 32768, "maxTokens": 2048}]}}}
         (self.root / "agent/models.json").write_text(json.dumps(models))
-        (self.root / "agent/settings.json").write_text(json.dumps({"defaultProvider": "fixture", "defaultModel": "one"}))
+        (self.root / "agent/settings.json").write_text(json.dumps({"defaultProvider": "fixture", "defaultModel": "one",
+                                                                  "compaction": {"keepRecentTokens": 0}}))
         extension = self.root / "commands.py"
         extension.write_text('''import asyncio
 async def echo(args, ctx): return "echo:" + args
@@ -101,7 +103,9 @@ def setup(api):
                 delta, stop = {"role": "assistant", "content": "NATIVE_OK"}, "stop"
             def event(delta, finish):
                 return "data: " + json.dumps({"id": "fixture", "object": "chat.completion.chunk", "created": 0,
-                    "model": request.get("model", "one"), "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
+                    "model": request.get("model", "one"), "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                    **({"usage": {"prompt_tokens": self.prompt_tokens, "completion_tokens": 3,
+                                  "total_tokens": self.prompt_tokens + 3}} if finish else {})}) + "\n\n"
             body = (event(delta, None) + event({}, stop) + "data: [DONE]\n\n").encode()
             if self.failures:
                 self.failures -= 1
@@ -598,6 +602,115 @@ def setup(api):
         self.assertIn("NATIVE_OK", self.client.text())
         self.assertEqual(self.model_requests[-1]["model"], "two")
 
+    def context_updates(self, kind):
+        return [message["params"]["update"] for message in self.client.updates
+                if message.get("method") == "session/update" and message["params"]["update"]["sessionUpdate"] == kind]
+
+    async def test_manual_compaction_updates_context_and_preserves_native_history(self):
+        for text in ("Remember the first detail.", "Remember the next detail.", "Remember the latest detail."):
+            await self.prompt(text)
+        known = self.context_updates("usage_update")[-1]
+        self.assertEqual((known["used"], known["size"]), (26, 32768))
+        self.assertNotIn("cost", known)
+
+        before = len(self.model_requests)
+        self.assertEqual(await self.prompt("/compact Preserve only decisions"), {"stopReason": "end_turn"})
+        progress = self.context_updates("tool_call")[-1]
+        result = self.context_updates("tool_call_update")[-1]
+        self.assertEqual(result["toolCallId"], progress["toolCallId"])
+        self.assertEqual(result["_meta"]["aelix/compaction"]["state"], "completed")
+        self.assertGreater(result["_meta"]["aelix/compaction"]["tokensBefore"], 0)
+        summarized_request = json.dumps(self.model_requests[before:])
+        self.assertIn("Preserve only decisions", summarized_request)
+        self.assertNotIn("/compact", summarized_request)
+        self.assertEqual(self.context_updates("usage_update")[-1]["_meta"], {"aelix/contextUnknown": True})
+
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+        self.assertIn("Remember the first detail.", self.client.text())
+        self.assertEqual(self.context_updates("usage_update")[-1]["_meta"], {"aelix/contextUnknown": True})
+        await self.prompt("Continue after compaction")
+        self.assertEqual(self.context_updates("usage_update")[-1], known)
+
+    async def test_compaction_with_no_history_reports_no_work_without_a_model_request(self):
+        self.assertEqual(await self.prompt("/compact"), {"stopReason": "end_turn"})
+        self.assertEqual(self.model_requests, [])
+        self.assertIn("Nothing to compact", self.client.text())
+        progress = self.context_updates("tool_call_update")[-1]
+        self.assertEqual(progress["_meta"]["aelix/compaction"], {"reason": "manual", "state": "failed"})
+
+    async def test_compaction_deadline_reports_unknown_and_reopens_the_same_session_without_replay(self):
+        import sqlite3
+        await self.config("permission_mode", "yolo")
+        await self.prompt("Prior context must remain")
+        await self.prompt("More prior context")
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=["--command-timeout", "1"])
+        await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+        def session_file():
+            with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+                return db.execute("SELECT file FROM sessions WHERE id=?", (self.session,)).fetchone()[0]
+        saved_file = session_file()
+        self.assertTrue(Path(saved_file).is_file())
+        self.model_gate = asyncio.Event()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "compaction outcome is unknown") as caught:
+                await self.prompt("/compact", "deadline-compact")
+        finally:
+            self.model_gate.set()
+        self.assertEqual(json.loads(str(caught.exception))["code"], TURN_FAILED_AFTER_DISPATCH)
+        self.assertEqual(self.context_updates("tool_call_update")[-1]["_meta"]["aelix/compaction"]["state"], "unknown")
+        count = len(self.model_requests)
+        with self.assertRaisesRegex(RuntimeError, "unresolved outcome"):
+            await self.prompt("/compact", "deadline-compact")
+
+        profiles = self.root / "agent/agents"
+        profiles.mkdir(exist_ok=True)
+        (profiles / "current-owner.md").write_text(
+            "---\nname: current-owner\ndescription: Updated by the current owner\ntools: [read]\n---\nKeep the session."
+        )
+        contender = await AcpClient.start(self.root, EXECUTABLE)
+        resume_prompt = "Continue this same session"
+        resume_key = "retry-after-owner-releases"
+        try:
+            await contender.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
+            await contender.request("_aelix/manage", {"sessionId": self.session, "action": "agents/use",
+                                                     "arguments": {"name": "current-owner"}})
+            await contender.request("session/set_config_option", {"sessionId": self.session,
+                "configId": "permission_mode", "value": "default"})
+            with self.assertRaises(RuntimeError) as locked:
+                await self.prompt(resume_prompt, resume_key)
+            self.assertEqual(json.loads(str(locked.exception))["code"], SESSION_LOCKED)
+            with self.assertRaisesRegex(RuntimeError, "unresolved outcome"):
+                await self.prompt("/compact", "deadline-compact")
+            with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+                saved = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()[0])
+            self.assertEqual((saved["permission_mode"], saved["agent"]), ("default", "current-owner"))
+        finally:
+            await contender.close()
+
+        self.assertEqual(await self.prompt(resume_prompt, resume_key), {"stopReason": "end_turn"})
+        self.assertEqual(await self.prompt(resume_prompt, resume_key), {"stopReason": "end_turn"})
+        self.assertEqual(session_file(), saved_file)
+        self.assertEqual((await self.manage("permissions/get"))["mode"], "default")
+        self.assertEqual((await self.manage("resources/list"))["activeTools"], ["read"])
+        self.assertEqual(len(self.model_requests), count + 1)
+        self.assertIn("Prior context must remain", json.dumps(self.model_requests[-1]))
+
+    async def test_threshold_compaction_finishes_before_the_deduplicated_turn_returns(self):
+        await self.prompt("Earlier context")
+        await self.prompt("Recent context")
+        self.prompt_tokens = 18000
+        self.assertEqual(await self.prompt("Trigger threshold compaction", "threshold-turn"), {"stopReason": "end_turn"})
+        self.assertEqual(self.context_updates("tool_call")[-1]["_meta"]["aelix/compaction"],
+                         {"reason": "threshold", "state": "running"})
+        completed = self.context_updates("tool_call_update")[-1]["_meta"]["aelix/compaction"]
+        self.assertEqual((completed["reason"], completed["state"]), ("threshold", "completed"))
+        requests = len(self.model_requests)
+        await self.prompt("Trigger threshold compaction", "threshold-turn")
+        self.assertEqual(len(self.model_requests), requests)
+
     async def test_native_retry_settles_before_the_prompt_response(self):
         self.failures = 1
         self.assertEqual(await self.prompt("Respond after retry"), {"stopReason": "end_turn"})
@@ -902,6 +1015,87 @@ def setup(api):
             self.assertEqual(parent.read_bytes(), parent_bytes)
         finally:
             await reopened.close()
+
+    async def test_standard_head_fork_preserves_compaction_and_recovers_context_on_the_child(self):
+        await self.config("thinking_level", "high")
+        for text in ("Earlier parent context", "A second parent turn", "The latest parent detail"):
+            await self.prompt(text)
+        compacted = await self.prompt("/compact Keep the decisions", fork_head="compacted-head")
+        self.assertEqual(compacted, {"stopReason": "end_turn"})
+        self.assertEqual(self.context_updates("tool_call_update")[-1]["_meta"]["aelix/compaction"]["state"], "completed")
+
+        parent = self.native_session_file(self.session)
+        original = parent.read_bytes()
+        await self.client.close()
+        # Simulate an older ACP cache that disagrees with the compacted native history.
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            db.execute("UPDATE preferences SET value=json_set(value,'$.config.model',?,'$.config.thinking_level',?) "
+                       "WHERE session_id=?", ("fixture/two", "low", self.session))
+            db.commit()
+
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        resumed = await self.client.request("session/load", {
+            "sessionId": self.session, "cwd": str(self.root), "mcpServers": [],
+        })
+        options = {option["id"]: option["currentValue"] for option in resumed["configOptions"]}
+        self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
+        fork = await self.client.request("session/fork", self.fork_params("compacted-head"))
+        child_id = fork["sessionId"]
+        self.assertNotEqual(child_id, self.session)
+        child = self.native_session_file(child_id)
+        entries = [json.loads(line) for line in child.read_bytes().splitlines()]
+        self.assertEqual(Path(entries[0]["parentSession"]), parent)
+        self.assertTrue(any(entry["type"] == "compaction" for entry in entries))
+
+        await self.client.request("_aelix/manage", {"sessionId": child_id, "action": "sessions/close"})
+        self.client.updates.clear()
+        reopened = await self.client.request("session/load", {
+            "sessionId": child_id, "cwd": str(self.root), "mcpServers": [],
+        })
+        options = {option["id"]: option["currentValue"] for option in reopened["configOptions"]}
+        self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
+        self.assertEqual(self.context_updates("usage_update")[-1]["_meta"], {"aelix/contextUnknown": True})
+
+        result = await self.client.request("session/prompt", {
+            "sessionId": child_id, "prompt": [{"type": "text", "text": "Continue from the compacted fork"}],
+        })
+        self.assertEqual(result, {"stopReason": "end_turn"})
+        self.assertEqual(self.model_requests[-1]["model"], "one")
+        self.assertEqual(self.context_updates("usage_update")[-1],
+                         {"sessionUpdate": "usage_update", "used": 26, "size": 32768})
+        self.assertEqual(parent.read_bytes(), original)
+
+    async def test_compaction_stays_completed_when_its_fork_head_cannot_be_saved(self):
+        import sqlite3
+
+        for text in ("Earlier context", "More context"):
+            await self.prompt(text)
+        await self.prompt("Latest context", fork_head="before-compaction")
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            db.execute("""CREATE TRIGGER fail_fork_head_save BEFORE INSERT ON preferences
+                WHEN json_extract(NEW.value, '$.forkHead.id') = 'unsaved-head'
+                BEGIN SELECT json_extract('fixture malformed JSON', '$'); END""")
+            db.commit()
+            result = await self.prompt("/compact", key="compact-once", fork_head="unsaved-head")
+            self.assertEqual(result, {"stopReason": "end_turn"})
+            self.assertEqual(self.context_updates("tool_call_update")[-1]["_meta"]["aelix/compaction"]["state"],
+                             "completed")
+            self.assertNotIn("Request failed:", self.client.text())
+            self.assertEqual(db.execute("SELECT state FROM turns WHERE session_id=? AND request_key=?",
+                                        (self.session, "compact-once")).fetchone(), ("completed",))
+            db.execute("DROP TRIGGER fail_fork_head_save")
+            db.commit()
+
+        calls = len(self.model_requests)
+        self.assertEqual(await self.prompt("/compact", key="compact-once", fork_head="unsaved-head"), result)
+        self.assertEqual(len(self.model_requests), calls)
+        for anchor in ("unsaved-head", "before-compaction"):
+            with self.subTest(anchor=anchor), self.assertRaisesRegex(RuntimeError, "fork_head_changed"):
+                await self.client.request("session/fork", self.fork_params(anchor))
+
+        await self.prompt("Continue after the compacted turn", fork_head="current-head")
+        fork = await self.client.request("session/fork", self.fork_params("current-head"))
+        self.assertNotEqual(fork["sessionId"], self.session)
 
     async def test_standard_head_fork_refuses_an_older_live_adapter_lease(self):
         from aelix_acp.runtime.leases import acquire

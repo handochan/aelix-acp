@@ -283,6 +283,8 @@ class Server:
                     elif not session.fork_projection:
                         for update in await self.native_history(session):
                             await session.update(update)
+                    await session.publish_context_usage()
+                    session.save()
                 await session.publish_recovery_warnings()
             except BaseException:
                 self.sessions.pop(session_id, None)
@@ -372,6 +374,7 @@ class Server:
             if session.mutation_lock.locked():
                 raise ProtocolError("Session is busy", -32000)
             async with session.mutation_lock:
+                await session.recover_after_compaction()
                 result = await session.controls.set(config_id, value)
             return result if method == "session/set_config_option" else {}
         if method == "_aelix/capabilities":
@@ -387,7 +390,9 @@ class Server:
             async with session.mutation_lock:
                 if action == "sessions/close":
                     await session.close()
+                    self.sessions.pop(session.id, None)
                     return {}
+                await session.recover_after_compaction()
                 if action == "sessions/branch":
                     return await self.branch_session(session, arguments)
                 if action == "workspace/trust":

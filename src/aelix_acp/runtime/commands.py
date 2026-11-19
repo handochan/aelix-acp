@@ -51,6 +51,16 @@ PRIVATE_NATIVE_COMMANDS = frozenset({"aelix-acp-fork-head", SELECTOR_STARTUP_COM
 CLIENT_ACTIONS = {"login", "logout", "trust", "agents", "statusline", "hotkeys", "expand", "import"}
 
 
+def compact_instructions(text: str) -> str | None:
+    """Recognize only an explicit command at the start of the ACP text."""
+    if not text.startswith("/compact"):
+        return None
+    arguments = text[len("/compact"):]
+    if arguments and not arguments[0].isspace():
+        return None
+    return arguments
+
+
 def split_command(text: str) -> tuple[str, str] | None:
     # Leading whitespace and ordinary prose do not turn into control messages.
     if not text.startswith("/") or text.startswith("//"):
@@ -109,9 +119,6 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         session.state = await session.rpc("get_state")
         session.save()
         await output(session.state.get("sessionName") or "Unnamed session")
-    elif name == "compact":
-        await output(await session.rpc("compact", _timeout=getattr(session.server.args, "command_timeout", 600) or None,
-                                      **({"customInstructions": raw} if args else {})))
     elif name == "export":
         await output(await session.rpc("export_html", **({"outputPath": args} if args else {})))
     elif name == "copy":

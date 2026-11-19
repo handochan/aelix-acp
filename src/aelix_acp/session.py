@@ -13,6 +13,7 @@ import secrets
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -23,9 +24,11 @@ from .wire.errors import (ProtocolError, BackendError, after_dispatch, fork_head
 from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter
 from .runtime.controls import SessionControls, MODE_IDS
+from .runtime.context import SessionContext
 from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event,
-                            insert_history, begin_turn, finish_turn)
-from .runtime.commands import BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND, execute as execute_slash
+                            insert_history, begin_turn, finish_turn, recorded_turn)
+from .runtime.commands import (BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND,
+                               compact_instructions, execute as execute_slash)
 from .runtime.extensions import extension_reference
 from .runtime.leases import acquire as acquire_lease, lease_path
 from .runtime.subagents import SubagentTracker
@@ -130,6 +133,8 @@ class Session:
         self.stderr_task = None
         self.stderr_tail = bytearray()
         self.controls = SessionControls(self)
+        self.context = SessionContext(self)
+        self.compaction_recovery_needed = False
         self.mutation_lock = asyncio.Lock()
         self.restore_launch_preferences()
         self.analytics_project = Path(cwd) if (Path(cwd) / "analytics.json").is_file() else None
@@ -181,6 +186,10 @@ class Session:
         saved_agent = preferences.get("agent")
         resume_file = session_file if fork_source is None else fork_source["target"]
         self.restore_launch_preferences(preferences)
+        self.context.restore(preferences.get("lastContextMeasurement"))
+        # A reused object may have an older Yolo policy. Startup approval
+        # remains Ask until native confirms the just-read policy below.
+        self.controls.permission_mode = "default"
         self.stderr_tail = bytearray()  # A refusal from an earlier worker must not label this one.
         self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
         os.chmod(self.socket_dir, 0o700)
@@ -471,6 +480,7 @@ class Session:
              self.state.get("sessionName") or f"Aelix {self.server.args.profile}", int(time.time())))
         save_preferences(self.server.db, self.id, {"permission_mode": self.controls.permission_mode, "extensions": self.extra_extensions,
             "config": {option["id"]: option["currentValue"] for option in self.controls.options()},
+            "lastContextMeasurement": self.context.last_measurement,
             "agent": self.controls.capabilities.get("activeAgent"),
             "activeTools": self.active_tools,
             "forkProjection": self.fork_projection,
@@ -492,6 +502,46 @@ class Session:
         for warning in self.recovery_warnings:
             await self.update({"sessionUpdate": "agent_message_chunk", "content": {
                 "type": "text", "text": "Session recovery: " + warning["message"]}})
+
+    async def publish_context_usage(self):
+        try:
+            await self.context.publish_usage()
+        except (ProtocolError, ConnectionError):
+            # An auxiliary snapshot must not replace the outcome of the turn.
+            await self.context.invalidate_usage()
+
+    async def compact(self, instructions):
+        await self.context.start_compaction("manual")
+        try:
+            result = await self.rpc("compact", _timeout=getattr(self.server.args, "command_timeout", 600) or None,
+                                    **({"customInstructions": instructions} if instructions.strip() else {}))
+        except ProtocolError as error:
+            if error.code == -32007:
+                await self.close()
+                # Keep the accepted ACP id and mutation lock. The next distinct
+                # prompt reopens the saved native file without replaying work.
+                self.compaction_recovery_needed = True
+                self.server.sessions[self.id] = self
+                await self.context.invalidate_usage()
+                await self.context.finish_compaction("unknown")
+                raise after_dispatch(ProtocolError("Aelix compaction outcome is unknown after the deadline", -32603,
+                                                   error.data)) from error
+            await self.context.finish_compaction("failed")
+            await self.publish_context_usage()
+            if isinstance(error, BackendError) and error.data["command"] == "compact" and str(error) == "Nothing to compact":
+                # Pinned native reports this explicit no-op before starting the
+                # summary. Complete the ACP turn so the host keeps its prelude.
+                await self.update({"sessionUpdate": "agent_message_chunk",
+                                   "content": {"type": "text", "text": str(error)}})
+                return
+            raise
+        else:
+            await self.context.finish_compaction("completed", result)
+            await self.publish_context_usage()
+            with contextlib.suppress(ProtocolError, ConnectionError):
+                self.state = await self.rpc("get_state", _timeout=5)
+            if self.lease is not None:
+                self.record(self.save)
 
     async def rpc(self, command, *, _timeout=45, **kwargs):
         request_id = uuid.uuid4().hex
@@ -571,7 +621,9 @@ class Session:
 
     async def event(self, event):
         kind = event.get("type")
-        if kind == "message_start" and (event.get("message") or {}).get("role") == "assistant":
+        if kind in ("compaction_start", "compaction_end"):
+            await self.context.native_compaction_event(event)
+        elif kind == "message_start" and (event.get("message") or {}).get("role") == "assistant":
             self.failure = None
         elif kind == "message_update":
             update = event.get("assistantMessageEvent") or event.get("assistant_message_event") or {}
@@ -744,7 +796,7 @@ class Session:
             self.proc.stdin.write((json.dumps({"type": "extension_ui_response", "id": event.get("id"), **answer}) + "\n").encode())
             await self.proc.stdin.drain()
 
-    async def restart(self, *, extensions=None, trust_project=None, agents_enabled=None):
+    async def restart(self, *, extensions=None, trust_project=None, agents_enabled=None, preserve_history=False):
         if self.id in self.server.starting_ids:
             raise ProtocolError("Session is already starting", -32000)
         self.server.starting_ids.add(self.id)
@@ -753,9 +805,21 @@ class Session:
         held_lease = self.lease
         self.lease = None
         try:
-            filename = self.state.get("sessionFile")
-            if filename and not Path(filename).is_file():
-                filename = None
+            if preserve_history:
+                if held_lease is None:
+                    held_lease = acquire_lease(self.server.args.state_dir, self.id)
+                row = self.server.db.execute("SELECT cwd,profile,file FROM sessions WHERE id=?", (self.id,)).fetchone()
+                if not row or (row[0], row[1]) != (self.cwd, self.server.args.profile):
+                    raise ProtocolError("Saved session does not match this workspace and profile", -32004)
+                filename = row[2]
+                if not filename or not Path(filename).is_file():
+                    if load_preferences(self.server.db, self.id).get("backendMessageCount") != 0:
+                        raise ProtocolError("No persisted Aelix session file is available", -32004)
+                    filename = None
+            else:
+                filename = self.state.get("sessionFile")
+                if filename and not Path(filename).is_file():
+                    filename = None
             await self.close()
             self.lease, held_lease = held_lease, None
             self.tasks = set()
@@ -769,24 +833,51 @@ class Session:
                 self.trust_project = trust_project
             if agents_enabled is not None:
                 self.agents_enabled = agents_enabled
-            self.save()
+            if not preserve_history:
+                self.save()
             await self.start(filename)
             await self.commands()
+            if preserve_history:
+                await self.update({"sessionUpdate": "current_mode_update",
+                                   "currentModeId": self.controls.permission_mode})
+                await self.update({"sessionUpdate": "config_option_update", "configOptions": self.controls.options()})
+            await self.publish_context_usage()
+            self.save()
             await self.publish_recovery_warnings()
             self.server.sessions[self.id] = self
         except BaseException:
             if held_lease is not None:
-                self.lease, held_lease = held_lease, None
+                if preserve_history:
+                    held_lease.close()
+                else:
+                    self.lease = held_lease
             await self.close()
             raise
         finally:
             self.server.starting_ids.discard(self.id)
+
+    async def recover_after_compaction(self):
+        if not self.compaction_recovery_needed:
+            return
+        try:
+            await self.restart(preserve_history=True)
+        finally:
+            self.server.sessions[self.id] = self
+        self.compaction_recovery_needed = False
 
     async def prompt(self, blocks, request_key=None, fork_anchor=None):
         key = request_key or uuid.uuid4().hex
         if not isinstance(key, str) or not key or len(key) > 256:
             raise ProtocolError("Request id must be a non-empty string of at most 256 characters")
         fingerprint = hashlib.sha256(json.dumps(blocks, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+        if self.compaction_recovery_needed:
+            # Check old keys before recovery without claiming a new request.
+            prior = recorded_turn(self.server.db, self.id, key, fingerprint)
+            if prior is not None:
+                return prior
+            # A rejected reopen has not started this turn. Claim the key
+            # only after recovery holds the lease, with a fresh replay check.
+            await self.recover_after_compaction()
         prior = begin_turn(self.server.db, self.id, key, fingerprint)
         if prior is not None:
             return prior
@@ -827,9 +918,13 @@ class Session:
             if filename and not self.state.get("isStreaming", self.state.get("is_streaming", False)):
                 digest = await asyncio.to_thread(capture, filename)
                 self.fork_head = {"id": anchor, "sha256": digest}
-            self.save()
+            with self.server.db:
+                self.save()
         except (OSError, ProtocolError):
             pass
+        except sqlite3.Error as failure:
+            self.fork_head = None
+            print(f"[aelix-acp] Could not record the fork head: {type(failure).__name__}", file=sys.stderr)
 
     @staticmethod
     def record(write, *args):
@@ -878,10 +973,18 @@ class Session:
         text = "\n\n".join(parts)
         if not text.strip() and not images:
             raise ProtocolError("Prompt content is empty")
+        text_only = all(block.get("type") == "text" for block in blocks)
+        instructions = compact_instructions(text) if blocks[0]["type"] == "text" else None
+        if instructions is not None and (
+                not text_only or "[[AION_FILES]]" in map(str.strip, instructions.splitlines())):
+            raise ProtocolError("/compact accepts text instructions only")
         for block in blocks:
             append_event(self.server.db, self.id, {"sessionUpdate": "user_message_chunk", "content": block})
         self.server.db.commit()
-        if text.startswith("/") and all(block.get("type") == "text" for block in blocks):
+        if instructions is not None:
+            await self.compact(instructions.removeprefix(" "))
+            return {"stopReason": "end_turn"}
+        if text.startswith("/") and text_only:
             try:
                 handled, prepared = await execute_slash(self, text)
             except ProtocolError:
@@ -905,6 +1008,8 @@ class Session:
                 if self.cancelled:
                     await self.cancel()
                 await self.wait_until_idle()
+            await self.context.finish_compaction("failed")
+            await self.publish_context_usage()
             if self.failure and not self.cancelled:
                 raise ProtocolError(self.failure, -32603)
             self.save()
@@ -915,6 +1020,7 @@ class Session:
         finally:
             if self.done and not self.done.done():
                 self.done.cancel()
+            await self.context.finish_compaction("failed")
 
     async def wait_until_idle(self):
         # agent_end closes one provider attempt, not the enclosing prompt's
@@ -931,6 +1037,10 @@ class Session:
             await asyncio.sleep(0.05)
 
     async def cancel(self):
+        if self.context.manual_compaction:
+            # Classic RPC abort only interrupts native turns and retries.
+            # Keep waiting for the actual manual compaction outcome.
+            return
         self.cancelled = True
         self.tool_arrived.set()
         if self.management_task and not self.management_task.done():
