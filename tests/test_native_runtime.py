@@ -706,6 +706,38 @@ def setup(api):
                          {"sessionUpdate": "usage_update", "used": 26, "size": 32768})
         self.assertEqual(parent.read_bytes(), original)
 
+    async def test_compaction_stays_completed_when_its_fork_head_cannot_be_saved(self):
+        import sqlite3
+
+        for text in ("Earlier context", "More context"):
+            await self.prompt(text)
+        await self.prompt("Latest context", fork_head="before-compaction")
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            db.execute("""CREATE TRIGGER fail_fork_head_save BEFORE INSERT ON preferences
+                WHEN json_extract(NEW.value, '$.forkHead.id') = 'unsaved-head'
+                BEGIN SELECT json_extract('fixture malformed JSON', '$'); END""")
+            db.commit()
+            result = await self.prompt("/compact", key="compact-once", fork_head="unsaved-head")
+            self.assertEqual(result, {"stopReason": "end_turn"})
+            self.assertEqual(self.context_updates("tool_call_update")[-1]["_meta"]["aelix/compaction"]["state"],
+                             "completed")
+            self.assertNotIn("Request failed:", self.client.text())
+            self.assertEqual(db.execute("SELECT state FROM turns WHERE session_id=? AND request_key=?",
+                                        (self.session, "compact-once")).fetchone(), ("completed",))
+            db.execute("DROP TRIGGER fail_fork_head_save")
+            db.commit()
+
+        calls = len(self.model_requests)
+        self.assertEqual(await self.prompt("/compact", key="compact-once", fork_head="unsaved-head"), result)
+        self.assertEqual(len(self.model_requests), calls)
+        for anchor in ("unsaved-head", "before-compaction"):
+            with self.subTest(anchor=anchor), self.assertRaisesRegex(RuntimeError, "fork_head_changed"):
+                await self.client.request("session/fork", self.fork_params(anchor))
+
+        await self.prompt("Continue after the compacted turn", fork_head="current-head")
+        fork = await self.client.request("session/fork", self.fork_params("current-head"))
+        self.assertNotEqual(fork["sessionId"], self.session)
+
     async def test_standard_head_fork_refuses_an_older_live_adapter_lease(self):
         from aelix_acp.runtime.leases import acquire
 

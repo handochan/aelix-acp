@@ -13,6 +13,7 @@ import secrets
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -873,9 +874,13 @@ class Session:
             if filename and not self.state.get("isStreaming", self.state.get("is_streaming", False)):
                 digest = await asyncio.to_thread(capture, filename)
                 self.fork_head = {"id": anchor, "sha256": digest}
-            self.save()
+            with self.server.db:
+                self.save()
         except (OSError, ProtocolError):
             pass
+        except sqlite3.Error as failure:
+            self.fork_head = None
+            print(f"[aelix-acp] Could not record the fork head: {type(failure).__name__}", file=sys.stderr)
 
     @staticmethod
     def record(write, *args):
