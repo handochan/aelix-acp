@@ -181,6 +181,13 @@ def register_selector_startup(aelix, filename, nonce):
             if entry.type not in ("model_change", "thinking_level_change"):
                 await super().append_entry(entry)
 
+        async def append_to_leaf(self, build):
+            # Selector changes during profile restoration are temporary. Use
+            # the same filter as append_entry for native's atomic append API.
+            entry = build(await self.create_entry_id(), await self.get_leaf_id())
+            await self.append_entry(entry)
+            return entry
+
     expected = Path(filename)
     phase = "begin"
     bound_session = guarded = None
