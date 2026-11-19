@@ -933,6 +933,47 @@ def setup(api):
             await self.prompt("Respond")
         self.assertEqual(len(self.model_requests), requests)
 
+    async def test_standard_close_releases_the_native_writer_after_the_active_turn(self):
+        self.model_gate = asyncio.Event()
+        turn = asyncio.create_task(self.prompt("Persist this turn before closing"))
+        try:
+            async with asyncio.timeout(30):
+                while not self.model_requests:
+                    await asyncio.sleep(0.01)
+            with self.assertRaises(RuntimeError) as busy:
+                await self.client.request("session/close", {"sessionId": self.session})
+            self.assertEqual(json.loads(str(busy.exception))["code"], -32000)
+        finally:
+            self.model_gate.set()
+            await turn
+
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            native_file = db.execute("SELECT file FROM sessions WHERE id=?", (self.session,)).fetchone()[0]
+        saved = Path(native_file).read_bytes()
+        self.assertEqual(await self.client.request("session/close", {"sessionId": self.session}), {})
+        env = {key: os.environ[key] for key in ["PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"] if key in os.environ}
+        env.update(HOME=str(self.root / "home"), USERPROFILE=str(self.root / "home"),
+                   AELIX_CODING_AGENT_DIR=str(self.root / "agent"), AELIX_SETTINGS_PATH=str(self.root / "agent/settings.json"))
+        cli = await asyncio.create_subprocess_exec(
+            EXECUTABLE, "--mode", "rpc", "--offline", "--no-extensions", "--session", native_file,
+            cwd=self.root, env=env, stdin=-1, stdout=-1, stderr=-1,
+        )
+        try:
+            cli.stdin.write(b'{"id":"ready","type":"get_state"}\n')
+            await cli.stdin.drain()
+            response = json.loads(await asyncio.wait_for(cli.stdout.readline(), 10))
+            self.assertEqual((response["id"], response["success"]), ("ready", True))
+            self.assertEqual(Path(native_file).read_bytes(), saved)
+        finally:
+            cli.stdin.close()
+            try:
+                await asyncio.wait_for(cli.wait(), 10)
+            except TimeoutError:
+                cli.kill()
+                await cli.wait()
+        result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session})
+        self.assertIn("configOptions", result)
+
     async def test_native_lock_holder_refuses_load_with_a_structured_error(self):
         import sqlite3
         import subprocess

@@ -97,6 +97,14 @@ finish, another fork of that parent returns `-32006` with `kind:
 does not send an operation ID to recover an already successful ACP fork whose
 response the host lost before recording the new child ID.
 
+## Closing the native writer
+
+When `agentCapabilities.sessionCapabilities.close` is advertised, send
+`session/close` with the live ACP `sessionId`. ACP returns `{}` after the
+native worker exits and the session lease is released. The saved ACP
+identity, history, and native transcript are retained for `session/load`.
+An active session operation returns `-32000` without cancelling the turn.
+
 ## Management
 
 `_aelix/capabilities` takes `{sessionId}` and returns `version:1`, native
