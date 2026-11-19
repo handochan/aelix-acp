@@ -374,7 +374,20 @@ def setup(api):
         await self.prompt("Use the explicit native route")
         self.assertEqual([request["model"] for request in self.model_requests], ["one", "two"])
 
-    async def test_rejected_selector_restore_leaves_native_history_intact(self):
+    async def test_rejected_model_restore_leaves_native_history_intact(self):
+        await self.check_rejected_selector_restore("set_model", REJECT_RESTORED_MODEL)
+
+    async def test_rejected_thinking_restore_leaves_native_history_intact(self):
+        hook = """
+def setup(api):
+    async def reject(event, ctx):
+        if event.level == "high" and event.previous_level == "off":
+            raise RuntimeError("fixture refused selector restoration")
+    api.on("thinking_level_select", reject)
+"""
+        await self.check_rejected_selector_restore("set_thinking_level", hook)
+
+    async def check_rejected_selector_restore(self, command, script):
         profiles = self.root / "agent/agents"
         profiles.mkdir()
         (profiles / "restricted.md").write_text(SELECTOR_PROFILE, encoding="utf-8")
@@ -388,27 +401,20 @@ def setup(api):
         before = filename.read_bytes()
         load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
 
-        thinking_hook = """
-def setup(api):
-    async def reject(event, ctx):
-        if event.level == "high" and event.previous_level == "off":
-            raise RuntimeError("fixture refused selector restoration")
-    api.on("thinking_level_select", reject)
-"""
         hook = self.root / "reject-selector.py"
-        for command, script in (("set_model", REJECT_RESTORED_MODEL), ("set_thinking_level", thinking_hook)):
-            with self.subTest(command=command):
-                hook.write_text(script, encoding="utf-8")
-                self.client = await AcpClient.start(self.root, EXECUTABLE, extensions=[hook])
-                with self.assertRaisesRegex(RuntimeError, "fixture refused selector restoration") as rejected:
-                    await self.client.request("session/load", load)
-                self.assertEqual(json.loads(str(rejected.exception))["data"]["command"], command)
-                self.assertTrue(filename.read_bytes() == before, "rejected startup must preserve the native transcript")
-                with self.assertRaisesRegex(RuntimeError, "Unknown session"):
-                    await self.config("model", "fixture/two")
-                with self.assertRaisesRegex(RuntimeError, "Unknown session"):
-                    await self.prompt("WRITE_TEST")
-                await self.client.close()
+        hook.write_text(script, encoding="utf-8")
+        self.client = await AcpClient.start(self.root, EXECUTABLE, extensions=[hook])
+        try:
+            with self.assertRaisesRegex(RuntimeError, "fixture refused selector restoration") as rejected:
+                await self.client.request("session/load", load)
+            self.assertEqual(json.loads(str(rejected.exception))["data"]["command"], command)
+            self.assertTrue(filename.read_bytes() == before, "rejected startup must preserve the native transcript")
+            with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+                await self.config("model", "fixture/two")
+            with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+                await self.prompt("WRITE_TEST")
+        finally:
+            await self.client.close()
         self.assertFalse(self.write_path.exists())
         self.assertEqual(len(self.model_requests), 1)
 
