@@ -51,6 +51,9 @@ class SelectorStartupTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(SessionError) as error:
                 await session.get_storage().set_leaf_id(None)
             self.assertEqual(error.exception.code, "read_only")
+            with self.assertRaises(SessionError) as error:
+                await session.append_custom_entry("guarded-write")
+            self.assertEqual(error.exception.code, "read_only")
             await session.append_model_change("fixture", "two")
             await session.append_thinking_level_change("high")
             self.assertTrue(filename.read_bytes() == before)
