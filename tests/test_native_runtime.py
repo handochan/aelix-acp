@@ -1044,6 +1044,15 @@ def setup(api):
             prompt = {"sessionId": fork_id, "prompt": [{"type": "text", "text": "CHILD_NEXT"}]}
             await fork_client.request("session/prompt", prompt)
             self.assertIn("SECOND_PARENT_TURN", json.dumps(self.model_requests[-1]["messages"]))
+            child_bytes = child.read_bytes()
+            # A second ACP transport can see the shared index but cannot close
+            # the fork worker it does not own, even with the valid child ID.
+            with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+                await self.client.request("session/close", {"sessionId": fork_id})
+            self.assertEqual(await fork_client.request("session/close", {"sessionId": fork_id}), {})
+            self.assertIsNone(fork_client.process.returncode)
+            self.assertEqual(child.read_bytes(), child_bytes)
+            self.assertEqual(parent.read_bytes(), parent_bytes)
         finally:
             await fork_client.close()
         reopened = await AcpClient.start(self.root, EXECUTABLE)
