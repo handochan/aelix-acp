@@ -45,6 +45,8 @@ BUILTINS = {
     "quit": "Close this session's Aelix runtime",
 }
 ALIASES = {"rename": "name", "exit": "quit"}
+SELECTOR_STARTUP_COMMAND = "aelix-acp-selector-startup"
+PRIVATE_NATIVE_COMMANDS = frozenset({"aelix-acp-fork-head", SELECTOR_STARTUP_COMMAND})
 # `/clear` is deliberately absent: Studio reuses its own conversation view.
 CLIENT_ACTIONS = {"login", "logout", "trust", "agents", "statusline", "hotkeys", "expand", "import"}
 
@@ -82,6 +84,8 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
     if not parsed:
         return False, None
     name, raw = parsed
+    if name in PRIVATE_NATIVE_COMMANDS:
+        raise ProtocolError(f"Unknown slash command: /{name}", -32601)
     args = raw.strip()
 
     async def output(value):

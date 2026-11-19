@@ -170,12 +170,61 @@ async def fork_native_head(source, cwd):
         target_lock.release()
 
 
+def register_selector_startup(aelix, filename, nonce):
+    from aelix_agent_core.session.jsonl_storage import JsonlSessionStorage
+    from aelix_agent_core.session.read_only import ReadOnlySessionStorage
+
+    class SelectorStartupStorage(ReadOnlySessionStorage):
+        """Run native selector hooks while keeping temporary selections off disk."""
+
+        async def append_entry(self, entry):
+            if entry.type not in ("model_change", "thinking_level_change"):
+                await super().append_entry(entry)
+
+    expected = Path(filename)
+    phase = "begin"
+    bound_session = guarded = None
+
+    async def selector_startup(args, ctx):
+        nonlocal phase, bound_session, guarded
+        if not phase or not hmac.compare_digest(args.encode(), f"{phase} {nonce}".encode()):
+            raise ValueError("Selector startup requires its one-time authorization")
+        session = ctx.session_manager.get_session()
+        if session is None or not session.session_file or Path(session.session_file).resolve(strict=True) != expected:
+            raise ValueError("Selector startup requires the bound native session")
+        storage = session.get_storage()
+        if phase == "begin":
+            if type(storage) is not JsonlSessionStorage:
+                raise ValueError("Selector startup requires writable native JSONL storage")
+            # The native worker retains its writer lock. Use the pinned
+            # Session storage slot; never replace, truncate or reopen the file.
+            bound_session, guarded = session, SelectorStartupStorage(storage)
+            session._storage = guarded
+            # A fork worker rebuilds its extension runtime when binding the
+            # child. Retain the authorization until the matching file is
+            # protected, then make later extension reloads ineligible.
+            os.environ.pop("AELIX_ACP_SELECTOR_STARTUP_FILE", None)
+            phase = "finish"
+        else:
+            if session is not bound_session or storage is not guarded:
+                raise ValueError("The guarded native session changed during startup")
+            session._storage = guarded.inner
+            phase = None
+            bound_session = guarded = None
+        return "selector-startup-ok"
+
+    aelix.register_command("aelix-acp-selector-startup", description="Private ACP startup guard", handler=selector_startup)
+
+
 def setup(aelix):
     aelix.on("tool_call", before_tool)
     ready_file = os.environ.get("AELIX_ACP_READY_FILE")
     nonce = os.environ.get("AELIX_ACP_NONCE")
     if not ready_file or not nonce:
         raise RuntimeError("ACP bridge must be launched by aelix-acp")
+    selector_file = os.environ.get("AELIX_ACP_SELECTOR_STARTUP_FILE")
+    if selector_file is not None:
+        register_selector_startup(aelix, selector_file, nonce)
     fork_source = os.environ.pop("AELIX_ACP_FORK_SOURCE", None)
     if fork_source is not None:
         source = json.loads(fork_source)
