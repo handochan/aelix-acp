@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -11,6 +12,17 @@ from support import AcpClient
 from aelix_acp.wire.errors import SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH
 
 EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
+SELECTOR_PROFILE = (
+    "---\nname: restricted\ndescription: Restricted\nprovider: fixture\nmodel: two\n"
+    "thinking: 'off'\ntools: [read]\n---\nRead only.\n"
+)
+REJECT_RESTORED_MODEL = """
+def setup(api):
+    async def reject(event, ctx):
+        if event.model.id == "one" and getattr(event.previous_model, "id", None) == "two":
+            raise RuntimeError("fixture refused selector restoration")
+    api.on("model_select", reject)
+"""
 
 
 @unittest.skipUnless(EXECUTABLE, "Set AELIX_ACP_TEST_AELIX to a runtime-control-v1 Aelix executable")
@@ -21,6 +33,7 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         (self.root / "home").mkdir()
         (self.root / "agent").mkdir()
         self.model_requests = []
+        self.model_authorizations = []
         self.write_path = self.root / "approved.txt"
         self.failures = 0
         self.model_gate = None
@@ -64,6 +77,9 @@ def setup(api):
             length = int(next(line.split(":", 1)[1].strip() for line in header.split("\r\n") if line.lower().startswith("content-length:")))
             request = json.loads(await reader.readexactly(length))
             self.model_requests.append(request)
+            self.model_authorizations.append(next(
+                (line.split(":", 1)[1].strip() for line in header.split("\r\n")
+                 if line.lower().startswith("authorization:")), None))
             if self.model_gate is not None:
                 await self.model_gate.wait()
             messages = request.get("messages", [])
@@ -236,6 +252,326 @@ def setup(api):
         self.assertEqual(result["modes"]["currentModeId"], "yolo")
         self.assertEqual(result["models"]["currentModelId"], "fixture/two")
 
+    async def test_native_file_selectors_win_over_saved_adapter_preferences(self):
+        await self.config("thinking_level", "low")
+        await self.prompt("Seed the native session")
+        await self.client.close()
+
+        state_dir = self.root / "state/sessions.sqlite3"
+        with contextlib.closing(sqlite3.connect(state_dir)) as db:
+            filename, = db.execute("SELECT file FROM sessions WHERE id=?", (self.session,)).fetchone()
+            saved, = db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()
+        self.assertEqual(json.loads(saved)["config"]["model"], "fixture/one")
+        self.assertEqual(json.loads(saved)["config"]["thinking_level"], "low")
+
+        models_path = self.root / "agent/models.json"
+        models = json.loads(models_path.read_text(encoding="utf-8"))
+        models["providers"]["fixture"]["models"][1]["reasoning"] = True
+        models_path.write_text(json.dumps(models), encoding="utf-8")
+
+        env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP") if key in os.environ}
+        env.update(HOME=str(self.root / "home"), USERPROFILE=str(self.root / "home"),
+                   AELIX_CODING_AGENT_DIR=str(self.root / "agent"),
+                   AELIX_SETTINGS_PATH=str(self.root / "agent/settings.json"))
+        native = await asyncio.create_subprocess_exec(
+            EXECUTABLE, "--mode", "rpc", "--offline", "--no-extensions", "--session", filename,
+            cwd=self.root, env=env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+        try:
+            for request in (
+                {"id": "model", "type": "set_model", "provider": "fixture", "modelId": "two"},
+                {"id": "level", "type": "set_thinking_level", "level": "high"},
+            ):
+                native.stdin.write((json.dumps(request) + "\n").encode())
+                await native.stdin.drain()
+                async with asyncio.timeout(30):
+                    while line := await native.stdout.readline():
+                        response = json.loads(line)
+                        if response.get("id") == request["id"] and response.get("type") == "response":
+                            self.assertTrue(response["success"], response)
+                            break
+                    else:
+                        self.fail(f"Native RPC closed while handling {request['type']}")
+        finally:
+            native.stdin.close()
+            try:
+                await asyncio.wait_for(native.wait(), 10)
+            except TimeoutError:
+                native.kill()
+                await native.wait()
+        self.assertEqual(native.returncode, 0)
+
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        restored = await self.client.request(
+            "session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}, timeout=120)
+        options = {option["id"]: option["currentValue"] for option in restored["configOptions"]}
+        self.assertEqual((options["model"], options["thinking_level"]), ("fixture/two", "high"))
+        self.assertEqual(await self.prompt("Use the restored model"), {"stopReason": "end_turn"})
+        self.assertEqual([request["model"] for request in self.model_requests], ["one", "two"])
+        with contextlib.closing(sqlite3.connect(state_dir)) as db:
+            persisted, = db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()
+        config = json.loads(persisted)["config"]
+        self.assertEqual((config["model"], config["thinking_level"]), ("fixture/two", "high"))
+
+    async def test_launch_model_is_only_a_default_for_sessions(self):
+        launch = ["--provider", "fixture", "--model", "two"]
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=launch)
+        new = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []})
+        self.session = new["sessionId"]
+        self.assertEqual(new["models"]["currentModelId"], "fixture/two")
+        await self.config("model", "fixture/one")
+        await self.config("thinking_level", "high")
+        await self.prompt("Use the explicit selector")
+        await self.client.close()
+
+        self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=launch)
+        restored = await self.client.request("session/load", {
+            "cwd": str(self.root), "sessionId": self.session, "mcpServers": [],
+        })
+        options = {option["id"]: option["currentValue"] for option in restored["configOptions"]}
+        self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
+        await self.prompt("Use the resumed selectors")
+        self.assertEqual([request["model"] for request in self.model_requests], ["one", "one"])
+
+    async def test_route_free_startup_profile_keeps_session_selectors(self):
+        profiles = self.root / "agent/agents"
+        profiles.mkdir()
+        profile = profiles / "read-only.md"
+        profile.write_text("---\nname: read-only\ndescription: Read only\ntools: [read]\n---\nRead only.\n",
+                           encoding="utf-8")
+        launch = ["--provider", "fixture", "--model", "two"]
+        for prefix in (["--agent", "read-only"], ["--agent-file", str(profile)]):
+            with self.subTest(prefix=prefix[0]):
+                await self.client.close()
+                self.client = await AcpClient.start(self.root, EXECUTABLE, prefix=prefix, adapter_args=launch)
+                created = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []})
+                self.session = created["sessionId"]
+                self.assertEqual(created["models"]["currentModelId"], "fixture/two")
+                await self.config("model", "fixture/one")
+                await self.config("thinking_level", "high")
+                await self.prompt("Seed with the selected model")
+                await self.client.close()
+
+                self.client = await AcpClient.start(self.root, EXECUTABLE, prefix=prefix, adapter_args=launch)
+                restored = await self.client.request("session/load", {
+                    "cwd": str(self.root), "sessionId": self.session, "mcpServers": [],
+                })
+                options = {option["id"]: option["currentValue"] for option in restored["configOptions"]}
+                self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
+                self.assertEqual((await self.manage("resources/list"))["activeTools"], ["read"])
+                await self.prompt("Use the resumed model")
+                self.assertEqual(self.model_requests[-1]["model"], "one")
+
+    async def test_explicit_native_route_is_preserved_on_resume(self):
+        await self.prompt("Record the first model")
+        await self.client.close()
+        self.client = await AcpClient.start(
+            self.root, EXECUTABLE, prefix=["--provider", "fixture", "--model", "two"])
+        restored = await self.client.request("session/load", {
+            "cwd": str(self.root), "sessionId": self.session, "mcpServers": [],
+        })
+        self.assertEqual(restored["models"]["currentModelId"], "fixture/two")
+        await self.prompt("Use the explicit native route")
+        self.assertEqual([request["model"] for request in self.model_requests], ["one", "two"])
+
+    async def test_rejected_model_restore_leaves_native_history_intact(self):
+        await self.check_rejected_selector_restore("set_model", REJECT_RESTORED_MODEL)
+
+    async def test_rejected_thinking_restore_leaves_native_history_intact(self):
+        hook = """
+def setup(api):
+    async def reject(event, ctx):
+        if event.level == "high" and event.previous_level == "off":
+            raise RuntimeError("fixture refused selector restoration")
+    api.on("thinking_level_select", reject)
+"""
+        await self.check_rejected_selector_restore("set_thinking_level", hook)
+
+    async def check_rejected_selector_restore(self, command, script):
+        profiles = self.root / "agent/agents"
+        profiles.mkdir()
+        (profiles / "restricted.md").write_text(SELECTOR_PROFILE, encoding="utf-8")
+        await self.manage("agents/use", {"name": "restricted"})
+        await self.config("model", "fixture/one")
+        await self.config("thinking_level", "high")
+        await self.config("permission_mode", "yolo")
+        await self.prompt("Seed the on-disk selection")
+        await self.client.close()
+        filename = self.native_session_file(self.session)
+        before = filename.read_bytes()
+        load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+
+        hook = self.root / "reject-selector.py"
+        hook.write_text(script, encoding="utf-8")
+        self.client = await AcpClient.start(self.root, EXECUTABLE, extensions=[hook])
+        try:
+            with self.assertRaisesRegex(RuntimeError, "fixture refused selector restoration") as rejected:
+                await self.client.request("session/load", load)
+            self.assertEqual(json.loads(str(rejected.exception))["data"]["command"], command)
+            self.assertTrue(filename.read_bytes() == before, "rejected startup must preserve the native transcript")
+            with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+                await self.config("model", "fixture/two")
+            with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+                await self.prompt("WRITE_TEST")
+        finally:
+            await self.client.close()
+        self.assertFalse(self.write_path.exists())
+        self.assertEqual(len(self.model_requests), 1)
+
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        restored = await self.client.request("session/load", load)
+        options = {option["id"]: option["currentValue"] for option in restored["configOptions"]}
+        self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
+        self.assertTrue(filename.read_bytes() == before, "automatic startup must not append selector entries")
+        advertised = [
+            option["name"] for frame in self.client.updates
+            for option in frame.get("params", {}).get("update", {}).get("availableCommands", [])
+        ]
+        self.assertTrue(advertised)
+        self.assertNotIn("aelix-acp-selector-startup", advertised)
+        for command in ("aelix-acp-selector-startup", "aelix-acp-fork-head"):
+            with self.assertRaisesRegex(RuntimeError, "Unknown slash command") as private:
+                await self.prompt(f"/{command} begin forged")
+            self.assertEqual(json.loads(str(private.exception))["code"], -32601)
+        await self.prompt("Retry after removing the blocking hook")
+        self.assertEqual([request["model"] for request in self.model_requests], ["one", "one"])
+        await self.config("thinking_level", "medium")
+        last = json.loads(filename.read_bytes().splitlines()[-1])
+        self.assertEqual((last["type"], last["thinkingLevel"]), ("thinking_level_change", "medium"))
+
+    async def test_standard_head_fork_inherits_selectors_and_restores_profile_restrictions(self):
+        profiles = self.root / "agent/agents"
+        profiles.mkdir()
+        (profiles / "restricted.md").write_text(SELECTOR_PROFILE, encoding="utf-8")
+        await self.manage("agents/use", {"name": "restricted"})
+        await self.config("model", "fixture/one")
+        await self.config("thinking_level", "high")
+        await self.config("permission_mode", "yolo")
+        await self.prompt("FORKED_PARENT_TURN", fork_head="selectors")
+        parent = self.native_session_file(self.session)
+        parent_bytes = parent.read_bytes()
+
+        launch = ["--provider", "fixture", "--model", "two"]
+        hook = self.root / "reject-fork-selector.py"
+        hook.write_text(REJECT_RESTORED_MODEL, encoding="utf-8")
+        rejected_peer = await AcpClient.start(self.root, EXECUTABLE, adapter_args=launch, extensions=[hook])
+        try:
+            with self.assertRaisesRegex(RuntimeError, "fixture refused selector restoration"):
+                await rejected_peer.request("session/fork", self.fork_params("selectors"))
+            self.assertEqual(set(parent.parent.glob("*.jsonl")), {parent})
+            visible = await rejected_peer.request("session/list", {"cwd": str(self.root)})
+            self.assertEqual([row["sessionId"] for row in visible["sessions"]], [self.session])
+        finally:
+            await rejected_peer.close()
+
+        peer = await AcpClient.start(self.root, EXECUTABLE, adapter_args=launch)
+        try:
+            forked = await peer.request("session/fork", self.fork_params("selectors"))
+            child = forked["sessionId"]
+            options = {option["id"]: option["currentValue"] for option in forked["configOptions"]}
+            self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
+            self.assertEqual(forked["modes"]["currentModeId"], "yolo")
+        finally:
+            await peer.close()
+
+        peer = await AcpClient.start(self.root, EXECUTABLE, adapter_args=launch)
+        try:
+            reopened = await peer.request("session/load", {
+                "cwd": str(self.root), "sessionId": child, "mcpServers": [],
+            })
+            options = {option["id"]: option["currentValue"] for option in reopened["configOptions"]}
+            self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
+            await peer.request("session/prompt", {"sessionId": child, "prompt": [{"type": "text", "text": "WRITE_TEST"}]})
+            request = self.model_requests[-1]
+            self.assertEqual(request["model"], "one")
+            self.assertIn("FORKED_PARENT_TURN", json.dumps(request["messages"]))
+            self.assertEqual([tool["function"]["name"] for tool in request["tools"]], ["read"])
+            self.assertFalse(self.write_path.exists())
+            self.assertTrue(parent.read_bytes() == parent_bytes)
+        finally:
+            await peer.close()
+
+    async def test_profile_restore_keeps_native_selectors_and_enforces_tool_filter(self):
+        profiles = self.root / "agent/agents"
+        profiles.mkdir()
+        (profiles / "restricted.md").write_text(SELECTOR_PROFILE, encoding="utf-8")
+        await self.manage("agents/use", {"name": "restricted"})
+        await self.config("model", "fixture/one")
+        await self.config("thinking_level", "high")
+        await self.config("permission_mode", "yolo")
+        await self.prompt("Seed the restricted session")
+        await self.client.close()
+
+        state_dir = self.root / "state/sessions.sqlite3"
+        with contextlib.closing(sqlite3.connect(state_dir)) as db, db:
+            saved, = db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()
+            preferences = json.loads(saved)
+            self.assertEqual(preferences["agent"], "restricted")
+            preferences["config"].update(model="fixture/two", thinking_level="off")
+            db.execute("UPDATE preferences SET value=? WHERE session_id=?", (json.dumps(preferences), self.session))
+
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        restored = await self.client.request("session/load", {
+            "cwd": str(self.root), "sessionId": self.session, "mcpServers": [],
+        })
+        options = {option["id"]: option["currentValue"] for option in restored["configOptions"]}
+        self.assertEqual((options["model"], options["thinking_level"]), ("fixture/one", "high"))
+        self.assertEqual(restored["modes"]["currentModeId"], "yolo")
+        self.assertEqual((await self.manage("resources/list"))["activeTools"], ["read"])
+        # The provider deliberately proposes a write even though it was not
+        # offered this tool. Restored Yolo must not bypass the profile filter.
+        await self.prompt("WRITE_TEST")
+        self.assertTrue(all(request["model"] == "one" for request in self.model_requests))
+        self.assertGreaterEqual(len(self.model_requests), 2)
+        self.assertEqual([tool["function"]["name"] for tool in self.model_requests[-1]["tools"]], ["read"])
+        self.assertFalse(self.write_path.exists())
+        with contextlib.closing(sqlite3.connect(state_dir)) as db:
+            saved, = db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()
+        config = json.loads(saved)["config"]
+        self.assertEqual((config["model"], config["thinking_level"]), ("fixture/one", "high"))
+
+    async def test_resume_does_not_rebind_a_typed_key_to_another_provider(self):
+        await self.client.close()
+        models_path = self.root / "agent/models.json"
+        models = json.loads(models_path.read_text(encoding="utf-8"))
+        models["providers"]["alternate"] = {
+            **models["providers"]["fixture"], "apiKey": "synthetic-alternate-key",
+            "models": [{"id": "alternate-model", "name": "Alternate", "reasoning": False,
+                        "input": ["text"], "contextWindow": 32768, "maxTokens": 2048}],
+        }
+        models_path.write_text(json.dumps(models), encoding="utf-8")
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        created = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []})
+        self.session = created["sessionId"]
+        await self.config("model", "alternate/alternate-model")
+        await self.prompt("Record the alternate provider in history")
+        await self.client.close()
+        (self.root / "agent/settings.json").write_text(json.dumps({
+            "defaultProvider": "alternate", "defaultModel": "alternate-model",
+        }), encoding="utf-8")
+
+        typed_key = "synthetic-typed-launch-key"
+        launch = ["--provider", "fixture", "--model", "one"]
+        profiles = self.root / "agent/agents"
+        profiles.mkdir()
+        (profiles / "read-only.md").write_text(
+            "---\nname: read-only\ndescription: Read only\ntools: [read]\n---\nRead only.\n", encoding="utf-8")
+        self.client = await AcpClient.start(
+            self.root, EXECUTABLE, prefix=["--agent", "read-only", "--api-key", typed_key], adapter_args=launch)
+        restored = await self.client.request("session/load", {
+            "cwd": str(self.root), "sessionId": self.session, "mcpServers": [],
+        })
+        self.assertEqual(restored["models"]["currentModelId"], "fixture/one")
+        self.assertNotIn(typed_key, json.dumps(restored))
+        self.assertEqual((await self.manage("resources/list"))["activeTools"], ["read"])
+        await self.prompt("Use the credential-bound launch route")
+        await self.config("model", "alternate/alternate-model")
+        await self.prompt("Select the other provider")
+        self.assertEqual([request["model"] for request in self.model_requests], ["alternate-model", "one", "alternate-model"])
+        self.assertEqual(self.model_authorizations, [
+            "Bearer synthetic-alternate-key", f"Bearer {typed_key}", "Bearer synthetic-alternate-key",
+        ])
+
     async def test_live_session_lease_blocks_other_adapters_and_close_preserves_history(self):
         other = await AcpClient.start(self.root, EXECUTABLE)
         try:
@@ -378,6 +714,10 @@ def setup(api):
         # What a host replays from its saved preference must not reach a session.
         with self.assertRaises(RuntimeError):
             await self.client.request("session/set_mode", {"sessionId": self.session, "modeId": "yolo"})
+        with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+            await self.config("model", "fixture/two")
+        with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+            await self.manage("agents/use", {"name": "--none"})
         with self.assertRaises(RuntimeError):
             await self.prompt("WRITE_TEST")
         self.assertFalse(self.write_path.exists())
