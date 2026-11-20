@@ -80,17 +80,24 @@ class ManagedExtension:
         path = item.get("path")
         return isinstance(path, str) and same_extension(self.package, path)
 
-    def state(self, resources, selections, enabled):
+    def worker_reference(self, socket_dir, index):
+        if self.package is not None:
+            return self.reference
+        return str(Path(socket_dir) / f"managed-module-{index}.py")
+
+    def state(self, resources, selections, enabled, worker_reference):
         registered = any(
-            row.get("name") == (self.plugin_id or self.reference)
+            (isinstance(row.get("name"), str) and same_extension(self.plugin_id or worker_reference, row["name"]))
             or (self.package is not None and isinstance(row.get("source"), str)
                 and same_extension(self.package, row["source"]))
             for row in resources["extensions"]
         )
         if not enabled:
-            return ("error", "unexpectedly_loaded") if registered else ("disabled", None)
-        if any(isinstance(row.get("source"), str) and self.overlaps(row["source"])
-               for row in resources["extensionErrors"]):
+            alias_registered = any(row.get("name") == self.reference for row in resources["extensions"])
+            return ("error", "unexpectedly_loaded") if registered or alias_registered else ("disabled", None)
+        if any(isinstance(row.get("source"), str) and (
+            same_extension(worker_reference, row["source"]) or self.overlaps(row["source"])
+        ) for row in resources["extensionErrors"]):
             return "error", "load_failed"
         if not registered:
             return "error", "not_registered"
@@ -118,6 +125,7 @@ class ManagedChange:
 class ManagedExtensions:
     generation: str
     entries: tuple[ManagedExtension, ...]
+    site_packages: str | None
 
     def alias(self, reference):
         matches = [item for item in self.entries if item.matches(reference)]
@@ -150,8 +158,21 @@ class ManagedExtensions:
                 overrides.setdefault(entry.id, "on")
         return remaining, overrides
 
-    def arguments(self, overrides):
-        return [item.reference for item in self.entries if item.enabled(overrides)]
+    def arguments(self, overrides, socket_dir):
+        references = []
+        for index, item in enumerate(self.entries):
+            if not item.enabled(overrides):
+                continue
+            reference = item.worker_reference(socket_dir, index)
+            if item.package is None:
+                # Native -e accepts absolute files without interpreting the
+                # module name as a path in the conversation's cwd.
+                shim = Path(__file__).with_name("managed_module.py").read_text(encoding="utf-8")
+                Path(reference).write_text(
+                    shim + f"\nsetup = load_factory({self.site_packages!r}, {item.reference!r})\n", encoding="utf-8",
+                )
+            references.append(reference)
+        return references
 
     async def status(self, session):
         has_packs = any(item.package and item.enabled(session.extension_overrides) for item in self.entries)
@@ -163,9 +184,9 @@ class ManagedExtensions:
         rows = []
         overrides = session.extension_overrides
         installed = {item.id for item in self.entries}
-        for item in self.entries:
+        for index, item in enumerate(self.entries):
             enabled = item.enabled(overrides)
-            state, reason = item.state(resources, selections, enabled)
+            state, reason = item.state(resources, selections, enabled, item.worker_reference(session.socket_dir, index))
             rows.append({"extensionId": item.id, "defaultEnabled": item.default_enabled,
                          "override": overrides.get(item.id, "inherit"), "desiredEnabled": enabled,
                          "state": state, "reason": reason})
@@ -174,12 +195,13 @@ class ManagedExtensions:
                          "desiredEnabled": False, "state": "unavailable", "reason": "not_installed"})
         return {"generation": self.generation, "extensions": rows}
 
-    async def verify_start(self, session, change):
+    async def verify_start(self, session, change, *, recovering=False):
         snapshot = await self.status(session)
         for row in snapshot["extensions"]:
-            if row["reason"] == "unexpectedly_loaded" or (
-                change is not None and row["extensionId"] == change.extension_id and row["state"] == "error"
-            ):
+            if row["state"] != "error":
+                continue
+            if (row["reason"] == "unexpectedly_loaded" or recovering
+                    or (change is not None and row["extensionId"] == change.extension_id)):
                 raise ProtocolError(
                     "The worker did not apply the managed extension selection", -32004,
                     {"kind": "managed_extension_not_applied", "extensionId": row["extensionId"],
@@ -281,10 +303,20 @@ def read_launch(path):
         if len(raw) > MAX_INPUT:
             raise ValueError("snapshot exceeds 1 MiB")
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
-        if not isinstance(value, dict) or set(value) != {"version", "generation", "extensions"}:
-            raise ValueError("expected version, generation, and extensions")
+        fields = {"version", "generation", "extensions"}
+        if not isinstance(value, dict) or set(value) not in (fields, fields | {"sitePackages"}):
+            raise ValueError("expected version, generation, extensions, and optional sitePackages")
         if type(value["version"]) is not int or value["version"] != VERSION or not valid_id(value["generation"]):
             raise ValueError("unsupported version or invalid generation")
-        return ManagedExtensions(value["generation"], _read_entries(value["extensions"]))
+        entries = _read_entries(value["extensions"])
+        site_packages = None
+        if "sitePackages" in value:
+            site = value["sitePackages"]
+            if not isinstance(site, str) or not Path(site).is_absolute() or not Path(site).is_dir():
+                raise ValueError("sitePackages must be an absolute generation site-packages directory")
+            site_packages = str(Path(site).resolve(strict=True))
+        if site_packages is None and any(item.package is None for item in entries):
+            raise ValueError("sitePackages is required for managed modules")
+        return ManagedExtensions(value["generation"], entries, site_packages)
     except (ValueError, OSError, RuntimeError) as error:
         raise argparse.ArgumentTypeError(f"invalid managed extensions snapshot: {error}") from None

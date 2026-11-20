@@ -17,6 +17,7 @@ includes all verified entries, including those disabled by default.
 {
   "version": 1,
   "generation": "g00000012-feed",
+  "sitePackages": "/studio/runtime/generations/g00000012-feed/venv/lib/python3.12/site-packages",
   "extensions": [
     {
       "id": "aelix-notes:notes",
@@ -41,11 +42,16 @@ includes all verified entries, including those disabled by default.
   stable ID for the group and list all of its entry-point aliases.
 - `defaultEnabled` is a boolean. Use `true` for a verified installation with
   no user preference. `extensions` may be empty.
+- `sitePackages` is the absolute import directory of the leased generation.
+  It is required whenever the snapshot contains a module entry.
 - A module entry has exactly `id`, `defaultEnabled`, and `reference`. Its
   reference is `module.path:factory`. Use `:setup` explicitly for bare module
   entry points. Module components and the factory are ASCII Python
   identifiers. A single-letter module before the colon is drive-relative
-  on Windows. This loads Python code using native `-e`.
+  on Windows. ACP passes a private absolute loader file to native `-e`.
+  The loader resolves the named module from `sitePackages`, including
+  when the workspace is trusted and when native reloads resources.
+  It rejects a cached module from another location.
 - A pack entry also has `entryPoints`, a nonempty array of explicit
   `module.path:factory` references. Its reference names an absolute wrapper
   directory with exactly one child directory containing
@@ -60,7 +66,8 @@ includes all verified entries, including those disabled by default.
   the individual pack inputs have been verified.
 - The launcher attaches the generation's site-packages to the **native**
   worker's import path and holds the generation lease for the lifetime of
-  the adapter. Pass each managed selection through the snapshot only.
+  the adapter. Use the same directory for `sitePackages` and the worker's
+  generation import path. Pass each managed selection through the snapshot only.
   Operator `--extension` arguments remain available for separate trusted
   extensions. ACP rejects overlapping operator references before launch.
   A known legacy session reference migrates to an `on` override unless
@@ -94,6 +101,10 @@ already installed. The action selects it for the conversation. Managed
 `/extension enable TARGET` and `/extension disable TARGET` share the setter.
 They prefer the exact stable ID and accept an unambiguous reference,
 entry-point alias or pack ID. Use the structured `set` request to restore inheritance.
+With a snapshot, `enable` through either the slash command or
+`extensions/action` refuses a target outside the snapshot before requesting
+permission. This keeps new session loads within the launcher's verified
+catalog. Existing legacy session entries can still be disabled.
 
 Both actions return the same shape.
 
@@ -122,8 +133,9 @@ report actual registration and on-demand activation. An active row describes
 the extension registration. Its individual capabilities and MCP connections
 remain governed by native.
 
-Invalid arguments return `-32602`. Busy or rejected requests use the existing
-ACP errors (`-32000` or `-32003`). `-32004` carries a `data.kind` of
+Invalid arguments return `-32602`. An ambiguous managed alias returns
+`-32602` with `data.kind: "managed_extension_ambiguous"`. Busy or rejected
+requests use the existing ACP errors (`-32000` or `-32003`). `-32004` carries a `data.kind` of
 `managed_extensions_unavailable`, `managed_extension_unavailable`,
 `managed_extension_conflict`, `managed_extension_not_applied`, or
 `managed_extension_change_failed`. When a change fails,
@@ -142,8 +154,10 @@ ACP holds the session activity lock through a managed change and its recovery.
 It reopens the same native transcript, verifies the requested registration,
 and persists an accepted override in the session preferences in
 `sessions.sqlite3`. If the candidate fails, ACP reopens with the previous
-preferences. If recovery fails, the worker is closed and the client can
-retry using `session/load`. The saved history and previous override are
+preferences and verifies registration of every managed extension selected
+by that configuration. If startup or registration fails during recovery,
+ACP reports `recovered: false`, closes the worker, and the client can retry
+using `session/load`. The saved history and previous override are
 retained. A request that loses its response can read back the current
 override after reconnecting. Session changes do not write native
 `selections/set` global or project preferences.

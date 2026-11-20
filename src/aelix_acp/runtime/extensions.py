@@ -74,6 +74,9 @@ async def _run_extension_action(server, session, raw) -> dict:
             return await managed.set(server, session, target.id, "on" if action == "enable" else "off")
         if managed is not None:
             managed.check_external([reference])
+            if action == "enable":
+                raise ProtocolError("Extension is not in the managed generation", -32004,
+                                    {"kind": "managed_extension_unavailable"})
         if action == "enable" and Path(reference).is_absolute() and not Path(reference).exists():
             raise ProtocolError("Extension source path does not exist")
         if any(same_extension(reference, owned) for owned in operator_extensions(server, session.cwd)):

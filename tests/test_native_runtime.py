@@ -1382,16 +1382,26 @@ def setup(api):
         (pkg / "aelix-plugin.toml").write_text(manifest, encoding="utf-8")
         return {"id": name, "defaultEnabled": not broken, "reference": str(wrapper), "entryPoints": [f"{module}:setup"]}
 
-    async def managed_adapter(self, generation, *entries, operator_extensions=(), studio_managed=False):
+    def managed_module(self, name, source, *, default_enabled=False):
+        installed = self.root / "installed"
+        installed.mkdir(exist_ok=True)
+        (installed / f"{name}.py").write_text(source, encoding="utf-8")
+        return {"id": name, "defaultEnabled": default_enabled, "reference": f"{name}:setup"}
+
+    async def managed_adapter(self, generation, *entries, operator_extensions=(), studio_managed=False, trust_project=False):
+        installed = self.root / "installed"
+        installed.mkdir(exist_ok=True)
         snapshot = self.root / f"{generation}.json"
-        snapshot.write_text(json.dumps({"version": 1, "generation": generation, "extensions": entries}), encoding="utf-8")
+        snapshot.write_text(json.dumps({"version": 1, "generation": generation,
+                                        "sitePackages": str(installed), "extensions": entries}), encoding="utf-8")
         launcher = self.root / "managed-launch.py"
         launcher.write_text(
             f"import sys\nsys.path.append({str(self.root / 'installed')!r})\n"
             "from aelix_coding_agent.cli.entry import main_sync\nmain_sync()\n", encoding="utf-8"
         )
         adapter = await AcpClient.start(self.root, sys.executable, prefix=(str(launcher),), extensions=operator_extensions,
-                                        adapter_args=("--managed-extensions", str(snapshot)),
+                                        adapter_args=("--managed-extensions", str(snapshot),
+                                                      *(["--trust-project"] if trust_project else [])),
                                         extra_env={"AELIX_ACP_STUDIO_MANAGED": "1"} if studio_managed else None)
         self.addAsyncCleanup(adapter.close)
         return adapter
@@ -1559,3 +1569,77 @@ def setup(api):
         finally:
             change.cancel()
             await asyncio.gather(change, return_exceptions=True)
+
+
+    async def test_managed_module_uses_generation_in_trusted_workspace(self):
+        marker = self.root / "generation-factory"
+        entry = self.managed_module("generation_test", textwrap.dedent(f"""
+            from pathlib import Path
+            def setup(api):
+                Path({str(marker)!r}).touch()
+        """), default_enabled=True)
+        (self.root / "generation_test.py").touch()
+        if os.name != "nt":
+            # A benign workspace directory can have the reference's literal
+            # name. It contains no extension code.
+            (self.root / entry["reference"]).mkdir()
+        adapter = await self.managed_adapter("g1", entry, trust_project=True)
+        session = await self.open_managed(adapter)
+        self.assertTrue(marker.exists())
+        self.assertEqual(await self.managed_states(adapter, session), {"generation_test": "active"})
+        resources = await adapter.request("_aelix/manage", {"sessionId": session, "action": "resources/list"})
+        self.assertTrue(resources["projectTrusted"])
+        marker.unlink()
+        await adapter.request("_aelix/manage", {"sessionId": session, "action": "resources/reload"})
+        self.assertTrue(marker.exists())
+        self.assertEqual(await self.managed_states(adapter, session), {"generation_test": "active"})
+
+    async def test_managed_recovery_closes_worker_if_previous_extension_cannot_register(self):
+        stop_registration = self.root / "fail-previous-registration"
+        previous = self.managed_module("previous_ext", textwrap.dedent(f"""
+            from pathlib import Path
+            def setup(api):
+                if Path({str(stop_registration)!r}).exists():
+                    raise RuntimeError("synthetic registration failure")
+        """))
+        bad = self.managed_module("bad_ext", 'def setup(api): raise RuntimeError("synthetic change failure")\n')
+        adapter = await self.managed_adapter("g1", previous, bad)
+        session = await self.open_managed(adapter)
+        history = "Remember settings through a failed recovery"
+        await adapter.request("session/prompt", {"sessionId": session, "prompt": [{"type": "text", "text": history}]})
+        await self.managed_request(adapter, session, "set", extensionId=previous["id"], value="on")
+        self.assertEqual((await self.managed_states(adapter, session))[previous["id"]], "active")
+        stop_registration.touch()
+        with self.assertRaises(RuntimeError) as caught:
+            await self.managed_request(adapter, session, "set", extensionId=bad["id"], value="on")
+        error = json.loads(str(caught.exception))
+        self.assertEqual(error["code"], -32004)
+        self.assertEqual(error["data"]["kind"], "managed_extension_change_failed")
+        self.assertFalse(error["data"]["recovered"])
+        with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+            await self.managed_request(adapter, session)
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            preferences = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (session,)).fetchone()[0])
+            self.assertEqual(preferences["extensionOverrides"], {previous["id"]: "on"})
+        stop_registration.unlink()
+        await self.open_managed(adapter, session)
+        self.assertEqual(await self.managed_states(adapter, session), {previous["id"]: "active", bad["id"]: "disabled"})
+        self.assertIn(history, adapter.text())
+
+    async def test_managed_mode_refuses_unlisted_enable_from_slash_and_api(self):
+        adapter = await self.managed_adapter("g1")
+        session = await self.open_managed(adapter)
+        unlisted = self.root / "unlisted.py"
+        unlisted.touch()
+        adapter.permission = "reject-once"
+        for method, params in (
+            ("session/prompt", {"prompt": [{"type": "text", "text": "/extension enable ./unlisted.py"}]}),
+            ("_aelix/manage", {"action": "extensions/action", "arguments": {"action": "enable", "target": str(unlisted)}}),
+        ):
+            with self.subTest(method=method), self.assertRaises(RuntimeError) as caught:
+                await adapter.request(method, dict(params, sessionId=session))
+            error = json.loads(str(caught.exception))
+            self.assertEqual(error["code"], -32004)
+            self.assertEqual(error["data"]["kind"], "managed_extension_unavailable")
+        self.assertEqual(adapter.requests, [])
+        self.assertEqual(await self.managed_states(adapter, session), {})

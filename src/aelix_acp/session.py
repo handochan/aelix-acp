@@ -138,6 +138,7 @@ class Session:
         self.compaction_recovery_needed = False
         self.mutation_lock = asyncio.Lock()
         self._pending_extension_change = None
+        self._verifying_extension_recovery = False
         self.restore_launch_preferences()
         self.analytics_project = Path(cwd) if (Path(cwd) / "analytics.json").is_file() else None
 
@@ -221,7 +222,7 @@ class Session:
             self.extra_extensions, self.extension_overrides = managed.migrate_session_references(
                 extra_extensions, self.extension_overrides,
             )
-            extra_extensions = self.extra_extensions + managed.arguments(self.extension_overrides)
+            extra_extensions = self.extra_extensions + managed.arguments(self.extension_overrides, self.socket_dir)
         explicit_extensions.extend(extra_extensions)
         for extension in explicit_extensions:
             args += ["-e", extension]
@@ -367,7 +368,8 @@ class Session:
             await self.rpc("aelix_control", method="ui/enable", params={"enabled": True})
         if guard_selectors:
             await self.selector_startup(nonce, "finish")
-        snapshot = await managed.verify_start(self, managed_change) if managed is not None else None
+        snapshot = (await managed.verify_start(self, managed_change, recovering=self._verifying_extension_recovery)
+                    if managed is not None else None)
         if fork_source is None and managed_change is None:
             self.save()
         return snapshot
@@ -900,12 +902,15 @@ class Session:
                 raise  # Adapter shutdown.
             data = getattr(failure, "data", None) or {}
             recovered = False
+            self._verifying_extension_recovery = True
             try:
                 await self.restart(preserve_history=True)
                 recovered = True
             except Exception as recovery_error:
                 print(f"[aelix-acp] Extension selection recovery failed: {type(recovery_error).__name__}",
                       file=sys.stderr)
+            finally:
+                self._verifying_extension_recovery = False
             raise ProtocolError(
                 "Extension change was cancelled" if cancelled else "Could not apply the managed extension override",
                 -32003 if cancelled else -32004,
