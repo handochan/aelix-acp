@@ -30,6 +30,7 @@ from .runtime.store import (save_preferences, load_preferences, legacy_permissio
 from .runtime.commands import (BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND,
                                compact_instructions, execute as execute_slash)
 from .runtime.extensions import extension_reference
+from .runtime.managed_extensions import managed_preferences
 from .runtime.leases import acquire as acquire_lease, lease_path
 from .runtime.subagents import SubagentTracker
 
@@ -136,6 +137,7 @@ class Session:
         self.context = SessionContext(self)
         self.compaction_recovery_needed = False
         self.mutation_lock = asyncio.Lock()
+        self._pending_extension_change = None
         self.restore_launch_preferences()
         self.analytics_project = Path(cwd) if (Path(cwd) / "analytics.json").is_file() else None
 
@@ -148,6 +150,7 @@ class Session:
         if self.active_tools is not None and (not isinstance(self.active_tools, list) or any(not isinstance(name, str) for name in self.active_tools)):
             raise ProtocolError("Invalid saved tool selection")
         self.extra_extensions = preferences.get("extensions", [])
+        self.extension_overrides = managed_preferences(preferences)
         self.trust_project = preferences.get("trustProject", getattr(self.server.args, "trust_project", None))
         self.agents_enabled = preferences.get("agentsEnabled", getattr(self.server.args, "enable_agents", False))
         if self.trust_project is not None and type(self.trust_project) is not bool:
@@ -168,7 +171,7 @@ class Session:
                                 {"kind": "unsupported_saved_mode", "mode": str(mode)[:64], "supported": sorted(MODE_IDS)})
         self.launch_mode = mode
 
-    async def start(self, session_file=None, *, fork_source=None, fork_preferences=None):
+    async def start(self, session_file=None, *, fork_source=None, fork_preferences=None, managed_change=None):
         launch_prefix = getattr(self.server.args, "aelix_arg", [])
         prefix_options = {argument.split("=", 1)[0] for argument in launch_prefix}
         if prefix_options.intersection(SESSION_SELECTORS):
@@ -186,6 +189,8 @@ class Session:
         saved_agent = preferences.get("agent")
         resume_file = session_file if fork_source is None else fork_source["target"]
         self.restore_launch_preferences(preferences)
+        if managed_change is not None:
+            self.extension_overrides = managed_change.overrides
         self.context.restore(preferences.get("lastContextMeasurement"))
         # A reused object may have an older Yolo policy. Startup approval
         # remains Ask until native confirms the just-read policy below.
@@ -201,13 +206,25 @@ class Session:
         args += ["--agents" if self.agents_enabled else "--no-agents"]
         if self.trust_project is not None:
             args += ["--approve" if self.trust_project else "--deny"]
+        explicit_extensions = []
         if self.server.args.profile == "analytics":
             extension = self.server.args.analytics_extension
             if not extension or not Path(extension).is_file():
                 raise ProtocolError("Analytics extension is missing; pass --analytics-extension PATH")
-            args += ["-e", str(Path(extension).resolve())]
-        for extension in [*getattr(self.server.args, "extension", []), *self.extra_extensions]:
-            args += ["-e", extension_reference(extension, self.cwd)]
+            explicit_extensions.append(str(Path(extension).resolve()))
+        explicit_extensions.extend(extension_reference(extension, self.cwd)
+                                   for extension in getattr(self.server.args, "extension", []))
+        extra_extensions = [extension_reference(extension, self.cwd) for extension in self.extra_extensions]
+        managed = getattr(self.server, "managed_extensions", None)
+        if managed is not None:
+            managed.check_external([*explicit_extensions, str(PACKAGE / "bridge.py")])
+            self.extra_extensions, self.extension_overrides = managed.migrate_session_references(
+                extra_extensions, self.extension_overrides,
+            )
+            extra_extensions = self.extra_extensions + managed.arguments(self.extension_overrides)
+        explicit_extensions.extend(extra_extensions)
+        for extension in explicit_extensions:
+            args += ["-e", extension]
         # Consent sees arguments after other trusted extension hooks.
         args += ["-e", str(PACKAGE / "bridge.py")]
         # Adapter defaults must not suppress native resume. Explicit native
@@ -350,8 +367,10 @@ class Session:
             await self.rpc("aelix_control", method="ui/enable", params={"enabled": True})
         if guard_selectors:
             await self.selector_startup(nonce, "finish")
-        if fork_source is None:
+        snapshot = await managed.verify_start(self, managed_change) if managed is not None else None
+        if fork_source is None and managed_change is None:
             self.save()
+        return snapshot
 
     async def selector_startup(self, nonce, operation):
         result = await self.rpc("aelix_control", method="commands/run",
@@ -480,6 +499,7 @@ class Session:
              self.state.get("sessionName") or f"Aelix {self.server.args.profile}", int(time.time())))
         save_preferences(self.server.db, self.id, {"permission_mode": self.controls.permission_mode, "extensions": self.extra_extensions,
             "config": {option["id"]: option["currentValue"] for option in self.controls.options()},
+            **({"extensionOverrides": self.extension_overrides} if self.extension_overrides else {}),
             "lastContextMeasurement": self.context.last_measurement,
             "agent": self.controls.capabilities.get("activeAgent"),
             "activeTools": self.active_tools,
@@ -804,6 +824,8 @@ class Session:
             self.dispatched = True  # Replacing the worker is itself an effect.
         held_lease = self.lease
         self.lease = None
+        managed_change = self._pending_extension_change
+        self._pending_extension_change = None
         try:
             if preserve_history:
                 if held_lease is None:
@@ -835,16 +857,25 @@ class Session:
                 self.agents_enabled = agents_enabled
             if not preserve_history:
                 self.save()
-            await self.start(filename)
+            if managed_change is not None:
+                # Keep session/cancel routed to the mutation while the candidate
+                # starts. Other requests still have the activity/mutation locks.
+                self.server.sessions[self.id] = self
+            snapshot = await self.start(filename, managed_change=managed_change)
             await self.commands()
             if preserve_history:
                 await self.update({"sessionUpdate": "current_mode_update",
                                    "currentModeId": self.controls.permission_mode})
                 await self.update({"sessionUpdate": "config_option_update", "configOptions": self.controls.options()})
             await self.publish_context_usage()
-            self.save()
+            if managed_change is None:
+                self.save()
             await self.publish_recovery_warnings()
+            if managed_change is not None:
+                with self.server.db:
+                    self.save()
             self.server.sessions[self.id] = self
+            return snapshot
         except BaseException:
             if held_lease is not None:
                 if preserve_history:
@@ -855,6 +886,33 @@ class Session:
             raise
         finally:
             self.server.starting_ids.discard(self.id)
+
+    async def apply_extension_override(self, change):
+        # The caller holds the mutation lock. Only this restart may use the
+        # candidate. A recovery restart always reloads durable preferences.
+        self._pending_extension_change = change
+        try:
+            return await self.restart(preserve_history=True)
+        except (Exception, asyncio.CancelledError) as failure:
+            self._pending_extension_change = None
+            cancelled = isinstance(failure, asyncio.CancelledError)
+            if cancelled and not self.cancelled:
+                raise  # Adapter shutdown.
+            data = getattr(failure, "data", None) or {}
+            recovered = False
+            try:
+                await self.restart(preserve_history=True)
+                recovered = True
+            except Exception as recovery_error:
+                print(f"[aelix-acp] Extension selection recovery failed: {type(recovery_error).__name__}",
+                      file=sys.stderr)
+            raise ProtocolError(
+                "Extension change was cancelled" if cancelled else "Could not apply the managed extension override",
+                -32003 if cancelled else -32004,
+                {"kind": "managed_extension_change_failed", "extensionId": change.extension_id,
+                 "reason": "cancelled" if cancelled else data.get("reason") or data.get("kind") or "restart_failed",
+                 "recovered": recovered},
+            ) from failure
 
     async def recover_after_compaction(self):
         if not self.compaction_recovery_needed:
