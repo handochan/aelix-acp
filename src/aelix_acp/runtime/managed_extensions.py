@@ -160,6 +160,7 @@ class ManagedExtensions:
 
     def arguments(self, overrides, socket_dir):
         references = []
+        shim = None
         for index, item in enumerate(self.entries):
             if not item.enabled(overrides):
                 continue
@@ -167,7 +168,8 @@ class ManagedExtensions:
             if item.package is None:
                 # Native -e accepts absolute files without interpreting the
                 # module name as a path in the conversation's cwd.
-                shim = Path(__file__).with_name("managed_module.py").read_text(encoding="utf-8")
+                if shim is None:
+                    shim = Path(__file__).with_name("managed_module.py").read_text(encoding="utf-8")
                 Path(reference).write_text(
                     shim + f"\nsetup = load_factory({self.site_packages!r}, {item.reference!r})\n", encoding="utf-8",
                 )
@@ -195,13 +197,10 @@ class ManagedExtensions:
                          "desiredEnabled": False, "state": "unavailable", "reason": "not_installed"})
         return {"generation": self.generation, "extensions": rows}
 
-    async def verify_start(self, session, change, *, recovering=False):
+    async def verify_start(self, session, *, require_complete=False):
         snapshot = await self.status(session)
         for row in snapshot["extensions"]:
-            if row["state"] != "error":
-                continue
-            if (row["reason"] == "unexpectedly_loaded" or recovering
-                    or (change is not None and row["extensionId"] == change.extension_id)):
+            if row["state"] == "error" and (require_complete or row["reason"] == "unexpectedly_loaded"):
                 raise ProtocolError(
                     "The worker did not apply the managed extension selection", -32004,
                     {"kind": "managed_extension_not_applied", "extensionId": row["extensionId"],

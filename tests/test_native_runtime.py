@@ -1643,3 +1643,67 @@ def setup(api):
             self.assertEqual(error["data"]["kind"], "managed_extension_unavailable")
         self.assertEqual(adapter.requests, [])
         self.assertEqual(await self.managed_states(adapter, session), {})
+
+    async def test_managed_change_requires_other_selected_extensions_to_register(self):
+        fail_once = self.root / "fail-next-registration"
+        candidate_started = self.root / "candidate-registered"
+        previous = self.managed_module("previous_selected", textwrap.dedent(f"""
+            from pathlib import Path
+            def setup(api):
+                trigger = Path({str(fail_once)!r})
+                if trigger.exists():
+                    trigger.unlink()
+                    raise RuntimeError("synthetic one-time registration failure")
+        """))
+        candidate = self.managed_module("next_selected", textwrap.dedent(f"""
+            from pathlib import Path
+            def setup(api):
+                Path({str(candidate_started)!r}).touch()
+        """))
+        adapter = await self.managed_adapter("g1", previous, candidate)
+        session_id = await self.open_managed(adapter)
+        await self.managed_request(adapter, session_id, "set", extensionId=previous["id"], value="on")
+        self.assertEqual(await self.managed_states(adapter, session_id), {
+            previous["id"]: "active", candidate["id"]: "disabled",
+        })
+
+        fail_once.touch()
+        with self.assertRaises(RuntimeError) as caught:
+            await self.managed_request(adapter, session_id, "set", extensionId=candidate["id"], value="on")
+        error = json.loads(str(caught.exception))
+        self.assertEqual(error["code"], -32004)
+        self.assertEqual(error["data"]["kind"], "managed_extension_change_failed")
+        self.assertEqual(error["data"]["reason"], "load_failed")
+        self.assertEqual(error["data"]["extensionId"], candidate["id"])
+        self.assertEqual(error["data"]["failedExtensionId"], previous["id"])
+        self.assertTrue(error["data"]["recovered"])
+        self.assertTrue(candidate_started.exists())
+        self.assertFalse(fail_once.exists())
+        self.assertEqual(await self.managed_states(adapter, session_id), {
+            previous["id"]: "active", candidate["id"]: "disabled",
+        })
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            preferences = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (session_id,)).fetchone()[0])
+        self.assertEqual(preferences["extensionOverrides"], {previous["id"]: "on"})
+
+    async def test_managed_lazy_factory_lookup_uses_generation_import_guard(self):
+        marker = self.root / "lazy-generation-factory-registered"
+        entry = self.managed_module("acp_lazy_managed", textwrap.dedent("""
+            def __getattr__(name):
+                if name == "setup":
+                    from acp_lazy_factory_fixture import register
+                    return register
+                raise AttributeError(name)
+        """), default_enabled=True)
+        (self.root / "installed" / "acp_lazy_factory_fixture.py").write_text(textwrap.dedent(f"""
+            from pathlib import Path
+            def register(api):
+                Path({str(marker)!r}).touch()
+        """), encoding="utf-8")
+        # A harmless file under the workspace's ordinary import path should
+        # not be considered when the installed module looks up its factory.
+        (self.root / "acp_lazy_factory_fixture.py").touch()
+        adapter = await self.managed_adapter("g1", entry, trust_project=True)
+        session_id = await self.open_managed(adapter)
+        self.assertTrue(marker.exists())
+        self.assertEqual(await self.managed_states(adapter, session_id), {entry["id"]: "active"})

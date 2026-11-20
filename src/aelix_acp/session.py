@@ -368,8 +368,11 @@ class Session:
             await self.rpc("aelix_control", method="ui/enable", params={"enabled": True})
         if guard_selectors:
             await self.selector_startup(nonce, "finish")
-        snapshot = (await managed.verify_start(self, managed_change, recovering=self._verifying_extension_recovery)
-                    if managed is not None else None)
+        snapshot = None
+        if managed is not None:
+            snapshot = await managed.verify_start(
+                self, require_complete=managed_change is not None or self._verifying_extension_recovery,
+            )
         if fork_source is None and managed_change is None:
             self.save()
         return snapshot
@@ -911,12 +914,16 @@ class Session:
                       file=sys.stderr)
             finally:
                 self._verifying_extension_recovery = False
+            details = {
+                "kind": "managed_extension_change_failed", "extensionId": change.extension_id,
+                "reason": "cancelled" if cancelled else data.get("reason") or data.get("kind") or "restart_failed",
+                "recovered": recovered,
+            }
+            if data.get("kind") == "managed_extension_not_applied":
+                details["failedExtensionId"] = data["extensionId"]
             raise ProtocolError(
                 "Extension change was cancelled" if cancelled else "Could not apply the managed extension override",
-                -32003 if cancelled else -32004,
-                {"kind": "managed_extension_change_failed", "extensionId": change.extension_id,
-                 "reason": "cancelled" if cancelled else data.get("reason") or data.get("kind") or "restart_failed",
-                 "recovered": recovered},
+                -32003 if cancelled else -32004, details,
             ) from failure
 
     async def recover_after_compaction(self):

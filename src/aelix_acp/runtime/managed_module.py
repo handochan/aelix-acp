@@ -36,7 +36,7 @@ class GenerationFinder:
 def load_factory(site, reference):
     # This shim runs in the pinned native worker. Keep native's workspace
     # import exclusions in force for dependencies imported by the module.
-    from aelix_coding_agent.extensions.loader import _import_module_outside_cwd
+    from aelix_coding_agent.extensions.loader import _import_module_outside_cwd, _import_path_without_cwd
 
     module_name, _, factory_name = reference.partition(":")
     finder = GenerationFinder(site, module_name)
@@ -50,6 +50,9 @@ def load_factory(site, reference):
         module = _import_module_outside_cwd(module_name, cwd=None)
         if not finder.owns(module.__spec__):
             raise ImportError(f"Managed module {module_name!r} is unavailable in the selected generation")
+        # A package can import the factory on demand from __getattr__.
+        # Resolve it while the generation finder and native cwd guard apply.
+        with _import_path_without_cwd(None):
+            return getattr(module, factory_name)
     finally:
         sys.meta_path.remove(finder)
-    return getattr(module, factory_name)

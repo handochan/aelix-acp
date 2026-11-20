@@ -49,9 +49,10 @@ includes all verified entries, including those disabled by default.
   entry points. Module components and the factory are ASCII Python
   identifiers. A single-letter module before the colon is drive-relative
   on Windows. ACP passes a private absolute loader file to native `-e`.
-  The loader resolves the named module from `sitePackages`, including
-  when the workspace is trusted and when native reloads resources.
-  It rejects a cached module from another location.
+  The loader resolves the named module from `sitePackages`. The generation
+  finder and native workspace import exclusions also apply while looking up
+  the factory, including lazy lookup, in trusted workspaces and on reload.
+  The loader rejects a cached module from another location.
 - A pack entry also has `entryPoints`, a nonempty array of explicit
   `module.path:factory` references. Its reference names an absolute wrapper
   directory with exactly one child directory containing
@@ -139,7 +140,9 @@ requests use the existing ACP errors (`-32000` or `-32003`). `-32004` carries a 
 `managed_extensions_unavailable`, `managed_extension_unavailable`,
 `managed_extension_conflict`, `managed_extension_not_applied`, or
 `managed_extension_change_failed`. When a change fails,
-`data` includes the extension ID, reason and `recovered` status. Cancellation
+`data` includes the requested `extensionId`, reason and `recovered` status.
+If verification fails, `failedExtensionId` identifies the entry that failed.
+Cancellation
 during worker replacement uses the same recovery path and returns `-32003`.
 
 ## Worker startup and recovery
@@ -151,10 +154,11 @@ runs with `--no-extensions`. An unexpected registration of a disabled entry
 refuses the worker.
 
 ACP holds the session activity lock through a managed change and its recovery.
-It reopens the same native transcript, verifies the requested registration,
-and persists an accepted override in the session preferences in
-`sessions.sqlite3`. If the candidate fails, ACP reopens with the previous
-preferences and verifies registration of every managed extension selected
+It reopens the same native transcript and verifies the entire managed
+selection before persisting the override in `sessions.sqlite3`. Selected
+extensions must be active or registered for on-demand activation. Unselected
+extensions must be absent. If any entry fails verification, ACP reopens with
+the previous preferences and verifies registration of every managed extension selected
 by that configuration. If startup or registration fails during recovery,
 ACP reports `recovered: false`, closes the worker, and the client can retry
 using `session/load`. The saved history and previous override are
