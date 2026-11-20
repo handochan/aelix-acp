@@ -113,6 +113,10 @@ gets up to 45 s to end before it is killed, so `{}` can take that long (see
 
 ## Management
 
+For app defaults and conversation-specific extension selection, Studio uses the
+[managed extension override contract](studio-extension-overrides.md). It
+defines both the launcher snapshot and the versioned ACP management actions.
+
 `_aelix/capabilities` takes `{sessionId}` and returns `version:1`, native
 `runtime` capabilities and `configOptions`. Discover actual methods.
 

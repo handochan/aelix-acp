@@ -5,7 +5,9 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
+import textwrap
 import unittest
 
 from support import AcpClient
@@ -29,6 +31,7 @@ def setup(api):
 class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="acp-native-", dir="/tmp" if os.name != "nt" else None)
+        self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         (self.root / "home").mkdir()
         (self.root / "agent").mkdir()
@@ -71,7 +74,6 @@ def setup(api):
         await self.client.close()
         self.listener.close()
         await self.listener.wait_closed()
-        self.temp.cleanup()
 
     async def model(self, reader, writer):
         try:
@@ -1321,3 +1323,492 @@ def setup(api):
         self.assertEqual(result["models"]["currentModelId"], "fixture/two")
         self.assertIn("NATIVE_OK", self.client.text())
         self.assertIn("/help", self.client.text())
+
+    def managed_pack(self, name, *, lazy=False, mcp_marker=None, broken=False):
+        installed = self.root / "installed"
+        installed.mkdir(exist_ok=True)
+        module = name.replace("-", "_")
+        marker = self.root / (name + ".setup")
+        if broken:
+            setup = "raise RuntimeError('synthetic setup failure')"
+        else:
+            setup = f"""Path({str(marker)!r}).touch()
+    api.register_command("{name}", description="Managed command", handler=lambda args, ctx: "{name} works")
+    api.on("session_shutdown", lambda event, ctx: None)"""
+        (installed / f"{module}.py").write_text(f"from pathlib import Path\ndef setup(api):\n    {setup}\n", encoding="utf-8")
+        wrapper = self.root / "packs" / name
+        pkg = wrapper / name
+        pkg.mkdir(parents=True)
+        activation = f'on_command = ["{name}"]' if lazy else "on_startup_finished = true"
+        manifest = textwrap.dedent(f"""
+            [plugin]
+            id = "{name}"
+            name = "{name}"
+            version = "0.1.0"
+            description = "Managed test plugin"
+            authors = ["Fixture <fixture@example.com>"]
+            repository = "https://example.com/fixture"
+            license = "MIT"
+
+            [plugin.api]
+            level = 1
+            min_level = 1
+
+            [plugin.entry]
+            python = "{module}:setup"
+
+            [activation]
+            {activation}
+
+            [contributes]
+            commands = [{{ id = "{name}", description = "Managed command" }}]
+        """)
+        if mcp_marker:
+            server = self.root / "managed_mcp.py"
+            server.write_text(textwrap.dedent(f"""
+                from pathlib import Path
+                from mcp.server.fastmcp import FastMCP
+                Path({str(mcp_marker)!r}).touch()
+                service = FastMCP("managed-fixture")
+                @service.tool()
+                def managed_echo(value: str) -> str:
+                    return value
+                service.run()
+            """), encoding="utf-8")
+            manifest += (
+                f'mcp_servers = [{{name = "managed-fixture", transport = "stdio", command = {json.dumps(sys.executable)}, '
+                f'args = [{json.dumps(str(server))}]}}]\n\n[capabilities]\nshell_exec = true\n'
+            )
+        (pkg / "aelix-plugin.toml").write_text(manifest, encoding="utf-8")
+        return {"id": name, "defaultEnabled": not broken, "reference": str(wrapper), "entryPoints": [f"{module}:setup"]}
+
+    def managed_module(self, name, source, *, default_enabled=False):
+        installed = self.root / "installed"
+        installed.mkdir(exist_ok=True)
+        (installed / f"{name}.py").write_text(source, encoding="utf-8")
+        return {"id": name, "defaultEnabled": default_enabled, "reference": f"{name}:setup"}
+
+    async def managed_adapter(self, generation, *entries, operator_extensions=(), studio_managed=False,
+                              trust_project=False, launch_setup=""):
+        installed = self.root / "installed"
+        installed.mkdir(exist_ok=True)
+        snapshot = self.root / f"{generation}.json"
+        snapshot.write_text(json.dumps({"version": 1, "generation": generation,
+                                        "sitePackages": str(installed), "extensions": entries}), encoding="utf-8")
+        launcher = self.root / "managed-launch.py"
+        launcher.write_text(
+            f"import sys\nsys.path.append({str(installed)!r})\n"
+            f"{launch_setup}\n"
+            "from aelix_coding_agent.cli.entry import main_sync\nmain_sync()\n", encoding="utf-8"
+        )
+        adapter = await AcpClient.start(self.root, sys.executable, prefix=(str(launcher),), extensions=operator_extensions,
+                                        adapter_args=("--managed-extensions", str(snapshot),
+                                                      *(["--trust-project"] if trust_project else [])),
+                                        extra_env={"AELIX_ACP_STUDIO_MANAGED": "1"} if studio_managed else None)
+        self.addAsyncCleanup(adapter.close)
+        return adapter
+
+    async def open_managed(self, adapter, session_id=None):
+        params = {"cwd": str(self.root), "mcpServers": []}
+        if session_id:
+            await adapter.request("session/load", dict(params, sessionId=session_id))
+            return session_id
+        return (await adapter.request("session/new", params))["sessionId"]
+
+    async def managed_request(self, adapter, session_id, action="list", **arguments):
+        return await adapter.request("_aelix/manage", {"sessionId": session_id,
+            "action": f"extensions/overrides/{action}", "arguments": arguments})
+
+    async def managed_states(self, adapter, session_id):
+        result = await self.managed_request(adapter, session_id)
+        return {row["extensionId"]: row["state"] for row in result["extensions"]}
+
+    async def test_studio_allows_managed_overrides_and_blocks_package_installs_in_the_same_session(self):
+        entry = dict(self.managed_pack("studio-pack"), defaultEnabled=False)
+        adapter = await self.managed_adapter("studio-g1", entry, studio_managed=True)
+        session = await self.open_managed(adapter)
+        self.assertEqual(await self.managed_states(adapter, session), {"studio-pack": "disabled"})
+        self.assertFalse((self.root / "studio-pack.setup").exists())
+
+        await self.managed_request(adapter, session, "set", extensionId=entry["id"], value="on")
+        self.assertTrue((self.root / "studio-pack.setup").exists())
+        self.assertEqual(await self.managed_states(adapter, session), {"studio-pack": "active"})
+        self.assertEqual([request["method"] for request in adapter.requests], ["session/request_permission"])
+
+        adapter.permission = "reject-once"
+        with self.assertRaises(RuntimeError) as caught:
+            await adapter.request("session/prompt", {"sessionId": session, "prompt": [
+                {"type": "text", "text": "/extension install ./absent-fixture.whl"},
+            ]})
+        error = json.loads(str(caught.exception))
+        self.assertEqual(error["code"], -32004)
+        self.assertEqual(error["data"], {"kind": "studio_extension_management_required", "action": "install"})
+        self.assertEqual([request["method"] for request in adapter.requests], ["session/request_permission"])
+        self.assertEqual(await self.managed_states(adapter, session), {"studio-pack": "active"})
+
+    async def test_managed_extensions_recover_across_workers_adapters_and_generations(self):
+        mcp = self.root / "managed.mcp"
+        one = self.managed_pack("managed-one", mcp_marker=mcp)
+        two = self.managed_pack("managed-two")
+        first = await self.managed_adapter("g1", one, two)
+        second = await self.managed_adapter("g1", one, two)
+        a, b = await self.open_managed(first), await self.open_managed(second)
+        active = {"managed-one": "active", "managed-two": "active"}
+        self.assertEqual(await self.managed_states(first, a), active)
+        self.assertTrue(mcp.exists())
+        inventory = await first.request("_aelix/manage", {"sessionId": a, "action": "resources/list"})
+        mcp_tool = next(tool["name"] for tool in inventory["tools"] if tool["name"].endswith("__managed_echo"))
+        await first.request("session/prompt", {"sessionId": a, "prompt": [{"type": "text", "text": "Remember me"}]})
+        mcp.unlink()
+        (self.root / "managed-one.setup").unlink()
+        (self.root / "managed-two.setup").unlink()
+
+        await self.managed_request(first, a, "set", extensionId=one["id"], value="off")
+        self.assertEqual(await self.managed_states(first, a), dict(active, **{"managed-one": "disabled"}))
+        self.assertFalse(mcp.exists())
+        self.assertFalse((self.root / "managed-one.setup").exists())
+        self.assertTrue((self.root / "managed-two.setup").exists())
+        inventory = await first.request("_aelix/manage", {"sessionId": a, "action": "resources/list"})
+        hooks = {Path(row["extension"]).name for row in inventory["hooks"]}
+        self.assertNotIn(mcp_tool, {tool["name"] for tool in inventory["tools"]})
+        self.assertNotIn("managed-one", hooks)
+        self.assertIn("managed-two", hooks)
+        commands = [event["params"]["update"]["availableCommands"] for event in first.updates
+                    if event.get("method") == "session/update"
+                    and event["params"]["update"]["sessionUpdate"] == "available_commands_update"][-1]
+        self.assertNotIn("managed-one", {command["name"] for command in commands})
+        self.assertIn("managed-two", {command["name"] for command in commands})
+        self.assertEqual(await self.managed_states(second, b), active)
+        self.assertEqual(await self.managed_states(second, await self.open_managed(second)), active)
+
+        shared_packs = str(self.root / "packs")
+        with self.assertRaises(RuntimeError) as overlap:
+            await first.request("_aelix/manage", {"sessionId": a, "action": "extensions/action",
+                                                    "arguments": {"action": "enable", "target": shared_packs}})
+        self.assertEqual(json.loads(str(overlap.exception))["data"]["kind"], "managed_extension_conflict")
+        current = self.root / "g1.json"
+        current.write_text('{"version":2}', encoding="utf-8")
+        await first.request("session/close", {"sessionId": a})
+        await self.open_managed(first, a)
+        self.assertEqual(await self.managed_states(first, a), dict(active, **{"managed-one": "disabled"}))
+        await first.close()
+        third = await self.managed_adapter("g2", dict(one, defaultEnabled=False), two)
+        await self.open_managed(third, a)
+        self.assertIn("Remember me", third.text())
+        self.assertEqual((await self.managed_request(third, a))["generation"], "g2")
+        await self.managed_request(third, a, "set", extensionId=one["id"], value="on")
+        self.assertEqual(await self.managed_states(third, a), active)
+        new_session = await self.open_managed(third)
+        self.assertEqual((await self.managed_states(third, new_session))["managed-one"], "disabled")
+        await third.close()
+
+        removed = await self.managed_adapter("g3", two)
+        await self.open_managed(removed, a)
+        self.assertEqual(await self.managed_states(removed, a), dict(active, **{"managed-one": "unavailable"}))
+        restored = await self.managed_adapter("g4", dict(one, defaultEnabled=False), two)
+        await removed.close()
+        await self.open_managed(restored, a)
+        self.assertEqual(await self.managed_states(restored, a), active)
+        await self.managed_request(restored, a, "set", extensionId=one["id"], value="inherit")
+        self.assertEqual(await self.managed_states(restored, a), dict(active, **{"managed-one": "disabled"}))
+
+    async def test_managed_apply_failure_recovers_and_defers_lazy_packs(self):
+        lazy = self.managed_pack("lazy-pack", lazy=True)
+        broken = self.managed_pack("broken-pack", broken=True)
+        adapter = await self.managed_adapter("g1", lazy, broken)
+        session = await self.open_managed(adapter)
+        self.assertFalse((self.root / "lazy-pack.setup").exists())
+        self.assertEqual(await self.managed_states(adapter, session), {"lazy-pack": "deferred", "broken-pack": "disabled"})
+        adapter.permission = "reject-once"
+        with self.assertRaises(RuntimeError) as rejected:
+            await self.managed_request(adapter, session, "set", extensionId=lazy["id"], value="off")
+        self.assertEqual(json.loads(str(rejected.exception))["code"], -32003)
+        adapter.permission = "allow-once"
+        with self.assertRaises(RuntimeError) as failed:
+            await self.managed_request(adapter, session, "set", extensionId=broken["id"], value="on")
+        data = json.loads(str(failed.exception))["data"]
+        self.assertEqual(data["kind"], "managed_extension_change_failed")
+        self.assertEqual(data["reason"], "load_failed")
+        self.assertTrue(data["recovered"])
+        self.assertEqual(await self.managed_states(adapter, session), {"lazy-pack": "deferred", "broken-pack": "disabled"})
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            saved = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (session,)).fetchone()[0])
+        self.assertNotIn("extensionOverrides", saved)
+        await adapter.request("session/prompt", {"sessionId": session, "prompt": [{"type": "text", "text": "/lazy-pack"}]})
+        self.assertTrue((self.root / "lazy-pack.setup").exists())
+        self.assertEqual((await self.managed_states(adapter, session))["lazy-pack"], "active")
+        await adapter.request("session/prompt", {"sessionId": session,
+            "prompt": [{"type": "text", "text": "/extension disable lazy-pack"}]})
+        self.assertEqual((await self.managed_states(adapter, session))["lazy-pack"], "disabled")
+
+    async def test_cancel_managed_module_replacement_restores_previous_worker(self):
+        installed = self.root / "installed"
+        installed.mkdir()
+        marker = self.root / "candidate-started"
+        (installed / "managed_slow.py").write_text(textwrap.dedent(f"""
+            import asyncio
+            from pathlib import Path
+            async def setup(api):
+                Path({str(marker)!r}).touch()
+                await asyncio.sleep(60)
+        """), encoding="utf-8")
+        entry = {"id": "demo:slow", "defaultEnabled": False, "reference": "managed_slow:setup"}
+        adapter = await self.managed_adapter("g1", entry)
+        session = await self.open_managed(adapter)
+        change = asyncio.create_task(self.managed_request(adapter, session, "set", extensionId=entry["id"], value="on"))
+        try:
+            async with asyncio.timeout(15):
+                while not marker.exists():
+                    await asyncio.sleep(0.02)
+            await adapter.request("session/cancel", {"sessionId": session})
+            with self.assertRaises(RuntimeError) as cancelled:
+                await change
+            err = json.loads(str(cancelled.exception))
+            self.assertEqual(err["code"], -32003)
+            self.assertEqual(err["data"]["reason"], "cancelled")
+            self.assertTrue(err["data"]["recovered"])
+            self.assertEqual(await self.managed_states(adapter, session), {"demo:slow": "disabled"})
+        finally:
+            change.cancel()
+            await asyncio.gather(change, return_exceptions=True)
+
+
+    async def test_managed_module_uses_generation_in_trusted_workspace(self):
+        marker = self.root / "generation-factory"
+        entry = self.managed_module("generation_test", textwrap.dedent(f"""
+            from pathlib import Path
+            def setup(api):
+                Path({str(marker)!r}).touch()
+        """), default_enabled=True)
+        (self.root / "generation_test.py").touch()
+        if os.name != "nt":
+            # A benign workspace directory can have the reference's literal
+            # name. It contains no extension code.
+            (self.root / entry["reference"]).mkdir()
+        adapter = await self.managed_adapter("g1", entry, trust_project=True)
+        session = await self.open_managed(adapter)
+        self.assertTrue(marker.exists())
+        self.assertEqual(await self.managed_states(adapter, session), {"generation_test": "active"})
+        resources = await adapter.request("_aelix/manage", {"sessionId": session, "action": "resources/list"})
+        self.assertTrue(resources["projectTrusted"])
+        marker.unlink()
+        await adapter.request("_aelix/manage", {"sessionId": session, "action": "resources/reload"})
+        self.assertTrue(marker.exists())
+        self.assertEqual(await self.managed_states(adapter, session), {"generation_test": "active"})
+
+    async def test_managed_recovery_closes_worker_if_previous_extension_cannot_register(self):
+        stop_registration = self.root / "fail-previous-registration"
+        previous = self.managed_module("previous_ext", textwrap.dedent(f"""
+            from pathlib import Path
+            def setup(api):
+                if Path({str(stop_registration)!r}).exists():
+                    raise RuntimeError("synthetic registration failure")
+        """))
+        bad = self.managed_module("bad_ext", 'def setup(api): raise RuntimeError("synthetic change failure")\n')
+        adapter = await self.managed_adapter("g1", previous, bad)
+        session = await self.open_managed(adapter)
+        history = "Remember settings through a failed recovery"
+        await adapter.request("session/prompt", {"sessionId": session, "prompt": [{"type": "text", "text": history}]})
+        await self.managed_request(adapter, session, "set", extensionId=previous["id"], value="on")
+        self.assertEqual((await self.managed_states(adapter, session))[previous["id"]], "active")
+        stop_registration.touch()
+        with self.assertRaises(RuntimeError) as caught:
+            await self.managed_request(adapter, session, "set", extensionId=bad["id"], value="on")
+        error = json.loads(str(caught.exception))
+        self.assertEqual(error["code"], -32004)
+        self.assertEqual(error["data"]["kind"], "managed_extension_change_failed")
+        self.assertFalse(error["data"]["recovered"])
+        with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+            await self.managed_request(adapter, session)
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            preferences = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (session,)).fetchone()[0])
+            self.assertEqual(preferences["extensionOverrides"], {previous["id"]: "on"})
+        stop_registration.unlink()
+        await self.open_managed(adapter, session)
+        self.assertEqual(await self.managed_states(adapter, session), {previous["id"]: "active", bad["id"]: "disabled"})
+        self.assertIn(history, adapter.text())
+
+    async def test_managed_mode_refuses_unlisted_enable_from_slash_and_api(self):
+        adapter = await self.managed_adapter("g1")
+        session = await self.open_managed(adapter)
+        unlisted = self.root / "unlisted.py"
+        unlisted.touch()
+        adapter.permission = "reject-once"
+        for method, params in (
+            ("session/prompt", {"prompt": [{"type": "text", "text": "/extension enable ./unlisted.py"}]}),
+            ("_aelix/manage", {"action": "extensions/action", "arguments": {"action": "enable", "target": str(unlisted)}}),
+        ):
+            with self.subTest(method=method), self.assertRaises(RuntimeError) as caught:
+                await adapter.request(method, dict(params, sessionId=session))
+            error = json.loads(str(caught.exception))
+            self.assertEqual(error["code"], -32004)
+            self.assertEqual(error["data"]["kind"], "managed_extension_unavailable")
+        self.assertEqual(adapter.requests, [])
+        self.assertEqual(await self.managed_states(adapter, session), {})
+
+    async def test_managed_change_requires_other_selected_extensions_to_register(self):
+        fail_once = self.root / "fail-next-registration"
+        candidate_started = self.root / "candidate-registered"
+        previous = self.managed_module("previous_selected", textwrap.dedent(f"""
+            from pathlib import Path
+            def setup(api):
+                trigger = Path({str(fail_once)!r})
+                if trigger.exists():
+                    trigger.unlink()
+                    raise RuntimeError("synthetic one-time registration failure")
+        """))
+        candidate = self.managed_module("next_selected", textwrap.dedent(f"""
+            from pathlib import Path
+            def setup(api):
+                Path({str(candidate_started)!r}).touch()
+        """))
+        adapter = await self.managed_adapter("g1", previous, candidate)
+        session_id = await self.open_managed(adapter)
+        await self.managed_request(adapter, session_id, "set", extensionId=previous["id"], value="on")
+        self.assertEqual(await self.managed_states(adapter, session_id), {
+            previous["id"]: "active", candidate["id"]: "disabled",
+        })
+
+        fail_once.touch()
+        with self.assertRaises(RuntimeError) as caught:
+            await self.managed_request(adapter, session_id, "set", extensionId=candidate["id"], value="on")
+        error = json.loads(str(caught.exception))
+        self.assertEqual(error["code"], -32004)
+        self.assertEqual(error["data"]["kind"], "managed_extension_change_failed")
+        self.assertEqual(error["data"]["reason"], "load_failed")
+        self.assertEqual(error["data"]["extensionId"], candidate["id"])
+        self.assertEqual(error["data"]["failedExtensionId"], previous["id"])
+        self.assertTrue(error["data"]["recovered"])
+        self.assertTrue(candidate_started.exists())
+        self.assertFalse(fail_once.exists())
+        self.assertEqual(await self.managed_states(adapter, session_id), {
+            previous["id"]: "active", candidate["id"]: "disabled",
+        })
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            preferences = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (session_id,)).fetchone()[0])
+        self.assertEqual(preferences["extensionOverrides"], {previous["id"]: "on"})
+
+    async def test_managed_lazy_factory_lookup_uses_generation_import_guard(self):
+        marker = self.root / "lazy-generation-factory-registered"
+        entry = self.managed_module("acp_lazy_managed", textwrap.dedent("""
+            def __getattr__(name):
+                if name == "setup":
+                    from acp_lazy_factory_fixture import register
+                    return register
+                raise AttributeError(name)
+        """), default_enabled=True)
+        (self.root / "installed" / "acp_lazy_factory_fixture.py").write_text(textwrap.dedent(f"""
+            from pathlib import Path
+            def register(api):
+                Path({str(marker)!r}).touch()
+        """), encoding="utf-8")
+        # A harmless file under the workspace's ordinary import path should
+        # not be considered when the installed module looks up its factory.
+        (self.root / "acp_lazy_factory_fixture.py").touch()
+        adapter = await self.managed_adapter("g1", entry, trust_project=True)
+        session_id = await self.open_managed(adapter)
+        self.assertTrue(marker.exists())
+        self.assertEqual(await self.managed_states(adapter, session_id), {entry["id"]: "active"})
+
+    async def test_managed_factory_rejects_cached_and_workspace_subdirectory_origins(self):
+        workspace_imports = self.root / "workspace-imports"
+        workspace_imports.mkdir()
+        foreign = workspace_imports / "outside_fixture.py"
+        foreign.write_text("def register(api): pass\n", encoding="utf-8")
+        package = self.root / "installed" / "acp_cached_fixture"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(textwrap.dedent("""
+            def __getattr__(name):
+                if name == "setup":
+                    from .supplier import register
+                    return register
+                raise AttributeError(name)
+        """), encoding="utf-8")
+        on_path = self.managed_module("acp_workspace_fixture", textwrap.dedent("""
+            def __getattr__(name):
+                if name == "setup":
+                    from outside_fixture import register
+                    return register
+                raise AttributeError(name)
+        """), default_enabled=True)
+        cached = {"id": "cached", "defaultEnabled": True, "reference": "acp_cached_fixture:setup"}
+        setup = textwrap.dedent(f"""
+            from importlib.util import module_from_spec, spec_from_file_location
+            sys.path.insert(0, {str(workspace_imports)!r})
+            name = "acp_cached_fixture.supplier"
+            spec = spec_from_file_location(name, {str(foreign)!r})
+            fixture = module_from_spec(spec)
+            spec.loader.exec_module(fixture)
+            sys.modules[name] = fixture
+        """)
+        adapter = await self.managed_adapter("g1", cached, on_path, trust_project=True, launch_setup=setup)
+        session = await self.open_managed(adapter)
+        rows = (await self.managed_request(adapter, session))["extensions"]
+        self.assertEqual({row["extensionId"]: (row["state"], row["reason"]) for row in rows},
+                         {cached["id"]: ("error", "load_failed"), on_path["id"]: ("error", "load_failed")})
+
+    async def test_managed_factory_allows_generation_namespace_and_normal_dependencies(self):
+        package = self.root / "installed" / "acp_namespace_fixture"
+        package.mkdir(parents=True)
+        marker = self.root / "namespace-factory-ran"
+        (package / "entry.py").write_text(textwrap.dedent("""
+            def __getattr__(name):
+                if name == "setup":
+                    from .supplier import register
+                    return register
+                raise AttributeError(name)
+        """), encoding="utf-8")
+        (package / "supplier.py").write_text(textwrap.dedent(f"""
+            from pathlib import Path
+            from . import sibling
+
+            def register(api):
+                Path({str(marker)!r}).write_text(sibling.content(), encoding="utf-8")
+        """), encoding="utf-8")
+        (package / "sibling.py").write_text(textwrap.dedent("""
+            from json import dumps
+
+            def content():
+                return dumps({"generation": True})
+        """), encoding="utf-8")
+        entry = {"id": "namespace", "defaultEnabled": True, "reference": "acp_namespace_fixture.entry:setup"}
+        adapter = await self.managed_adapter("g1", entry)
+        session = await self.open_managed(adapter)
+        self.assertEqual(await self.managed_states(adapter, session), {"namespace": "active"})
+        self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), {"generation": True})
+
+    async def test_managed_class_factory_keeps_working_when_enabling_callable_instance(self):
+        class_marker = self.root / "class-factory-ran"
+        instance_marker = self.root / "instance-factory-ran"
+        default_enabled = self.managed_module("acp_factory_class", textwrap.dedent(f"""
+            from pathlib import Path
+
+            class Registration:
+                def __init__(self, api):
+                    Path({str(class_marker)!r}).touch()
+
+            setup = Registration
+        """), default_enabled=True)
+        disabled = self.managed_module("acp_factory_instance", textwrap.dedent(f"""
+            from pathlib import Path
+
+            class Registration:
+                def __call__(self, api):
+                    Path({str(instance_marker)!r}).touch()
+
+            setup = Registration()
+        """))
+        adapter = await self.managed_adapter("g1", default_enabled, disabled)
+        session = await self.open_managed(adapter)
+        self.assertEqual(await self.managed_states(adapter, session), {
+            default_enabled["id"]: "active", disabled["id"]: "disabled",
+        })
+        self.assertTrue(class_marker.exists())
+        self.assertFalse(instance_marker.exists())
+        class_marker.unlink()
+        await self.managed_request(adapter, session, "set", extensionId=disabled["id"], value="on")
+        self.assertEqual(await self.managed_states(adapter, session), {
+            default_enabled["id"]: "active", disabled["id"]: "active",
+        })
+        self.assertTrue(class_marker.exists())
+        self.assertTrue(instance_marker.exists())

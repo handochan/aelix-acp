@@ -18,7 +18,11 @@ WRITE_ACTIONS = {"install", "remove", "update"}
 
 
 async def run_extension_action(server, session, raw: str) -> dict:
-    task = asyncio.create_task(_run_extension_action(server, session, raw))
+    return await run_management_task(session, _run_extension_action(server, session, raw))
+
+
+async def run_management_task(session, operation) -> dict:
+    task = asyncio.create_task(operation)
     session.management_task = task
     try:
         return await task
@@ -61,7 +65,18 @@ async def _run_extension_action(server, session, raw) -> dict:
             return result
         if len(arguments) != 1:
             raise ProtocolError(f"/extension {action} requires one extension path or native module reference")
-        reference = extension_reference(arguments[0], session.cwd)
+        managed = getattr(server, "managed_extensions", None)
+        target = managed.target(arguments[0]) if managed is not None else None
+        if target is None:
+            reference = extension_reference(arguments[0], session.cwd)
+            target = managed.target(reference) if managed is not None else None
+        if target is not None:
+            return await managed.set(server, session, target.id, "on" if action == "enable" else "off")
+        if managed is not None:
+            managed.check_external([reference])
+            if action == "enable":
+                raise ProtocolError("Extension is not in the managed generation", -32004,
+                                    {"kind": "managed_extension_unavailable"})
         if action == "enable" and Path(reference).is_absolute() and not Path(reference).exists():
             raise ProtocolError("Extension source path does not exist")
         if any(same_extension(reference, owned) for owned in operator_extensions(server, session.cwd)):

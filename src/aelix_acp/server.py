@@ -21,6 +21,7 @@ from .wire.errors import (ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPA
                           fork_head_changed, require_object, require_string)
 from .runtime.store import open_store, load_preferences, history, legacy_permission_mode, save_preferences
 from .runtime.controls import MODE_IDS
+from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
 from .stdio import StdinReader
 from .wire.transport import decode_frame, StdoutWriter
@@ -59,6 +60,7 @@ class Server:
         self.closing = False  # The client is gone: sessions end without sending.
         self.output_lock = asyncio.Lock()
         self.output = None
+        self.managed_extensions = getattr(args, "managed_extensions", None)
 
     async def send(self, message):
         async with self.output_lock:
@@ -274,7 +276,9 @@ class Server:
                                           "_meta": {SUBAGENTS_META: {"version": 1, "on": "tool_call_update"},
                                                     "aelix/errors": {"sessionLocked": SESSION_LOCKED, "turnFailedAfterDispatch": TURN_FAILED_AFTER_DISPATCH}}},
                     "_meta": {"aelix/control": {"version": 1, "methods": ["_aelix/capabilities", "_aelix/manage"],
-                              "clientActionCapability": "aelix/clientActions"}}, "authMethods": []}
+                              "clientActionCapability": "aelix/clientActions"},
+                              **({managed_extensions.META: {"version": managed_extensions.VERSION}}
+                                 if self.managed_extensions is not None else {})}, "authMethods": []}
         if method == "session/fork":
             return await self.fork_head(params)
         if method in ("session/new", "session/load"):
@@ -455,6 +459,15 @@ class Server:
                     await require_consent(self, session, "Change agent delegation", {"enabled": enabled})
                     await session.restart(agents_enabled=enabled)
                     return {"enabled": enabled}
+                if action in (managed_extensions.LIST, managed_extensions.SET):
+                    if self.managed_extensions is None:
+                        raise ProtocolError("Managed extensions are unavailable", -32004,
+                                            {"kind": "managed_extensions_unavailable"})
+                    if action == managed_extensions.LIST and not arguments:
+                        return await self.managed_extensions.status(session)
+                    if action == managed_extensions.SET and set(arguments) == {"extensionId", "value"}:
+                        return await self.managed_extensions.set(self, session, arguments["extensionId"], arguments["value"])
+                    raise ProtocolError("Invalid managed extension arguments")
                 if action == "extensions/action":
                     return await self.extension_action(session, require_string(arguments["command"], "command") if "command" in arguments else arguments)
                 if action not in MANAGE_ACTIONS or action not in session.controls.capabilities.get("methods", []):
@@ -596,11 +609,18 @@ def main():
                         help="Initial mode for new sessions; saved sessions restore their recorded mode")
     parser.add_argument("--extension-manager", help="Writable Aelix CLI used for extension package management")
     parser.add_argument("--extension", action="append", default=[], help="Explicit trusted Aelix extension path (repeatable)")
+    parser.add_argument("--managed-extensions", type=managed_extensions.read_launch,
+                        help="Absolute path to the Studio launch snapshot for managed extensions")
     parser.add_argument("--provider")
     parser.add_argument("--model")
     args = parser.parse_args()
     if args.max_sessions < 1 or args.max_sessions > 256 or any(not math.isfinite(value) or value < 0 for value in (args.turn_timeout, args.command_timeout)):
         parser.error("max-sessions must be 1..256 and timeouts must be finite and nonnegative")
+    if args.managed_extensions is not None and any(
+        arg.startswith("-e") or arg.split("=", 1)[0] == "--extension"
+        for arg in args.aelix_arg
+    ):
+        parser.error("use adapter --extension for explicit extensions in managed mode")
     try:
         asyncio.run(Server(args).run())
     except (KeyboardInterrupt, BrokenPipeError, asyncio.CancelledError):
