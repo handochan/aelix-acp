@@ -35,6 +35,13 @@ an OS session lease. Startup reservations enforce the process limit during
 concurrent creation. Failure before readiness closes the candidate. EOF and
 adapter shutdown close children. POSIX native workers run in their own process
 group; cleanup terminates it and kills members left after the leader exits.
+SIGKILL follows SIGTERM after 5 s, or after 45 s for a native that lists
+`children/list` or `children/notices`: its session-end stages (the turn's
+settle, the jobs' owner end, the job service's shutdown) are bounded at about
+40 s in sequence (aelix-ai contract r5 section 6.4), and a close shorter than
+that would cut them. A native that lists only `children/notices` gets it too,
+since its background jobs need the same stages (the lead's call). It is a
+deadline, not a promise that native finished.
 On Windows a trusted gate holds the native bootstrap until the worker joins a
 kill-on-close Job Object, so the worker and every descendant, including MCP
 servers started before the first RPC, end when the adapter's job handle closes,
@@ -78,8 +85,10 @@ a 0700 directory; on Windows a per-worker token authenticates loopback TCP.
 
 Installed extensions and the process environment are trusted. Extension Python
 can run during loading or commands with the host's authority. The bridge is
-not a malicious-extension sandbox. Delegated children retain native restrictions;
-there is no claim of an ACP dialog for every child tool.
+not a malicious-extension sandbox. Delegated children retain native restrictions.
+With a children-capable native and a client-action client, a child of an Ask
+session asks through `session/request_permission` (Delegated children below);
+otherwise it runs under native `plan`.
 
 ## Persistence and ambiguous outcomes
 
@@ -134,6 +143,167 @@ Known unresolved candidate limitation: native JSONL is bounded to 16 MiB too.
 An oversized aggregate event or `get_messages` response can close its actor.
 Large branch-history acceptance needs compact native lifecycle events and
 paged/bounded history; no such new core API is introduced by this adapter fix.
+
+## Delegated children (aelix-ai #612)
+
+Native's `children/` family, `aelix_child` and `aelix_notice` events and
+`childApproval` dialog are mapped here; the client contract is in
+[Studio integration](studio-integration.md#delegated-children).
+
+Admission. `children/list`, `children/events`, `children/steer`,
+`children/wrap_up` and `children/stop` are native's lock-free reads and
+`CONCURRENT_METHODS`. The adapter sends them from `Session.intervene`, outside
+`mutation_lock` and the per-session activity lease that a running
+`session/prompt` or `agents/run` holds, so a host reaches a child during a turn.
+They never mark that turn dispatched: they act on a child, and resending the
+turn would not resend them. `children/notices` runs a turn and stays under the
+lock (`Session.notice_turn`, sharing `drive_turn` with a prompt: the turn
+timeout, `wait_until_idle`, `session/cancel`, and a reset of `cancelled` so the
+bridge does not deny the turn's tools).
+
+The fence. A counter on `Session` is raised inside `restart()` and `_close()`
+themselves, so every path that replaces or ends the worker passes it: trust and
+extension enable/disable (`_aelix/manage` and slash `/trust`, `/extension`),
+delegation enable/disable (`_aelix/manage agents/enable`; `/agents` has no such
+subcommand), `session/close` and `sessions/close` (both `Server.close_session`
+since aelix-acp #35), `/quit`, `session/delete`, `session/load` of a live
+session, compaction recovery, the close that follows a worker's ended RPC
+stream, and adapter shutdown. Only the close's raise ends anything:
+`raise_fence()`, the first step of `_close()`, ends each intervention native has
+not answered yet: its line is already on native's stdin, so it answers `-33002`
+with cause `session_changed` ("its delivery is unknown"). `restart()` raises the
+counter first, a loop turn or more before its close, and that raise only refuses
+new ones; an intervention whose answer is read in between returns it (fix round
+2, F1: the verifier's run of Codex's `fence` case read the answer with the
+counter at 1, and the reply was native's `queued`; `FenceOrderTests`, a steer
+answered between a restart's start and its close). One native answered before
+the close's fence rose returns that answer, on Python 3.11 to 3.14 alike (fix
+round 1, Codex C-M1: 3.11's `wait_for` returned an answer that arrived after the
+cancel and 3.12's did not; `tests/test_children.py` `FenceOrderTests`, both
+interleavings, run on 3.11 and 3.12). A worker that dies first fails its
+waiting requests itself (`-32603`, "Aelix process closed its RPC stream"),
+before that close begins (the lead's call: that answer stays). While the counter
+is up, the session is starting or closed, or its stream ended or its process is
+gone, a new intervention is refused before it is written (`-32000`,
+`session_changing`). At adapter shutdown the request tasks are cancelled before
+sessions close, so an intervention then gets no reply, as every request does. A
+native reload within one worker is fenced by native (its `transitioning`) and
+passes through.
+
+Events. `runtime/children.py` keeps `(epoch, id) -> parentToolCallId` from
+each child's `state` frame, outside the per-prompt `SubagentTracker` reset: at
+most 64 live children (the adapter's own bound on what it routes; an ended
+child's route is dropped), an entry dropped on its terminal frame and every
+entry of an epoch dropped when native names another epoch, in a frame or in a
+`children/list` or `children/events` reply (an epoch seen replaced is
+remembered, eight deep, and its late frames are dropped). Frames repeat nothing
+already seen for `(epoch, id, seq)`. Beside each route it keeps the card fields
+the child has shown, so a frame after the next prompt's per-turn reset folds onto
+them and the entry keeps its `profile`, `state` and `wrappingUp` (fix round 1,
+V-F1). The card's `_meta["aelix/subagents"]` gains `lastText`, `stuck`,
+`wrappingUp`, `end`, and `currentTool` from the child's own `tool_start` and
+`tool_end` (the tool of its latest call still open; fix round 1, Codex C-L7). A
+client that declared `aelix/nestedToolCalls` also gets the child's own calls and
+a synthetic card for a child with no parent call. `aelix_notice` becomes
+`_aelix/notice` for a client that declared `aelix/notices`. Native names a parent
+call whose id is longer than 128 bytes as the wire writes it (JSON-escaped
+UTF-8, a control character six bytes) `h:` and the first 32 hex digits of its
+sha256 (aelix-ai `aelix_agents/child_events.py` `wire_call_id`); the adapter
+applies the same projection to the ids of the cards it opened, so such a child
+still finds its card (fix round 1, Codex C-L6; `WireCallIdTests` compares the two
+functions when the native is installed).
+
+Replay. Every update is recorded. `session/load` replays a child's own calls
+(`_meta.parentToolCallId`) and the synthetic `aelix-child:` card only to a
+client that declared `aelix/nestedToolCalls`, as the live path sends them; the
+parent card's updates are the same for both and replay to every client (fix
+round 1, Codex C-M4; `ReplayTests`).
+
+When the worker ends. `_close()` keeps reading native's stdout through its
+shutdown (SIGTERM up to the deadline, then the exit), so the `tool_end` and
+terminal `state` frames native writes while it stops a child are routed and
+recorded like any other (fix round 1, Codex C-M3; against native `83714045` a
+`workspace/trust` restart with a child's question open gave native's own
+`tool_end` and `end: "stopped"`). A dialog native opens meanwhile is answered
+`cancelled` without asking. Then, for each child still live when the worker is
+gone, the adapter closes what it left open: its own calls `failed`, its entry
+state and end `stopped` (native's end for a child a stop ended), marked
+`_meta["aelix/child"].closedBy = "adapter"`, and its synthetic card `failed`;
+the epoch is then retired (P-LOW-2). These updates are recorded; they are sent
+only while the client is still connected and was not told the session was
+replaced (`session/close`, `sessions/close`, `/quit`, a restart,
+`session/delete` and a dead worker send them; adapter shutdown and
+`session/load` of the same live session record them, and that load replays
+them). `_aelix/notice` and `_aelix/subagent` read then follow the same rule and
+are not recorded (fix round 2, N1; `EndingNotificationTests`).
+
+Approvals. `childApproval` becomes `session/request_permission` in the
+`extension_ui_request` task, outside `mutation_lock`; the reply is native's
+`extension_ui_response` from the same task. The parent's own approvals stay on
+the bridge, so the two can be open together (aelix-ai ADR-0308 K13). Every
+ending that is not an offered choice is `{cancelled:true}`. A question native
+drops while it is open is void: the child's terminal frame, the question's
+`withdrawn` or `denied` approval step, or a newer epoch (frame or
+`children/list` / `children/events` reply). The adapter then ends its own wait,
+takes the request back from the client with ACP's `$/cancel_request`
+(`{requestId}`), which a client is free to ignore, and answers native
+`{cancelled:true}`, which native ignores (fix round 1, P-LOW-1). `session/cancel`
+voids every open question, also during a manual `/compact` (P-LOW-3), and also
+one whose task it cancelled before the task first ran (the cancel and native's
+request handled in one loop turn): that task's done-callback answers native
+`{cancelled:true}` once, for an extension's dialog too, which a cancel one loop
+turn later already answered so (fix round 2, F2;
+`CancelBeforeTheDialogRanTests`). An
+extension's dialog opened during `/compact` keeps its earlier behaviour (it is
+not cancelled, since the compaction goes on). The adapter waits up to 330 s for
+the client, past native's own 300 s (aelix-ai `rpc/control_ui.py`
+`DIALOG_TIMEOUT_SECONDS`): at 300 s native answers the child itself ("no answer
+from the host within 300 s") and its `denied` step takes the request back; the
+330 s only backs that up (P-LOW-4; other client requests keep 290 s; read from
+native's source and held by a unit test with shortened bounds, a 300 s wait not
+run). Native asks one child question at a time (its permission gate's lock,
+`decide_for_child`), so a second child's question waits until the first ends. A nesting client's request keeps
+the nested card's own title (the tool's name); a client without nesting gets
+native's descriptive title (NIT-5).
+
+Cancel cadence (aelix-ai #800 K5). A cancelled turn that still streams is
+aborted again only when 2 s (native's own re-abort grace) have passed since the
+previous abort sent by any path, not at every 50 ms poll; `drive_turn`'s
+re-cancel after native accepted a prompt obeys the same cadence. Each client
+`session/cancel` sends one abort at once: its own after `commands/cancel`, or
+none if the turn's poll aborted while `commands/cancel` waited (fix round 1,
+Codex C-M2: those two were 0.3 ms apart).
+
+How it is held, against native aelix-ai `83714045` on macOS (the Windows paths
+are unchanged and not run here): `tests/test_children.py` (no native: routing,
+dedupe and epochs, the card fields across the per-prompt reset, `currentTool`,
+the projected parent id, replay by capability, approvals and their option
+mapping, void questions and `$/cancel_request`, which requests are taken back,
+a dialog whose task a cancel ended before it ran, the timeout bounds, the
+fence's two answers, its two orders, a restart's counter that ends nothing and
+`session/close`, the cadence, the notice turn, the deadline choice, the routes'
+bounds, the `_aelix/` notifications while the worker is ended, and closing with
+a POSIX worker that writes or does not write its last frames) and `tests/test_native_children.py` (a real native and a scripted model:
+a steer and a wrap-up during `session/prompt`, a steer and a stop during
+`agents/run`, refusals during three restarts, a steer in flight when a restart
+begins (POSIX), nested calls of a spawned child after its call ended, a spawned
+child's entry after the next prompt, the card-only view without the
+capability, `children/notices` after a `session/cancel`, allow-once and
+reject-once, `session/cancel` denying an open child question, `children/stop`,
+`children/wrap_up` and `resources/reload` taking an open question back, a
+restart with a child asking closing its cards, a parent's and a child's question
+open together, the cancelled call's report replayed by `session/load` (a guard
+that passes on `a78db59` too), and one abort in the re-abort window for one
+cancel, read from native's receipt times so a runner that settles after 2 s may
+count the re-abort that is then due). Closing measured with a scripted model at
+`20f1d27` (with the shutdown read): an idle native, one with a spawned child
+held in its model call and one with a background `bash` job were gone
+0.08-0.55 s after the request through `sessions/close`, `session/delete` and
+adapter shutdown, and 0.61-1.01 s through a `session/load` of the same session
+(which starts the new native), so neither the 45 s deadline nor the read added
+latency there; a native whose session end took 8 s (a `session_shutdown` hook)
+finished in 8.08-8.12 s (8.60 s through `session/load`) and was killed at
+5.01 s on `a78db59` ([product validation](product-validation.md)).
 
 ## Credentials, MCP and packages
 

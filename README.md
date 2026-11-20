@@ -17,7 +17,10 @@ beta.2 Preview 내부 검증 빌드는 ACP `117cf6c9d536c4aa98b1f3a6481c12464584
 | 세션 생성·목록·복구·분기·종료 | native session + SQLite 이력·설정·요청 기록 | 표준 ACP, 분기 전환은 client action |
 | 모델·추론·권한 변경 | native setter, 모델별 추론 수준, 실행 전 승인 | `configOptions`, legacy modes/models |
 | 텍스트·추론·도구·이미지 입력 | 스트리밍, 실패·취소, 파일 위치 | 표준 ACP |
-| 서브에이전트 진행 | native `aelix_subagent` → 부모 `agent` 도구 호출의 `tool_call_update` + `_meta` | 표준 ACP (기존 도구 카드) |
+| 서브에이전트 진행 | native `aelix_subagent`·`aelix_child` → 부모 `agent` 도구 호출의 `tool_call_update` + `_meta` (`lastText`·`stuck`·`wrappingUp`·`currentTool`·`end` 포함). `aelix/nestedToolCalls`를 선언한 클라이언트에는 자식의 도구 호출도 `"<자식 id>:<호출 id>"` 도구 호출로(`session/load` 재생도 선언한 클라이언트에만) | 표준 ACP (기존 도구 카드), 중첩은 선택 |
+| 자식 제어 | `_aelix/manage children/list·events·steer·wrap_up·stop`: 턴·`agents/run` 중에도 응답, 워커 재시작·종료 중에는 거부 | `_aelix/manage` 화면 연결 필요 |
+| 자식 승인 | native `childApproval` → `session/request_permission` (Allow once / Allow for this agent / Reject). native가 버린 질문은 `$/cancel_request`로 거둠 | 표준 ACP, `aelix/clientActions` 클라이언트 |
+| 작업 알림 | native `aelix_notice` → `_aelix/notice`, `children/notices`가 알림 턴 실행 | `aelix/notices` 선언 필요 |
 | 세션 잠금 | native "already open" 거부와 ACP 세션 lease를 구조화된 오류로 | 오류 표시 |
 | 슬래시 명령 | 명시적 라우터 + native 확장·스킬·프롬프트 실행 | 목록·텍스트는 표준, TUI 대화창은 client action |
 | 설정·인증 | 타입을 제한한 사용자 설정, 같은 AuthStorage의 키·OAuth | `_aelix/manage` 화면 연결 필요 |
@@ -30,7 +33,8 @@ beta.2 Preview 내부 검증 빌드는 ACP `117cf6c9d536c4aa98b1f3a6481c12464584
 클라이언트 계약은 [Studio 연동 명세](docs/studio-integration.md)에 있습니다.
 임의의 TUI 위젯, SSH 호스트 관리, 팀 서버·다중 사용자 인증, 터미널 패널,
 전체 브라우저·HTML 렌더러는 이 stdio 어댑터와 별도의 기능입니다.
-자식별 승인·중지·steer(S3)는 aelix-ai #612 판정 뒤의 작업입니다.
+위임된 자식의 제어·승인·알림(aelix-ai #612)은 `runtime-reference.json`의 native가
+`children/` 메서드를 광고할 때만 동작하며, 계약과 조건은 [Studio 연동 명세](docs/studio-integration.md#delegated-children)에 있습니다.
 
 ## 실행
 
@@ -60,7 +64,14 @@ aelix-acp --extension installed_module:setup \
 `--state-dir` 기본값은 `~/.aelix/acp`이며 `AELIX_ACP_STATE_DIR`로 바꿀 수 있습니다.
 이 디렉터리는 ACP ID와 native transcript의 연결, 설정, 표시 이력, 요청 결과를 보관합니다.
 `session/delete`는 ACP 기록을 삭제하며 native transcript 파일을 지우지는 않습니다.
-`sessions/close` 또는 `/quit`는 기록을 유지하면서 프로세스 슬롯을 반환합니다.
+`session/close`, `sessions/close` 또는 `/quit`는 기록을 유지하면서 프로세스 슬롯을 반환합니다.
+POSIX에서 native를 닫을 때는 SIGTERM 뒤 기다렸다가 SIGKILL합니다. 위임 자식이나 백그라운드
+작업을 다루는 native(`children/list` 또는 `children/notices`를 광고)는 45초, 그 밖에는 5초입니다.
+보통은 native가 먼저 끝나므로 지연이 늘지 않습니다(macOS, 합성 모델: 유휴·자식 실행·백그라운드 bash 모두
+요청부터 native 종료까지 0.08–0.55초, 같은 세션의 `session/load`는 새 native 시작을 포함해 0.61–1.01초).
+종료 단계가 8초 걸린 native는 45초 기한에서 끝까지 실행됐고(8.08–8.12초), `a78db59`의 5초 기한에서는
+5.01초에 강제 종료됐습니다. 닫는 동안에도 native의 출력을 읽으므로 native가 멈추며 보낸 자식의 마지막
+프레임이 클라이언트와 기록에 남습니다. Windows는 그대로 Job Object를 닫아 즉시 끝냅니다.
 같은 저장 세션을 두 ACP 프로세스가 열면 OS 파일 잠금으로 두 번째를 거부합니다.
 CLI 등 다른 native 프로세스가 같은 transcript를 쓰고 있으면 native가 거부하며,
 어댑터는 이를 `-33001` 구조화 오류로 전달합니다. 보유자 정보는 aelix-ai의
@@ -75,6 +86,17 @@ CLI 등 다른 native 프로세스가 같은 transcript를 쓰고 있으면 nati
 ACP **Allow once / Reject** 승인을 받습니다. Yolo는 client 질문만 생략하며 native guardrail,
 활성 도구 제한, 다른 확장의 거부, 승인 브리지는 그대로 둡니다. native에는 Plan·Auto Edit·Auto도
 있지만 headless RPC 동작이 수용되지 않아 광고하지 않습니다.
+
+Ask 세션의 위임 자식은 2026-11-18 오너 결정("default로 돌며 물어봄 (권장)")에 따라 default로 돌며
+변경 전마다 묻습니다. `aelix/clientActions`를 선언한 클라이언트에 한해, native가 `children/list`를
+광고하면 어댑터가 `ui/enable {enabled: true, childApprovals: true}`를 보내고, 자식의 질문을
+`session/request_permission`으로 전달합니다. 선택지는 **Allow once / Allow for this agent / Reject**이고
+취소·클라이언트 오류·교체된 epoch의 요청은 모두 거부(`cancelled`)로 답합니다. 자식이 끝나거나 멈추거나
+native가 질문을 거두면(`withdrawn`·`denied`, 새 epoch) 어댑터는 native에 거부로 답하고 클라이언트에
+ACP `$/cancel_request`를 보냅니다. 이를 무시하는 클라이언트의 대화창은 열려 있지만 그 답은 효과가 없습니다.
+질문 하나는 native의 300초가 지나면 native가 스스로 끝냅니다. 그렇지 않은 클라이언트(`aelix/clientActions`
+미선언)에서 자식은 이전처럼 native의 `plan`(읽기 전용)으로 돕니다. 이는 오너의 Q-A보다 좁으며
+리드의 판단입니다. 자세한 형식은 [Studio 연동 명세](docs/studio-integration.md#child-approvals)에 있습니다.
 
 `--permission-mode default|yolo`는 새 세션의 초기 모드입니다. 저장 세션은 기록된 모드로
 native를 시작하고 `permissions/get`으로 확인합니다. 기록이 없는 이전 세션은 Ask이고,
@@ -120,6 +142,11 @@ AionCore는 `retryable == true`인 오류만 한 번 자동 재실행하며 이 
 v0.2.2 host는 이런 턴을 한 번 다시 보냅니다. 응답을 잃은 뒤 사용자가 다시 보낸 요청은 결정에 따라 새 턴입니다.
 `_meta["aelix/requestId"]`로 같은 요청을 다시 보내면 완료된 결과를 재생하고,
 결과가 불확실한 요청은 다시 실행하지 않습니다(`-32006`).
+자식 제어(`children/steer`·`wrap_up`·`stop`·`list`·`events`)는 워커 재시작·종료가 시작된 뒤 들어오면
+아무것도 쓰기 전에 `-32000` "the session is changing"으로 거부합니다. 이미 native에 쓴 요청은 워커를
+닫기 시작할 때(`_close()`, 재시작이면 그 확인 단계 뒤) 끝냅니다. 그때까지 native가 답하지 않았으면
+`-33002`(`cause.kind: "session_changed"`) "its delivery is unknown"으로 답하고, 그 전에 native가 답했으면
+변경이 시작된 뒤 온 답이라도 그 답을 돌려줍니다(Python 3.11–3.14 동일). 워커가 먼저 죽은 요청은 `-32603`입니다.
 
 자세한 경계와 복구 보장은 [설계 기록](docs/architecture.md)에 있습니다.
 
@@ -138,7 +165,9 @@ python -m aelix_acp.preview /absolute/path/to/analysis-project RUN_ID
 ## 검증
 
 ```sh
-PYTHONPATH=src python -m unittest discover -s tests -v
+PYTHONPATH=src:tests python -m unittest discover -s tests -v
+# 모듈 하나만: tests/support.py를 가져오므로 tests도 경로에 둡니다.
+PYTHONPATH=src:tests python -m unittest tests.test_children -v
 
 # 고정한 native workspace(uv sync --all-packages)로 실제 프로세스 테스트까지 실행합니다.
 # 로컬 합성 모델 endpoint와 임시 MCP만 사용하고 사용자 키나 인터넷 모델 호출은 쓰지 않습니다.

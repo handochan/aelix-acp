@@ -19,8 +19,8 @@ import tempfile
 import time
 import uuid
 
-from .wire.errors import (ProtocolError, BackendError, after_dispatch, fork_head_changed, is_native_session_locked,
-                          require_object, require_string, session_locked)
+from .wire.errors import (ProtocolError, BackendError, after_dispatch, delivery_unknown, fork_head_changed,
+                          is_native_session_locked, require_object, require_string, session_changing, session_locked)
 from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter
 from .runtime.controls import SessionControls, MODE_IDS
@@ -32,6 +32,8 @@ from .runtime.commands import (BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_START
 from .runtime.extensions import extension_reference
 from .runtime.leases import acquire as acquire_lease, lease_path
 from .runtime.subagents import SubagentTracker
+from .runtime.children import (CHILD_META, END_STATUS, NESTED_TOOL_CALLS, NOTICES, SYNTHETIC_PREFIX, TOOL_STATUS,
+                               ChildRoutes, terminal)
 
 PACKAGE = Path(__file__).resolve().parent
 KINDS = {"read": "read", "grep": "search", "find": "search", "ls": "read",
@@ -51,7 +53,34 @@ READ_ONLY_COMMANDS = frozenset({"get_state", "get_messages", "get_available_mode
                                 "export_html", "abort", "abort_retry", "abort_bash"})
 READ_ONLY_CONTROLS = frozenset({"capabilities", "resources/list", "settings/get", "permissions/get",
                                 "permissions/evaluate", "mcp/status", "extensions/list", "auth/status",
-                                "agents/list", "agents/show", "commands/cancel"})
+                                "agents/list", "agents/show", "commands/cancel",
+                                "children/list", "children/events"})
+# aelix-ai #612: a host's view of and interventions on delegated children. Native
+# answers them during a turn and during agents/run (its CONCURRENT_METHODS and the
+# two lock-free reads), so ACP sends them outside mutation_lock. They act on a
+# child, not on the turn, so they never mark a running turn dispatched.
+CONCURRENT_CONTROLS = frozenset({"children/list", "children/events", "children/steer",
+                                 "children/wrap_up", "children/stop"})
+# A cancelled turn that still streams is aborted again at native's own grace
+# (aelix-ai harness/core.py _REABORT_GRACE_SECONDS), not at every 50 ms poll.
+REABORT_SECONDS = 2.0
+# How long a closing POSIX worker that serves delegated children or background
+# jobs gets between SIGTERM and SIGKILL: native's session-end stages (the turn's
+# settle, the jobs' owner_end and the job service's shutdown) take about 40 s
+# at their bounds (aelix-ai contract r5 section 6.4). Others keep 5 s.
+CHILDREN_CLOSE_SECONDS = 45.0
+# A child's question waits for native's own bound (aelix-ai rpc/control_ui.py
+# DIALOG_TIMEOUT_SECONDS, 300 s): there native answers it itself and the child
+# reads "no answer from the host within 300 s" (fix round 1, P-LOW-4), and its
+# `denied` step takes the request back. The adapter's bound is a backstop past it.
+CHILD_QUESTION_SECONDS = 330.0
+CHILD_APPROVAL_OPTIONS = {"allow_once": ("allow-once", "Allow once"),
+                          "allow_always": ("allow-always", "Allow for this agent"),
+                          "reject_once": ("reject-once", "Reject")}
+# Native UI methods that need no answer.
+UI_NOTIFICATIONS = frozenset({"notify", "setStatus", "setWidget", "setTitle", "authProgress"})
+# How long a worker that exited gets for its last stdout lines to be read.
+READ_TAIL_SECONDS = 2.0
 STDERR_TAIL = 16 * 1024
 FRAME_LIMIT = 16 * 1024 * 1024
 # An unauthenticated loopback peer gets one bounded line for its token.
@@ -86,6 +115,15 @@ async def read_line(reader, limit):
     return bytes(line)
 
 
+def ui_enable_params(methods):
+    """`ui/enable` for a client-action client; with a children-capable native, its child approvals too.
+
+    aelix-ai #612 (ADR-0308): a delegated child of an Ask parent then asks this
+    client through `session/request_permission` (`Session.child_approval`).
+    """
+    return {"enabled": True, **({"childApprovals": True} if "children/list" in methods else {})}
+
+
 def text_content(content):
     if isinstance(content, str):
         return content
@@ -118,6 +156,18 @@ class Session:
         self.permissions = set()
         self.permission_connections = set()
         self.ui_tasks = set()
+        self.unstarted = set()  # Dialog tasks not yet run: answer_unstarted answers one cancelled before it ran.
+        # Open child questions: a future set when the question is void -> (epoch, child id, call id).
+        self.questions = {}
+        self.children = ChildRoutes()
+        self.child_calls = set()  # Synthetic top-level cards opened for unparented children.
+        self.changing = 0  # Raised while restart() or close() replaces or ends the worker.
+        self.interventions = {}  # CONCURRENT_CONTROLS requests waiting for native: task -> its answer's future.
+        self.fenced = set()  # Those a restart or close interrupted.
+        self.reader = None  # The read_rpc task.
+        self.ending = False  # While _close() ends the worker.
+        self.last_abort = None
+        self.aborts = 0  # Native aborts sent, by any path.
         self.management_task = None
         self._close_task = None
         self.lease = None
@@ -347,7 +397,7 @@ class Session:
                     await self.controls.set(config_id, config[config_id], publish=False)
         metadata = getattr(self.server, "client_capabilities", {}).get("_meta", {})
         if metadata.get("aelix/clientActions") is True and "ui/enable" in methods:
-            await self.rpc("aelix_control", method="ui/enable", params={"enabled": True})
+            await self.rpc("aelix_control", method="ui/enable", params=ui_enable_params(methods))
         if guard_selectors:
             await self.selector_startup(nonce, "finish")
         if fork_source is None:
@@ -547,6 +597,8 @@ class Session:
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
+        if (task := asyncio.current_task()) in self.interventions:
+            self.interventions[task] = future  # raise_fence reads whether native answered.
         try:
             if self.rpc_closed:
                 raise ProtocolError(self.failure or "Aelix RPC stream is closed", -32603)
@@ -555,7 +607,7 @@ class Session:
             self.proc.stdin.write((json.dumps({"id": request_id, "type": command, **kwargs}) + "\n").encode())
             await self.proc.stdin.drain()
             if self.turn_active and command not in READ_ONLY_COMMANDS and not (
-                    command == "aelix_control" and kwargs.get("method") in READ_ONLY_CONTROLS):
+                    command == "aelix_control" and kwargs.get("method") in READ_ONLY_CONTROLS | CONCURRENT_CONTROLS):
                 self.dispatched = True
             try:
                 return await asyncio.wait_for(future, _timeout)
@@ -583,6 +635,7 @@ class Session:
             writer.close()
 
     async def read_rpc(self):
+        self.reader = asyncio.current_task()
         try:
             while line := await self.proc.stdout.readline():
                 try:
@@ -637,6 +690,7 @@ class Session:
             if kind == "tool_execution_start":
                 # Aelix emits execution_start before the extension consent hook.
                 self.subagents.tool_started(call_id, name)
+                self.children.call_started(call_id)
                 call = tool_call(call_id, name, event.get("args") or {}, self.cwd, "pending")
                 known = call_id in self.tools
                 self.tools[call_id] = call
@@ -675,12 +729,54 @@ class Session:
                 self.failure = error
         elif kind == "aelix_subagent":
             await self.subagent_progress(event.get("event"), event.get("data") or {})
+        elif kind == "aelix_child":
+            await self.child_progress(event.get("event"), event.get("data"))
+        elif kind == "aelix_notice":
+            # aelix-ai #612: a job notice waits; the client wakes the session with
+            # _aelix/manage children/notices. Only a client that asked gets it.
+            if self.declares(NOTICES):
+                await self.notify("_aelix/notice", {
+                    "sessionId": self.id, "event": event.get("event"),
+                    "data": event.get("data") if isinstance(event.get("data"), dict) else {}})
         elif kind == "extension_ui_request":
-            task = asyncio.create_task(self.handle_ui(event))
+            if self.ending:
+                # Native is being ended while its frames are still read: no one is asked.
+                if event.get("method") not in UI_NOTIFICATIONS and self.proc and self.proc.returncode is None:
+                    with contextlib.suppress(ConnectionError, RuntimeError):
+                        self.proc.stdin.write((json.dumps({"type": "extension_ui_response", "id": event.get("id"),
+                                                           "cancelled": True}) + "\n").encode())
+                return
+            # A child's question is registered before its task runs: a frame read meanwhile can void it.
+            void = self.open_question(event) if event.get("method") == "childApproval" else None
+            task = asyncio.create_task(self.handle_ui(event, void))
             self.tasks.add(task)
             self.ui_tasks.add(task)
             task.add_done_callback(self.tasks.discard)
             task.add_done_callback(self.ui_tasks.discard)
+            if event.get("method") not in UI_NOTIFICATIONS:
+                self.unstarted.add(task)  # handle_ui's first step takes it out
+                task.add_done_callback(lambda ended: self.answer_unstarted(ended, event, void))
+
+    def answer_unstarted(self, task, event, void):
+        """A dialog's task ended before it first ran: native's one answer is `{cancelled: true}` (fix round 2, F2).
+
+        A `session/cancel` handled in the loop turn that created the task cancels
+        it before its coroutine starts, so neither its client request nor the
+        answer `handle_ui` writes (a child question's in its `finally`, an
+        extension dialog's after its try) happens, and native would wait its 300 s
+        (one child question at a time, so the next child's too). A child's
+        question and an extension's dialog alike get the cancelled answer that
+        one cancelled a turn later gets.
+        """
+        if task not in self.unstarted:
+            return
+        self.unstarted.discard(task)
+        if void is not None:
+            self.questions.pop(void, None)
+        if self.proc and self.proc.returncode is None and not self.rpc_closed:
+            with contextlib.suppress(ConnectionError, RuntimeError):
+                self.proc.stdin.write((json.dumps({"type": "extension_ui_response", "id": event.get("id"),
+                                                   "cancelled": True}) + "\n").encode())
 
     async def subagent_progress(self, name, data):
         """Show a delegated child on its parent `agent` tool call (standard ACP)."""
@@ -688,8 +784,7 @@ class Session:
         if parent is None:
             # No parent tool call (for example `/agents run`): keep the
             # extension notification. Standard clients ignore it.
-            await self.server.send({"jsonrpc": "2.0", "method": "_aelix/subagent",
-                                    "params": {"sessionId": self.id, "event": name, "data": data}})
+            await self.notify("_aelix/subagent", {"sessionId": self.id, "event": name, "data": data})
             return
         if meta is None:
             return
@@ -698,10 +793,144 @@ class Session:
             update["status"] = "in_progress"
         await self.update(update)
 
+    def declares(self, capability):
+        metadata = getattr(self.server, "client_capabilities", {}).get("_meta") or {}
+        return metadata.get(capability) is True
+
+    async def child_progress(self, name, data):
+        """One native `aelix_child` frame (aelix-ai #612) as standard ACP updates.
+
+        Every client gets the child's `lastText`, `stuck`, `wrappingUp` and `end` on
+        its parent card's `_meta["aelix/subagents"]`. A client that declared
+        `aelix/nestedToolCalls` also gets the child's own calls as tool calls
+        `"<child id>:<call id>"` with `_meta.parentToolCallId`, and a child with no
+        parent call (`/agents run`) as a top-level card `aelix-child:<id>`.
+        """
+        epoch = self.children.epoch
+        routed = self.children.accept(name, data)
+        if self.children.epoch != epoch:
+            self.epoch_changed()
+        if isinstance(data, dict) and (terminal(name, data) or (
+                name == "approval" and data.get("step") in ("withdrawn", "denied"))):
+            # Native has dropped the question (fix round 1, P-LOW-1): the child ended, or
+            # its request was withdrawn or answered without this client (its 300 s, a plan).
+            asked = (data.get("epoch"), data.get("id"), *([data.get("callId")] if name == "approval" else []))
+            self.void_questions(lambda key: key[:len(asked)] == asked)
+        if routed is None:
+            return
+        key, parent = routed
+        epoch, child_id = key
+        nested = self.declares(NESTED_TOOL_CALLS)
+        card = parent or SYNTHETIC_PREFIX + child_id
+        ended = terminal(name, data)
+        child = {"id": child_id, "epoch": epoch, "seq": data["seq"], "event": name}
+        if ended:
+            child["end"] = data.get("end")
+        if parent is None and not nested:
+            # Without nesting an unparented child keeps `_aelix/subagent` (subagent_progress).
+            if ended:
+                self.children.ended(key)
+            return
+        if parent is None and name == "state" and card not in self.child_calls:
+            self.child_calls.add(card)
+            await self.update({"sessionUpdate": "tool_call", "toolCallId": card, "kind": "other",
+                               "title": f"agent {data.get('profile') or ''}".strip(), "status": "in_progress",
+                               "_meta": {CHILD_META: child}})
+        running = None
+        if name in ("tool_start", "tool_end") and isinstance(data.get("callId"), str):
+            tool = data.get("name") if isinstance(data.get("name"), str) else "tool"
+            # The tool a child runs, on its entry for every client, as aelix_subagent's
+            # currentTool did for a foreground child (fix round 1, Codex C-L7).
+            running = {"currentTool": self.children.tool(key, data["callId"], tool if name == "tool_start" else None)}
+        if nested and name in ("tool_start", "tool_end", "approval") and isinstance(data.get("callId"), str):
+            await self.child_tool(name, data, card, child)
+        fields = {"state": {"profile": data.get("profile"), "state": data.get("state"),
+                            "wrappingUp": data.get("wrappingUp") is True},
+                  "text": {"lastText": data.get("text")}, "stuck": {"stuck": data.get("stuck")},
+                  "wrap_up": {"wrappingUp": data.get("requested") is True},
+                  "tool_start": running, "tool_end": running}.get(name)
+        if fields is not None:
+            if ended:
+                fields.update(end=data.get("end"), currentTool=None)
+            # Onto what this child showed before: the next prompt's clear dropped its entry (V-F1).
+            meta = self.subagents.merge(card, child_id, self.children.remember(key, fields))
+            closing = ended and parent is None
+            if meta is not None or closing:
+                update = {"sessionUpdate": "tool_call_update", "toolCallId": card,
+                          "_meta": {**(meta or self.subagents.meta(card) or {}), CHILD_META: child}}
+                if closing:
+                    update["status"] = END_STATUS.get(data.get("end"), "failed")
+                elif card == self.subagents.open_call:
+                    update["status"] = "in_progress"
+                await self.update(update)
+        if ended:
+            self.children.ended(key)
+            if parent is None:
+                self.child_calls.discard(card)
+
+    def open_question(self, event):
+        """A child's question opens: the future that voids it, keyed by (epoch, child id, call id)."""
+        child, tool = event.get("child"), event.get("tool")
+        key = (child.get("epoch"), child.get("id"), tool.get("callId")) if (
+            isinstance(child, dict) and isinstance(tool, dict)) else (None, None, None)
+        void = asyncio.get_running_loop().create_future()
+        self.questions[void] = key
+        return void
+
+    def void_questions(self, matches):
+        """End the adapter's wait on each open child question whose key `matches`: native has dropped it."""
+        for void, key in list(self.questions.items()):
+            if not void.done() and matches(key):
+                void.set_result(None)
+
+    def epoch_changed(self):
+        """Native's epoch is newer (a frame, or a children/list or children/events reply): its questions are void."""
+        current = self.children.epoch
+        self.void_questions(lambda key: key[0] != current)
+
+    def observe_epoch(self, epoch):
+        if isinstance(epoch, str) and epoch:
+            before = self.children.epoch
+            self.children.observe(epoch)
+            if self.children.epoch != before:
+                self.epoch_changed()
+
+    async def child_tool(self, name, data, card, child):
+        call_id = f"{child['id']}:{data['callId']}"
+        meta = {"parentToolCallId": card, CHILD_META: child}
+        if name == "tool_start":
+            tool = data.get("name") if isinstance(data.get("name"), str) else "tool"
+            update = {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": tool,
+                      "kind": KINDS.get(tool, "other"), "status": "in_progress", "_meta": meta}
+            if isinstance(data.get("args"), str) and data["args"]:
+                update["content"] = [{"type": "content", "content": {"type": "text", "text": data["args"]}}]
+        elif name == "tool_end":
+            update = {"sessionUpdate": "tool_call_update", "toolCallId": call_id,
+                      "status": TOOL_STATUS.get(data.get("status"), "failed"), "_meta": meta}
+        else:
+            status = {"asked": "pending", "allowed": "in_progress"}.get(data.get("step"))
+            if status is None:
+                return  # A denied or withdrawn call ends with its tool_end.
+            update = {"sessionUpdate": "tool_call_update", "toolCallId": call_id, "status": status, "_meta": meta}
+        await self.update(update)
+
     async def update(self, update):
         append_event(self.server.db, self.id, update)
-        await self.server.send({"jsonrpc": "2.0", "method": "session/update",
-                                "params": {"sessionId": self.id, "update": update}})
+        await self.notify("session/update", {"sessionId": self.id, "update": update})
+
+    async def notify(self, method, params):
+        """One notification about this session (`session/update`, `_aelix/notice`, `_aelix/subagent`).
+
+        While the worker is ended, its last frames reach a client still here that
+        was not told this session was replaced (fix round 2, N1: the two `_aelix/`
+        notifications too); a `session/update` is recorded either way.
+        """
+        message = {"jsonrpc": "2.0", "method": method, "params": params}
+        if not self.ending:
+            await self.server.send(message)
+        elif not getattr(self.server, "closing", False) and self.server.sessions.get(self.id) is self:
+            with contextlib.suppress(ConnectionError, OSError):
+                await self.server.send(message)
 
     async def permission(self, reader, writer):
         owner = asyncio.current_task()
@@ -776,16 +1005,20 @@ class Session:
                        for c in dynamic if c.get("name") not in BUILTINS and c.get("name") not in PRIVATE_NATIVE_COMMANDS)
         await self.update({"sessionUpdate": "available_commands_update", "availableCommands": catalog})
 
-    async def handle_ui(self, event):
+    async def handle_ui(self, event, void=None):
+        self.unstarted.discard(asyncio.current_task())  # From here on the answer is this task's (answer_unstarted).
         method = event.get("method")
         if method == "authProgress":
             await self.server.send({"jsonrpc": "2.0", "method": "_aelix/notification",
                                     "params": {"sessionId": self.id, "event": event}})
             return
-        if method in {"notify", "setStatus", "setWidget", "setTitle"}:
+        if method in UI_NOTIFICATIONS:
             text = event.get("message") or event.get("text")
             if text:
                 await self.update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": str(text)}})
+            return
+        if method == "childApproval":
+            await self.child_approval(event, void)
             return
         answer = {"cancelled": True}
         try:
@@ -796,10 +1029,118 @@ class Session:
             self.proc.stdin.write((json.dumps({"type": "extension_ui_response", "id": event.get("id"), **answer}) + "\n").encode())
             await self.proc.stdin.drain()
 
+    async def child_approval(self, event, void=None):
+        """A delegated child asks before a change (aelix-ai #612, ADR-0308): `session/request_permission`.
+
+        Answered from this task, outside mutation_lock, so a parent's own request
+        (the bridge) and a child's can be open together (K13). Every ending that
+        is not an offered choice is `{cancelled: true}`: `session/cancel`, a client
+        error (K16), and a request of an epoch native has since replaced, which is
+        answered without asking. The parent's own approvals stay on the bridge.
+
+        A question native drops while it is open is void (fix round 1, P-LOW-1): the
+        child's end, its request's `withdrawn` or `denied` step, a newer epoch. The
+        adapter then takes the request back from the client (`$/cancel_request`)
+        and answers native `{cancelled: true}`, which it ignores.
+        """
+        if void is None:
+            void = self.open_question(event)
+        answer = {"cancelled": True}
+        try:
+            child, tool = event.get("child"), event.get("tool")
+            choices = {choice.get("kind"): choice.get("id") for choice in event.get("choices") or []
+                       if isinstance(choice, dict) and choice.get("kind") in CHILD_APPROVAL_OPTIONS
+                       and isinstance(choice.get("id"), str)}
+            if (not isinstance(child, dict) or not isinstance(tool, dict) or not choices
+                    or not isinstance(child.get("id"), str) or not isinstance(tool.get("callId"), str)
+                    or self.children.stale(child.get("epoch")) or void.done()
+                    or (self.cancelled and self.done is not None and not self.done.done())):
+                return
+            name = tool.get("name") if isinstance(tool.get("name"), str) else "tool"
+            args = tool.get("args") if isinstance(tool.get("args"), dict) else {}
+            cwd = child.get("cwd") if isinstance(child.get("cwd"), str) else self.cwd
+            call = tool_call(f"{child['id']}:{tool['callId']}", name, args, cwd)
+            nested = self.declares(NESTED_TOOL_CALLS)
+            if not nested and isinstance(event.get("title"), str) and event["title"]:
+                # This id names no card such a client has: native's title says who asks for what. A
+                # nesting client keeps its nested card's own title, the tool's name (fix round 1, NIT-5).
+                call["title"] = event["title"]
+            meta = {CHILD_META: {key: child.get(key) for key in ("id", "epoch", "profile", "jobId", "background")}}
+            if nested:
+                parent = child.get("parentToolCallId")
+                meta["parentToolCallId"] = (self.children.card_of(parent) if isinstance(parent, str) and parent
+                                            else SYNTHETIC_PREFIX + child["id"])
+            call["_meta"] = meta
+            options = [{"optionId": CHILD_APPROVAL_OPTIONS[kind][0], "name": CHILD_APPROVAL_OPTIONS[kind][1], "kind": kind}
+                       for kind in CHILD_APPROVAL_OPTIONS if kind in choices]
+            reply = await self.ask_client({"sessionId": self.id, "toolCall": call, "options": options}, void)
+            if reply is None:
+                return
+            outcome = reply.get("outcome") or {}
+            selected = next((choices[kind] for kind in choices if outcome.get("outcome") == "selected"
+                             and outcome.get("optionId") == CHILD_APPROVAL_OPTIONS[kind][0]), None)
+            if selected is not None:
+                answer = {"value": selected}
+        except (Exception, asyncio.CancelledError):
+            answer = {"cancelled": True}
+        finally:
+            self.questions.pop(void, None)
+            if self.proc and self.proc.returncode is None and not self.rpc_closed:
+                with contextlib.suppress(ConnectionError, RuntimeError):
+                    self.proc.stdin.write((json.dumps({"type": "extension_ui_response", "id": event.get("id"),
+                                                       **answer}) + "\n").encode())
+                    await self.proc.stdin.drain()
+
+    async def end_children(self):
+        """The worker is gone: close each card its live children left open (fix round 1, Codex C-M3, P-LOW-2).
+
+        Native's own terminal frames, read through its shutdown, close the cards of
+        the children it ended. For a child still live when the worker was gone, its
+        own calls still open become `failed`, and its entry on the card gets state
+        and end `stopped` (native's end for a child a stop ended), with
+        `_meta["aelix/child"].closedBy = "adapter"`; its top-level card closes
+        `failed`. Then the epoch is retired: a frame or question of it is stale.
+        """
+        nested = self.declares(NESTED_TOOL_CALLS)
+        for key, parent, seq, calls in self.children.live():
+            epoch, child_id = key
+            card = parent or SYNTHETIC_PREFIX + child_id
+            child = {"id": child_id, "epoch": epoch, "seq": seq, "event": "state", "end": "stopped",
+                     "closedBy": "adapter"}
+            if nested:
+                for call in calls:
+                    await self.update({"sessionUpdate": "tool_call_update", "toolCallId": f"{child_id}:{call}",
+                                       "status": "failed", "_meta": {"parentToolCallId": card, CHILD_META: child}})
+            if parent is None and not nested:
+                continue
+            meta = self.subagents.merge(card, child_id, self.children.remember(
+                key, {"state": "stopped", "end": "stopped", "currentTool": None}))
+            update = {"sessionUpdate": "tool_call_update", "toolCallId": card,
+                      "_meta": {**(meta or self.subagents.meta(card) or {}), CHILD_META: child}}
+            if parent is None:
+                update["status"] = END_STATUS.get("stopped", "failed")
+                self.child_calls.discard(card)
+            await self.update(update)
+        self.children.retire()
+
+    async def ask_client(self, params, void):
+        """The client's reply to a child's question, or None once the question is void (its request taken back)."""
+        request = asyncio.ensure_future(self.server.client_request("session/request_permission", params, withdraw=True,
+                                                                  timeout=CHILD_QUESTION_SECONDS))
+        try:
+            await asyncio.wait({request, void}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not request.done():
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+        return None if void.done() else request.result()
+
     async def restart(self, *, extensions=None, trust_project=None, agents_enabled=None, preserve_history=False):
         if self.id in self.server.starting_ids:
             raise ProtocolError("Session is already starting", -32000)
         self.server.starting_ids.add(self.id)
+        # Children actions are refused until this returns; close() below ends those in flight.
+        self.changing += 1
         if self.turn_active:
             self.dispatched = True  # Replacing the worker is itself an effect.
         held_lease = self.lease
@@ -855,6 +1196,51 @@ class Session:
             raise
         finally:
             self.server.starting_ids.discard(self.id)
+            self.changing -= 1
+
+    def raise_fence(self):
+        """A close begins (aelix-ai #612; a restart's too): end the child interventions waiting for native.
+
+        Each one native has not answered yet has its line on native's stdin, so it
+        answers that its delivery is unknown (`intervene`). One native answered
+        before the fence rose returns that answer, on every Python version (fix
+        round 1, Codex C-M1: 3.11's `wait_for` returned it and 3.12's raised).
+        New ones are refused until the fence is lowered. Only this ends any:
+        restart()'s own raise of the counter, before its close, refuses new
+        ones alone (fix round 2, F1).
+        """
+        self.changing += 1
+        for task, answer in list(self.interventions.items()):
+            if not task.done() and (answer is None or not answer.done()):
+                self.fenced.add(task)
+                task.cancel()
+
+    async def intervene(self, action, arguments):
+        """One CONCURRENT_CONTROLS request: outside mutation_lock, during a turn or agents/run."""
+        if (self.changing or self._close_task is not None or self.rpc_closed
+                or self.proc is None or self.proc.returncode is not None):
+            raise session_changing()
+        task = asyncio.current_task()
+        # No await between the check above and the line's write in rpc().
+        self.interventions[task] = None
+        try:
+            try:
+                answer = await self.rpc("aelix_control", method=action, params=arguments, _timeout=60)
+            except (asyncio.CancelledError, ProtocolError):
+                if task not in self.fenced:
+                    raise
+            else:
+                if task not in self.fenced:
+                    if action in ("children/list", "children/events") and isinstance(answer, dict):
+                        self.observe_epoch(answer.get("epoch"))  # P-LOW-1: a reply names native's epoch too
+                    return answer
+                # Python 3.11's wait_for returns an answer that came after the fence's cancel.
+            if task.cancelling():
+                task.uncancel()
+            raise delivery_unknown(action) from None
+        finally:
+            self.interventions.pop(task, None)
+            self.fenced.discard(task)
 
     async def recover_after_compaction(self):
         if not self.compaction_recovery_needed:
@@ -997,16 +1383,52 @@ class Session:
                 text = prepared
         if self.cancelled:
             return {"stopReason": "cancelled"}
+        return await self.drive_turn(lambda: self.rpc("prompt", message=text, **({"images": images} if images else {})))
+
+    async def notice_turn(self):
+        """`_aelix/manage children/notices` (aelix-ai #612): native's notice turn, run as a prompt turn.
+
+        Called under mutation_lock. Native runs the whole turn before it answers
+        `{started, placed, reason, remaining}`; the turn timeout bounds it and
+        `session/cancel` cancels it (native's commands/cancel, then abort): the
+        answer is then `{stopReason: "cancelled"}` with no native fields, since
+        native answered the cancelled request with an error. A notice it placed
+        stays placed.
+        """
+        if self.done and not self.done.done():
+            raise ProtocolError("A prompt is already running in this session")
+        # A cancel of an earlier turn must not deny this turn's tools (the bridge reads it).
+        self.cancelled = False
+        answer, sent = {}, []
+
+        async def send():
+            sent.append(True)
+            try:
+                answer.update(await self.rpc("aelix_control", method="children/notices", params={}, _timeout=None))
+            except BackendError:
+                if not self.cancelled:
+                    raise
+
+        try:
+            stop = await self.drive_turn(send)
+        except Exception as failure:
+            if not sent:
+                raise
+            raise after_dispatch(failure) from None
+        return {**answer, **stop}
+
+    async def drive_turn(self, send):
+        """Run the native turn `send` starts until native is idle, under the turn timeout."""
         self.done = asyncio.get_running_loop().create_future()
         self.failure = None
         self.tools.clear()
-        self.subagents.clear()
+        self.subagents.clear()  # Per turn; self.children (spawned children's parents) stays.
         try:
             timeout = getattr(self.server.args, "turn_timeout", 600)
             async with asyncio.timeout(timeout or None):
-                await self.rpc("prompt", message=text, **({"images": images} if images else {}))
+                await send()
                 if self.cancelled:
-                    await self.cancel()
+                    await self.cancel(again=True)
                 await self.wait_until_idle()
             await self.context.finish_compaction("failed")
             await self.publish_context_usage()
@@ -1029,14 +1451,28 @@ class Session:
             self.state = await self.rpc("get_state")
             if not self.state.get("isStreaming", self.state.get("is_streaming", False)):
                 return
-            if self.cancelled:
+            if self.cancelled and self.abort_due():
                 # Native acceptance precedes before_agent_start/build_context.
-                # An earlier abort can precede the turn task's creation.
-                with contextlib.suppress(ProtocolError, TimeoutError):
-                    await self.rpc("abort", _timeout=5)
+                # An earlier abort can precede the turn task's creation. Native
+                # gives an abort REABORT_SECONDS to end a turn before its own
+                # next one (aelix-ai #800 K5: every poll was one more abort).
+                await self.abort()
             await asyncio.sleep(0.05)
 
-    async def cancel(self):
+    def abort_due(self):
+        return self.last_abort is None or time.monotonic() - self.last_abort >= REABORT_SECONDS
+
+    async def abort(self):
+        self.aborts += 1
+        self.last_abort = time.monotonic()
+        with contextlib.suppress(ProtocolError, TimeoutError):
+            await self.rpc("abort", _timeout=5)
+
+    async def cancel(self, *, again=False):
+        """Cancel the turn. `again`: the turn's own re-cancel, sent only once an abort is due."""
+        # Every open child question ends, during a manual /compact too (fix round 1, P-LOW-3).
+        # An extension's dialog opened during /compact stays open: the compaction goes on.
+        self.void_questions(lambda key: True)
         if self.context.manual_compaction:
             # Classic RPC abort only interrupts native turns and retries.
             # Keep waiting for the actual manual compaction outcome.
@@ -1047,12 +1483,16 @@ class Session:
             self.management_task.cancel()
         for task in [*self.permission_connections, *self.permissions, *self.ui_tasks]:
             task.cancel()
+        if again and not self.abort_due():
+            return
+        aborts = self.aborts
         if "commands/cancel" in self.controls.capabilities.get("methods", []) and self.proc and self.proc.returncode is None:
             with contextlib.suppress(ProtocolError, TimeoutError):
                 await self.rpc("aelix_control", method="commands/cancel", params={}, _timeout=5)
-        if self.proc and self.proc.returncode is None:
-            with contextlib.suppress(ProtocolError, TimeoutError):
-                await self.rpc("abort", _timeout=5)
+        # The turn's poll may have aborted while commands/cancel waited: that was
+        # this cancel's one abort (fix round 1, Codex C-M2).
+        if self.proc and self.proc.returncode is None and self.aborts == aborts:
+            await self.abort()
 
     async def close(self):
         if self._close_task is None:
@@ -1062,6 +1502,15 @@ class Session:
         await asyncio.shield(self._close_task)
 
     async def _close(self):
+        self.raise_fence()
+        self.ending = True
+        try:
+            await self._end_worker()
+        finally:
+            self.ending = False
+            self.changing -= 1
+
+    async def _end_worker(self):
         self.permission_token = None
         await self.settle_exit()
         for task in list(self.permission_connections):
@@ -1069,7 +1518,10 @@ class Session:
         await asyncio.gather(*self.permission_connections, return_exceptions=True)
         for task in list(self.permissions):
             task.cancel()
-        owned_tasks = [task for task in self.tasks if task is not asyncio.current_task()]
+        # The reader keeps routing and recording native's frames through its shutdown
+        # (fix round 1, Codex C-M3): its last tool_end and terminal state close the cards.
+        reader = self.reader if self.reader in self.tasks and not self.reader.done() else None
+        owned_tasks = [task for task in self.tasks if task is not asyncio.current_task() and task is not reader]
         for task in owned_tasks:
             task.cancel()
         await asyncio.gather(*owned_tasks, return_exceptions=True)
@@ -1077,7 +1529,8 @@ class Session:
             async def discard(stream):
                 while await stream.read(65536):
                     pass
-            drains = [asyncio.create_task(discard(stream)) for stream in (self.proc.stdout, self.proc.stderr)]
+            drains = [asyncio.create_task(discard(stream)) for stream in
+                      ((self.proc.stderr,) if reader else (self.proc.stdout, self.proc.stderr))]
             try:
                 if self.worker_job:
                     # Kill-on-close ends the worker and every descendant in its job.
@@ -1089,11 +1542,22 @@ class Session:
                         self.proc.kill()
                         await self.proc.wait()
                 else:
-                    await terminate_owned(self.proc)
+                    methods = self.controls.capabilities.get("methods", [])
+                    serves_children = "children/list" in methods or "children/notices" in methods
+                    await terminate_owned(self.proc, grace=CHILDREN_CLOSE_SECONDS if serves_children else 5)
             finally:
                 for task in drains:
                     task.cancel()
                 await asyncio.gather(*drains, return_exceptions=True)
+        if reader is not None:
+            # The worker has exited: its stdout ends once its last lines are read.
+            await asyncio.wait({reader}, timeout=READ_TAIL_SECONDS)
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+        try:
+            await self.end_children()
+        except Exception as failure:  # A card left open must not keep the worker's resources.
+            print(f"[aelix-acp] Could not close the children's cards: {type(failure).__name__}", file=sys.stderr)
         if self.worker_job:
             self.worker_job.close()
             self.worker_job = None

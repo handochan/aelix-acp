@@ -25,7 +25,8 @@ async def kill_windows_tree(process):
             process.kill()
 
 
-async def terminate_owned(process):
+async def terminate_owned(process, *, grace=5):
+    """End `process` and its group: a graceful signal, then a kill after `grace` seconds."""
     if process.returncode is not None:
         return
     if sys.platform == "win32":
@@ -37,7 +38,7 @@ async def terminate_owned(process):
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGTERM)
     try:
-        await asyncio.wait_for(process.wait(), 5)
+        await asyncio.wait_for(process.wait(), grace)
     except TimeoutError:
         if sys.platform == "win32":
             await kill_windows_tree(process)
