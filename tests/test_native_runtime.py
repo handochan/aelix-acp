@@ -1776,3 +1776,39 @@ def setup(api):
         session = await self.open_managed(adapter)
         self.assertEqual(await self.managed_states(adapter, session), {"namespace": "active"})
         self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), {"generation": True})
+
+    async def test_managed_class_factory_keeps_working_when_enabling_callable_instance(self):
+        class_marker = self.root / "class-factory-ran"
+        instance_marker = self.root / "instance-factory-ran"
+        default_enabled = self.managed_module("acp_factory_class", textwrap.dedent(f"""
+            from pathlib import Path
+
+            class Registration:
+                def __init__(self, api):
+                    Path({str(class_marker)!r}).touch()
+
+            setup = Registration
+        """), default_enabled=True)
+        disabled = self.managed_module("acp_factory_instance", textwrap.dedent(f"""
+            from pathlib import Path
+
+            class Registration:
+                def __call__(self, api):
+                    Path({str(instance_marker)!r}).touch()
+
+            setup = Registration()
+        """))
+        adapter = await self.managed_adapter("g1", default_enabled, disabled)
+        session = await self.open_managed(adapter)
+        self.assertEqual(await self.managed_states(adapter, session), {
+            default_enabled["id"]: "active", disabled["id"]: "disabled",
+        })
+        self.assertTrue(class_marker.exists())
+        self.assertFalse(instance_marker.exists())
+        class_marker.unlink()
+        await self.managed_request(adapter, session, "set", extensionId=disabled["id"], value="on")
+        self.assertEqual(await self.managed_states(adapter, session), {
+            default_enabled["id"]: "active", disabled["id"]: "active",
+        })
+        self.assertTrue(class_marker.exists())
+        self.assertTrue(instance_marker.exists())

@@ -116,8 +116,7 @@ class ManagedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 finder.verify_factory(entry.setup, ())
                 finder.verify_factory(entry.Fixture().register, ())
                 finder.verify_factory(partial(entry.setup), ())
-                with self.assertRaisesRegex(ImportError, "must be a Python function"):
-                    finder.verify_factory(entry.Fixture, ())
+                finder.verify_factory(entry.Fixture, ())
                 with self.assertRaisesRegex(ImportError, "catalogued.sibling"):
                     finder.verify_factory(entry.setup, ("catalogued",))
                 entry.__file__ = str(foreign_file)
@@ -127,7 +126,7 @@ class ManagedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 del entry.__file__
                 with self.assertRaisesRegex(ImportError, "verified origin"):
                     finder.verify_factory(entry.setup, ())
-            with self.assertRaisesRegex(ImportError, "must be a Python function"):
+            with self.assertRaisesRegex(ImportError, "no verifiable Python function"):
                 finder.verify_factory(math.sqrt, ())
 
     def test_module_finder_refuses_symlink_outside_generation(self):
@@ -161,5 +160,108 @@ class ManagedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as temp:
             finder = GenerationFinder(str(Path(temp).resolve()), "entry")
-            with self.assertRaisesRegex(ImportError, "must be a Python function"):
+            with self.assertRaisesRegex(ImportError, "no verified origin"):
                 finder.verify_factory(Fixture(), ())
+
+    def test_factory_checks_effective_class_and_instance_slots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            site = Path(temp).resolve()
+            path = site / "class_fixture.py"
+            path.write_text(
+                """class Meta(type):
+    def __call__(cls, api):
+        return super().__call__(api)
+
+class Parent:
+    def __new__(cls, api):
+        return super().__new__(cls)
+
+    def __init__(self, api):
+        pass
+
+class Factory(Parent, metaclass=Meta):
+    pass
+
+class CallableBase:
+    @staticmethod
+    def __call__(api):
+        pass
+
+class CallableFixture(CallableBase):
+    pass
+
+class OpaqueCallable:
+    __call__ = iter
+
+class DynamicMeta(type):
+    def __getattribute__(cls, name):
+        return super().__getattribute__(name)
+
+class DynamicFactory(metaclass=DynamicMeta):
+    pass
+
+class NewDescriptorMeta(type):
+    pass
+
+class DescriptorFactory(metaclass=NewDescriptorMeta):
+    pass
+
+NewDescriptorMeta.__new__ = property(lambda self: None)
+""",
+                encoding="utf-8",
+            )
+            spec = spec_from_file_location("class_fixture", path)
+            module = module_from_spec(spec)
+            spec.loader.exec_module(module)
+            finder = GenerationFinder(str(site), "class_fixture")
+            with patch.dict(sys.modules, {"class_fixture": module}):
+                finder.verify_factory(module.Factory, ())
+                finder.verify_factory(module.CallableFixture(), ())
+                finder.verify_factory(partial(module.Factory), ())
+                with self.assertRaisesRegex(ImportError, "no verifiable Python function"):
+                    finder.verify_factory(module.OpaqueCallable(), ())
+                for factory in (module.DynamicFactory, module.DescriptorFactory):
+                    with self.assertRaisesRegex(ImportError, "dynamic metaclass constructor lookup"):
+                        finder.verify_factory(factory, ())
+
+    def test_factory_and_registration_slots_reject_replaced_code_outside_generation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outside = Path(temp).resolve()
+            site = outside / "site-packages"
+            site.mkdir()
+            path = site / "code_fixture.py"
+            path.write_text(
+                """def setup(api):
+    pass
+
+class Factory:
+    def __init__(self, api):
+        pass
+
+class CallableFixture:
+    def __call__(self, api):
+        pass
+""",
+                encoding="utf-8",
+            )
+            foreign_source = outside / "foreign.py"
+            foreign_source.write_text("def harmless(*args): pass\n", encoding="utf-8")
+            foreign_spec = spec_from_file_location("foreign_fixture", foreign_source)
+            foreign = module_from_spec(foreign_spec)
+            foreign_spec.loader.exec_module(foreign)
+            spec = spec_from_file_location("code_fixture", path)
+            module = module_from_spec(spec)
+            spec.loader.exec_module(module)
+            finder = GenerationFinder(str(site), "code_fixture")
+            candidates = (
+                (module.setup, module.setup),
+                (module.Factory, module.Factory.__init__),
+                (module.CallableFixture(), module.CallableFixture.__call__),
+            )
+            with patch.dict(sys.modules, {"code_fixture": module}):
+                for factory, function in candidates:
+                    with self.subTest(function=function.__qualname__):
+                        finder.verify_factory(factory, ())
+                        function.__code__ = foreign.harmless.__code__
+                        with self.assertRaisesRegex(ImportError, "code resolves outside the selected generation"):
+                            finder.verify_factory(factory, ())

@@ -60,16 +60,39 @@ includes all verified entries, including those disabled by default.
   `sitePackages`. Symlinks and junctions are checked at their resolved targets.
 
   The factory may be a file-backed Python function, a bound Python method,
-  or a plain `functools.partial` around one. ACP rejects C-backed factories,
-  classes, callable instances, and factories with unverified code paths.
+  a Python class, or a callable instance. ACP also verifies the target of a
+  plain `functools.partial`, bound method, or `staticmethod`. For a class ACP checks the
+  class's `__module__` and the effective metaclass `__call__`, class
+  `__new__`, and class `__init__` slots, including inherited methods.
+  The default machinery (`type.__call__`, `object.__new__`, and
+  `object.__init__`) is allowed. For a callable instance ACP checks its
+  class's `__module__` and effective `__call__`. A custom dispatch slot
+  must resolve statically to verifiable Python code. ACP rejects dynamic
+  metaclass constructor lookup, opaque descriptors, C-backed dispatch
+  other than the standard wrappers and defaults above, and unverified
+  Python code paths.
+
   C extension modules can be dependencies. When their module origin is
   checked, they must meet the same file-backed path rule. Namespace packages
   can be containers if every search directory resolves inside `sitePackages`.
   They cannot define the factory. Other modules with missing file metadata
   fail verification. Python dependencies from other generation packages and
-  standard-library imports remain available. These checks verify the managed
-  module load before registration. Trusted extension code runs with normal
-  Python capabilities.
+  standard-library imports remain available.
+
+  Module import and lazy factory attribute lookup run before result
+  verification. A failed check prevents ACP from handing the factory to
+  native for invocation and registration. The class check covers dispatch
+  on the advertised class. If a verified Python `__new__` returns an object
+  with a different initializer, Python selects that initializer as part of
+  the factory's behavior. Calls made by verified Python code during
+  registration and later extension behavior retain normal Python capabilities.
+
+  Studio's current D04 load gate invokes native with the direct `-e`
+  reference and checks `resources/list`. Native accepts a callable when
+  its registration succeeds. That gate may pass an opaque or C-backed
+  callable that this managed module contract refuses. Studio must also
+  apply the managed load contract to certify an entry for the managed
+  snapshot. The native pack load check still applies to pack entries.
 - A pack entry also has `entryPoints`, a nonempty array of explicit
   `module.path:factory` references. Its reference names an absolute wrapper
   directory with exactly one child directory containing
