@@ -24,11 +24,11 @@ from .runtime.controls import MODE_IDS
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
 from .stdio import StdinReader
-from .wire.transport import decode_frame, StdoutWriter
+from .wire.transport import decode_frame, encode_frame, StdoutWriter
 from .runtime.extensions import run_extension_action, require_consent
 from .runtime.leases import acquire as acquire_lease
 from .runtime.leases import lease_path
-from .runtime import forks
+from .runtime import forks, session_relay
 from .runtime.children import NESTED_TOOL_CALLS, nested_only
 
 from .session import CONCURRENT_CONTROLS, Session, text_content, tool_call
@@ -51,6 +51,7 @@ class Server:
         self.args = args
         self.db = open_store(args.state_dir)
         self.initialized = False
+        self.relay_enabled = False
         self.active_request_ids = set()
         self.sessions = {}
         self.starting_ids = set()
@@ -64,7 +65,7 @@ class Server:
 
     async def send(self, message):
         async with self.output_lock:
-            raw = (json.dumps(message, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+            raw = encode_frame(message)
             if self.output is None:
                 self.output = StdoutWriter()
             await self.output.write(raw)
@@ -152,6 +153,7 @@ class Server:
         if any(key in params for key in ("entryId", "lastTurnId", "anchor")):
             raise ProtocolError("Only HEAD forks are supported")
         metadata = require_object(params.get("_meta") or {}, "_meta")
+        binding_id = session_relay.open_binding(metadata) if self.relay_enabled else None
         expected_head = metadata.get("aelix/expectedHead")
         if not isinstance(expected_head, str) or not expected_head or len(expected_head) > 128:
             raise fork_head_changed()
@@ -216,7 +218,7 @@ class Server:
                 raise
             finally:
                 self.starting_ids.discard(identifier)
-        return result
+        return session_relay.bind_session(session, result, binding_id)
 
     async def close_session(self, session):
         if session.mutation_lock.locked():
@@ -227,6 +229,10 @@ class Server:
 
     async def dispatch(self, method, params):
         require_object(params)
+        if handler := session_relay.REQUESTS.get(method):
+            return await self.relay_request(handler, params)
+        if method.startswith(session_relay.METHOD_PREFIX):
+            raise ProtocolError("Unsupported session relay method.", -32601)
         if method == "_aelix/manage" and isinstance(params.get("action"), str) and params["action"] in CONCURRENT_CONTROLS:
             # aelix-ai #612: neither the activity lease nor mutation_lock, which a
             # running session/prompt or agents/run holds (Session.intervene).
@@ -243,6 +249,18 @@ class Server:
             if method == "session/fork":
                 raise ProtocolError("Saved session does not match this workspace and profile")
         return await self.dispatch_request(method, params)
+
+    async def relay_request(self, handler, params):
+        if not self.relay_enabled:
+            raise ProtocolError("Session relay was not negotiated.", -32601)
+        session_relay.require_fields(params, {"sessionId", "bindingId", "payload"})
+        session_id = require_string(params["sessionId"], "sessionId")
+        binding_id = require_string(params["bindingId"], "bindingId")
+        session = self.sessions.get(session_id)
+        relay = session.input_relay if session is not None else None
+        if relay is None or relay.binding_id != binding_id or session_id in self.starting_ids:
+            raise ProtocolError("Session relay binding is unavailable.", session_relay.SCOPE_DENIED)
+        return await handler(relay, params["payload"])
 
     async def intervene(self, params):
         session_id = require_string(params.get("sessionId"), "sessionId")
@@ -267,6 +285,8 @@ class Server:
             forks.recover(self.db, self.args.state_dir)
             self.initialized = True
             self.client_capabilities = capabilities
+            relay_ad = session_relay.advertisement(capabilities)
+            self.relay_enabled = relay_ad is not None
             return {"protocolVersion": 1,
                     "agentInfo": {"name": "aelix-acp", "title": f"Aelix {self.args.profile.title()}", "version": __version__},
                     "agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True, "image": True},
@@ -274,6 +294,7 @@ class Server:
                                           "sessionCapabilities": {"list": {}, "delete": {}, "close": {},
                                                                   "fork": {"_meta": {"aelix/expectedHead": 1}}},
                                           "_meta": {SUBAGENTS_META: {"version": 1, "on": "tool_call_update"},
+                                                    **({session_relay.META_KEY: relay_ad} if relay_ad else {}),
                                                     "aelix/errors": {"sessionLocked": SESSION_LOCKED, "turnFailedAfterDispatch": TURN_FAILED_AFTER_DISPATCH}}},
                     "_meta": {"aelix/control": {"version": 1, "methods": ["_aelix/capabilities", "_aelix/manage"],
                               "clientActionCapability": "aelix/clientActions"},
@@ -282,6 +303,7 @@ class Server:
         if method == "session/fork":
             return await self.fork_head(params)
         if method in ("session/new", "session/load"):
+            binding_id = session_relay.open_binding(params.get("_meta")) if self.relay_enabled else None
             cwd = str(Path(require_string(params.get("cwd"), "cwd")).expanduser().resolve())
             if not isinstance(params.get("mcpServers", []), list):
                 raise ProtocolError("mcpServers must be an array")
@@ -343,7 +365,8 @@ class Server:
                 raise
             finally:
                 self.starting_ids.discard(session_id)
-            return {**session.selectors(), **({"sessionId": session_id} if method.endswith("new") else {})}
+            result = {**session.selectors(), **({"sessionId": session_id} if method.endswith("new") else {})}
+            return session_relay.bind_session(session, result, binding_id)
         if method == "session/close":
             return await self.close_session(self.session(params))
         if method == "session/delete":
@@ -502,9 +525,15 @@ class Server:
         request_id = message.get("id")
         replied = False
         try:
-            result = await self.dispatch(message["method"], message.get("params") or {})
+            method = message["method"]
+            if request_id is None and method.startswith(session_relay.METHOD_PREFIX):
+                return  # v1 has no client-to-agent session relay notifications.
+            result = await self.dispatch(method, message.get("params") or {})
             if request_id is not None:
-                await self.send({"jsonrpc": "2.0", "id": request_id, "result": result})
+                response = {"jsonrpc": "2.0", "id": request_id, "result": result}
+                if method == session_relay.LOOKUP_METHOD:
+                    response = session_relay.bounded_lookup_response(response)
+                await self.send(response)
                 replied = True
                 if message["method"] in ("session/new", "session/load", "session/fork"):
                     session = self.sessions.get(result.get("sessionId") or message.get("params", {}).get("sessionId"))

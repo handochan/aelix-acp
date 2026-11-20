@@ -76,6 +76,10 @@ class StdoutWriter:
             pass
 
 
+def encode_frame(message: dict) -> bytes:
+    return (json.dumps(message, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+
+
 def decode_frame(raw: bytes) -> dict:
     if len(raw) > MAX_FRAME_BYTES:
         raise ProtocolError("JSON-RPC frame exceeds the byte limit", -32600)
