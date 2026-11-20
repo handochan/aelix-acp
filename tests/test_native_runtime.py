@@ -1025,6 +1025,8 @@ def setup(api):
             self.model_gate.set()
             await second
 
+        reopened = await AcpClient.start(self.root, EXECUTABLE)
+        self.addAsyncCleanup(reopened.close)
         try:
             parent = session_file(self.session)
             parent_bytes = parent.read_bytes()
@@ -1049,22 +1051,26 @@ def setup(api):
             # the fork worker it does not own, even with the valid child ID.
             with self.assertRaisesRegex(RuntimeError, "Unknown session"):
                 await self.client.request("session/close", {"sessionId": fork_id})
+            # The contender already has a live transport. Its first load must
+            # succeed immediately after the ACK while the owner process lives.
+            with self.assertRaisesRegex(RuntimeError, "-33001"):
+                await reopened.request("session/load", {**params, "sessionId": fork_id})
             self.assertEqual(await fork_client.request("session/close", {"sessionId": fork_id}), {})
             self.assertIsNone(fork_client.process.returncode)
             self.assertEqual(child.read_bytes(), child_bytes)
             self.assertEqual(parent.read_bytes(), parent_bytes)
-        finally:
-            await fork_client.close()
-        reopened = await AcpClient.start(self.root, EXECUTABLE)
-        try:
             await reopened.request("session/load", {**params, "sessionId": fork_id})
             self.assertIn("SECOND_PARENT_TURN", reopened.text())
             self.assertIn("CHILD_NEXT", reopened.text())
-            await reopened.request("session/prompt", {**prompt, "prompt": [{"type": "text", "text": "AFTER_RESTART"}]})
+            resumed = {**prompt, "prompt": [{"type": "text", "text": "AFTER_CLOSE_ACK"}]}
+            self.assertEqual(await reopened.request("session/prompt", resumed), {"stopReason": "end_turn"})
+            self.assertIsNone(fork_client.process.returncode)
             self.assertIn("SECOND_PARENT_TURN", json.dumps(self.model_requests[-1]["messages"]))
+            self.assertIn("AFTER_CLOSE_ACK", child.read_text(encoding="utf-8"))
             self.assertEqual(parent.read_bytes(), parent_bytes)
         finally:
             await reopened.close()
+            await fork_client.close()
 
     async def test_standard_head_fork_preserves_compaction_and_recovers_context_on_the_child(self):
         await self.config("thinking_level", "high")
