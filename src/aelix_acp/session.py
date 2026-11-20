@@ -148,6 +148,7 @@ class Session:
         self.rpc_closed = False
         self.cancelled = False
         self.turn_active = False
+        self.input_relay = None
         self.dispatched = False
         self.tools = {}
         self.tool_arrived = asyncio.Event()
@@ -606,7 +607,9 @@ class Session:
                 raise ProtocolError("Aelix child is not running", -32603)
             self.proc.stdin.write((json.dumps({"id": request_id, "type": command, **kwargs}) + "\n").encode())
             await self.proc.stdin.drain()
-            if self.turn_active and command not in READ_ONLY_COMMANDS and not (
+            # Queue writes have their own receipts. A late drain must not
+            # change the dispatch outcome tracked for another prompt.
+            if self.turn_active and command not in ("steer", "follow_up") and command not in READ_ONLY_COMMANDS and not (
                     command == "aelix_control" and kwargs.get("method") in READ_ONLY_CONTROLS | CONCURRENT_CONTROLS):
                 self.dispatched = True
             try:
@@ -1383,7 +1386,10 @@ class Session:
                 text = prepared
         if self.cancelled:
             return {"stopReason": "cancelled"}
-        return await self.drive_turn(lambda: self.rpc("prompt", message=text, **({"images": images} if images else {})))
+        return await self.drive_turn(
+            lambda: self.rpc("prompt", message=text, **({"images": images} if images else {})),
+            input_relay=self.input_relay,
+        )
 
     async def notice_turn(self):
         """`_aelix/manage children/notices` (aelix-ai #612): native's notice turn, run as a prompt turn.
@@ -1417,7 +1423,7 @@ class Session:
             raise after_dispatch(failure) from None
         return {**answer, **stop}
 
-    async def drive_turn(self, send):
+    async def drive_turn(self, send, *, input_relay=None):
         """Run the native turn `send` starts until native is idle, under the turn timeout."""
         self.done = asyncio.get_running_loop().create_future()
         self.failure = None
@@ -1429,7 +1435,7 @@ class Session:
                 await send()
                 if self.cancelled:
                     await self.cancel(again=True)
-                await self.wait_until_idle()
+                await self.wait_until_idle(input_relay=input_relay)
             await self.context.finish_compaction("failed")
             await self.publish_context_usage()
             if self.failure and not self.cancelled:
@@ -1440,16 +1446,21 @@ class Session:
             await self.cancel()
             raise ProtocolError("Aelix turn timed out", -32603)
         finally:
+            if input_relay is not None:
+                input_relay.observe_prompt(False)
             if self.done and not self.done.done():
                 self.done.cancel()
             await self.context.finish_compaction("failed")
 
-    async def wait_until_idle(self):
+    async def wait_until_idle(self, *, input_relay=None):
         # agent_end closes one provider attempt, not the enclosing prompt's
         # retries, overflow recovery or threshold compaction (#334 in native).
         while True:
             self.state = await self.rpc("get_state")
-            if not self.state.get("isStreaming", self.state.get("is_streaming", False)):
+            streaming = self.state.get("isStreaming", self.state.get("is_streaming", False))
+            if input_relay is not None:
+                input_relay.observe_prompt(streaming)
+            if not streaming:
                 return
             if self.cancelled and self.abort_due():
                 # Native acceptance precedes before_agent_start/build_context.
