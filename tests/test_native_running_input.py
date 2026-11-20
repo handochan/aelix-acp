@@ -25,6 +25,11 @@ def setup(api):
     async def queue_update(event, ctx):
         if Path(ctx.cwd, "reject-queue-hook").is_file():
             raise RuntimeError("fixture callback failed after queueing")
+        gate = Path(ctx.cwd, "hold-steer-receipt")
+        if event.steer and gate.is_file():
+            Path(ctx.cwd, "steer-enqueued").touch()
+            while gate.is_file():
+                await asyncio.sleep(0.005)
     api.on("agent_end", hold)
     api.on("queue_update", queue_update)
 """
@@ -216,6 +221,46 @@ class NativeRunningInputTests(unittest.IsolatedAsyncioTestCase):
         next_prompt = self.prompt("prompt after cancellation")
         users, gate = await self.model_turn()
         self.assertEqual(users, ["prompt after cancellation"])
+        gate.set()
+        self.assertEqual(await next_prompt, {"stopReason": "end_turn"})
+        self.assertEqual(self.user_chunks(), [])
+
+    async def test_stop_finishes_before_the_held_steer_receipt(self):
+        prompt = self.prompt("prompt to cancel")
+        _, cancelled_gate = await self.model_turn()
+        turn_id = await self.active_turn()
+        hold = self.root / "hold-steer-receipt"
+        hold.touch()
+        self.addCleanup(hold.unlink, missing_ok=True)
+        steer = self.input(turn_id, 1, "withdrawn queued input")
+        key = {"requestId": steer["requestId"]}
+        write = asyncio.create_task(self.relay(STEER, steer))
+        async with asyncio.timeout(10):
+            while not (self.root / "steer-enqueued").is_file():
+                await asyncio.sleep(0.01)
+            self.assertEqual(await self.relay(LOOKUP, key), {"status": "pending"})
+            await self.client.send({
+                "jsonrpc": "2.0", "method": "session/cancel",
+                "params": {"sessionId": self.session_id},
+            })
+            self.assertEqual(await prompt, {"stopReason": "cancelled"})
+            self.assertEqual(await self.relay(STATE, {}), {"active": False, "turnId": None})
+            self.assertEqual(await self.relay(LOOKUP, key), {"status": "pending"})
+        self.assertFalse(write.done())
+        cancelled_gate.set()
+        self.assertTrue(self.model_requests.empty())
+
+        next_prompt = self.prompt("prompt after cancellation")
+        users, gate = await self.model_turn()
+        self.assertEqual(users, ["prompt after cancellation"])
+        next_turn = await self.active_turn()
+        self.assertNotEqual(next_turn, turn_id)
+
+        hold.unlink()
+        receipt = {"turnId": turn_id, "accepted": True, "delivery": "native-queue"}
+        self.assertEqual(await asyncio.wait_for(write, 10), receipt)
+        self.assertEqual(await self.relay(LOOKUP, key), {"status": "completed", "result": receipt})
+        self.assertEqual(await self.relay(STATE, {}), {"active": True, "turnId": next_turn})
         gate.set()
         self.assertEqual(await next_prompt, {"stopReason": "end_turn"})
         self.assertEqual(self.user_chunks(), [])
