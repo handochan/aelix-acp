@@ -31,6 +31,7 @@ def setup(api):
 class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="acp-native-", dir="/tmp" if os.name != "nt" else None)
+        self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         (self.root / "home").mkdir()
         (self.root / "agent").mkdir()
@@ -73,7 +74,6 @@ def setup(api):
         await self.client.close()
         self.listener.close()
         await self.listener.wait_closed()
-        self.temp.cleanup()
 
     async def model(self, reader, writer):
         try:
