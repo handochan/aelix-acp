@@ -1388,7 +1388,8 @@ def setup(api):
         (installed / f"{name}.py").write_text(source, encoding="utf-8")
         return {"id": name, "defaultEnabled": default_enabled, "reference": f"{name}:setup"}
 
-    async def managed_adapter(self, generation, *entries, operator_extensions=(), studio_managed=False, trust_project=False):
+    async def managed_adapter(self, generation, *entries, operator_extensions=(), studio_managed=False,
+                              trust_project=False, launch_setup=""):
         installed = self.root / "installed"
         installed.mkdir(exist_ok=True)
         snapshot = self.root / f"{generation}.json"
@@ -1396,7 +1397,8 @@ def setup(api):
                                         "sitePackages": str(installed), "extensions": entries}), encoding="utf-8")
         launcher = self.root / "managed-launch.py"
         launcher.write_text(
-            f"import sys\nsys.path.append({str(self.root / 'installed')!r})\n"
+            f"import sys\nsys.path.append({str(installed)!r})\n"
+            f"{launch_setup}\n"
             "from aelix_coding_agent.cli.entry import main_sync\nmain_sync()\n", encoding="utf-8"
         )
         adapter = await AcpClient.start(self.root, sys.executable, prefix=(str(launcher),), extensions=operator_extensions,
@@ -1707,3 +1709,70 @@ def setup(api):
         session_id = await self.open_managed(adapter)
         self.assertTrue(marker.exists())
         self.assertEqual(await self.managed_states(adapter, session_id), {entry["id"]: "active"})
+
+    async def test_managed_factory_rejects_cached_and_workspace_subdirectory_origins(self):
+        workspace_imports = self.root / "workspace-imports"
+        workspace_imports.mkdir()
+        foreign = workspace_imports / "outside_fixture.py"
+        foreign.write_text("def register(api): pass\n", encoding="utf-8")
+        package = self.root / "installed" / "acp_cached_fixture"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(textwrap.dedent("""
+            def __getattr__(name):
+                if name == "setup":
+                    from .supplier import register
+                    return register
+                raise AttributeError(name)
+        """), encoding="utf-8")
+        on_path = self.managed_module("acp_workspace_fixture", textwrap.dedent("""
+            def __getattr__(name):
+                if name == "setup":
+                    from outside_fixture import register
+                    return register
+                raise AttributeError(name)
+        """), default_enabled=True)
+        cached = {"id": "cached", "defaultEnabled": True, "reference": "acp_cached_fixture:setup"}
+        setup = textwrap.dedent(f"""
+            from importlib.util import module_from_spec, spec_from_file_location
+            sys.path.insert(0, {str(workspace_imports)!r})
+            name = "acp_cached_fixture.supplier"
+            spec = spec_from_file_location(name, {str(foreign)!r})
+            fixture = module_from_spec(spec)
+            spec.loader.exec_module(fixture)
+            sys.modules[name] = fixture
+        """)
+        adapter = await self.managed_adapter("g1", cached, on_path, trust_project=True, launch_setup=setup)
+        session = await self.open_managed(adapter)
+        rows = (await self.managed_request(adapter, session))["extensions"]
+        self.assertEqual({row["extensionId"]: (row["state"], row["reason"]) for row in rows},
+                         {cached["id"]: ("error", "load_failed"), on_path["id"]: ("error", "load_failed")})
+
+    async def test_managed_factory_allows_generation_namespace_and_normal_dependencies(self):
+        package = self.root / "installed" / "acp_namespace_fixture"
+        package.mkdir(parents=True)
+        marker = self.root / "namespace-factory-ran"
+        (package / "entry.py").write_text(textwrap.dedent("""
+            def __getattr__(name):
+                if name == "setup":
+                    from .supplier import register
+                    return register
+                raise AttributeError(name)
+        """), encoding="utf-8")
+        (package / "supplier.py").write_text(textwrap.dedent(f"""
+            from pathlib import Path
+            from . import sibling
+
+            def register(api):
+                Path({str(marker)!r}).write_text(sibling.content(), encoding="utf-8")
+        """), encoding="utf-8")
+        (package / "sibling.py").write_text(textwrap.dedent("""
+            from json import dumps
+
+            def content():
+                return dumps({"generation": True})
+        """), encoding="utf-8")
+        entry = {"id": "namespace", "defaultEnabled": True, "reference": "acp_namespace_fixture.entry:setup"}
+        adapter = await self.managed_adapter("g1", entry)
+        session = await self.open_managed(adapter)
+        self.assertEqual(await self.managed_states(adapter, session), {"namespace": "active"})
+        self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), {"generation": True})

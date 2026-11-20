@@ -1,9 +1,12 @@
 import argparse
+from functools import partial
+from importlib.util import module_from_spec, spec_from_file_location
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -91,3 +94,72 @@ class ManagedLaunchTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(sys, "path", [str(other), *sys.path]):
                 with self.assertRaisesRegex(ImportError, "unavailable in the selected generation"):
                     finder.find_spec("acp_generation_only")
+
+    def test_factory_verifies_cached_managed_dependency_and_file_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outside = Path(temp).resolve()
+            site = outside / "site-packages"
+            site.mkdir()
+            local_file = site / "entry.py"
+            local_file.write_text(
+                "def setup(api): pass\nclass Fixture:\n    def register(self, api): pass\n",
+                encoding="utf-8",
+            )
+            foreign_file = outside / "sibling.py"
+            foreign_file.touch()
+            entry_spec = spec_from_file_location("entry", local_file)
+            entry = module_from_spec(entry_spec)
+            entry_spec.loader.exec_module(entry)
+            foreign = module_from_spec(spec_from_file_location("catalogued.sibling", foreign_file))
+            finder = GenerationFinder(str(site), "entry")
+            with patch.dict(sys.modules, {"entry": entry, "catalogued.sibling": foreign}):
+                finder.verify_factory(entry.setup, ())
+                finder.verify_factory(entry.Fixture().register, ())
+                finder.verify_factory(partial(entry.setup), ())
+                with self.assertRaisesRegex(ImportError, "must be a Python function"):
+                    finder.verify_factory(entry.Fixture, ())
+                with self.assertRaisesRegex(ImportError, "catalogued.sibling"):
+                    finder.verify_factory(entry.setup, ("catalogued",))
+                entry.__file__ = str(foreign_file)
+                with self.assertRaisesRegex(ImportError, "verified origin"):
+                    finder.verify_factory(entry.setup, ())
+                entry.__file__ = str(local_file)
+                del entry.__file__
+                with self.assertRaisesRegex(ImportError, "verified origin"):
+                    finder.verify_factory(entry.setup, ())
+            with self.assertRaisesRegex(ImportError, "must be a Python function"):
+                finder.verify_factory(math.sqrt, ())
+
+    def test_module_finder_refuses_symlink_outside_generation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outside = Path(temp).resolve()
+            site = outside / "site-packages"
+            site.mkdir()
+            foreign = outside / "module.py"
+            foreign.touch()
+            link = site / "acp_symlink_fixture.py"
+            try:
+                link.symlink_to(foreign)
+            except OSError:
+                self.skipTest("file symlink unavailable")
+            name = "acp_symlink_fixture"
+            finder = GenerationFinder(str(site), name)
+            with self.assertRaisesRegex(ImportError, "unavailable in the selected generation"):
+                finder.find_spec(name)
+            module = module_from_spec(spec_from_file_location(name, link))
+            with self.assertRaisesRegex(ImportError, "no verified origin"):
+                finder.verify_module(name, module)
+
+    def test_factory_rejects_callable_objects_with_an_apparent_function_type(self):
+        class Fixture:
+            @property
+            def __class__(self):
+                return FunctionType
+
+            def __call__(self, api):
+                raise AssertionError("factory must not be called")
+
+        with tempfile.TemporaryDirectory() as temp:
+            finder = GenerationFinder(str(Path(temp).resolve()), "entry")
+            with self.assertRaisesRegex(ImportError, "must be a Python function"):
+                finder.verify_factory(Fixture(), ())

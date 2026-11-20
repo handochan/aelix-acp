@@ -50,9 +50,26 @@ includes all verified entries, including those disabled by default.
   identifiers. A single-letter module before the colon is drive-relative
   on Windows. ACP passes a private absolute loader file to native `-e`.
   The loader resolves the named module from `sitePackages`. The generation
-  finder and native workspace import exclusions also apply while looking up
-  the factory, including lazy lookup, in trusted workspaces and on reload.
-  The loader rejects a cached module from another location.
+  finder and native workspace import exclusions also apply during factory
+  lookup, including lazy lookup, in trusted workspaces and on reload.
+  Before returning the factory to native, ACP checks the actual function's
+  code path and defining module. It also checks loaded modules in all
+  catalogued packages and in the factory's package, including cached
+  package and submodule imports. Each file-backed module must have
+  `__spec__.origin` and `__file__` resolving to the same existing file inside
+  `sitePackages`. Symlinks and junctions are checked at their resolved targets.
+
+  The factory may be a file-backed Python function, a bound Python method,
+  or a plain `functools.partial` around one. ACP rejects C-backed factories,
+  classes, callable instances, and factories with unverified code paths.
+  C extension modules can be dependencies. When their module origin is
+  checked, they must meet the same file-backed path rule. Namespace packages
+  can be containers if every search directory resolves inside `sitePackages`.
+  They cannot define the factory. Other modules with missing file metadata
+  fail verification. Python dependencies from other generation packages and
+  standard-library imports remain available. These checks verify the managed
+  module load before registration. Trusted extension code runs with normal
+  Python capabilities.
 - A pack entry also has `entryPoints`, a nonempty array of explicit
   `module.path:factory` references. Its reference names an absolute wrapper
   directory with exactly one child directory containing
@@ -141,9 +158,10 @@ requests use the existing ACP errors (`-32000` or `-32003`). `-32004` carries a 
 `managed_extension_conflict`, `managed_extension_not_applied`, or
 `managed_extension_change_failed`. When a change fails,
 `data` includes the requested `extensionId`, reason and `recovered` status.
-If verification fails, `failedExtensionId` identifies the entry that failed.
-Cancellation
-during worker replacement uses the same recovery path and returns `-32003`.
+If verification fails in the change candidate, `failedExtensionId`
+identifies that entry. `recovered` reports the later rollback result.
+Cancellation during worker replacement uses the same recovery path and
+returns `-32003`.
 
 ## Worker startup and recovery
 

@@ -161,6 +161,10 @@ class ManagedExtensions:
     def arguments(self, overrides, socket_dir):
         references = []
         shim = None
+        managed_packages = tuple(sorted({
+            point.split(":", 1)[0].split(".", 1)[0]
+            for item in self.entries for point in item.entry_points
+        }))
         for index, item in enumerate(self.entries):
             if not item.enabled(overrides):
                 continue
@@ -171,7 +175,8 @@ class ManagedExtensions:
                 if shim is None:
                     shim = Path(__file__).with_name("managed_module.py").read_text(encoding="utf-8")
                 Path(reference).write_text(
-                    shim + f"\nsetup = load_factory({self.site_packages!r}, {item.reference!r})\n", encoding="utf-8",
+                    shim + f"\nsetup = load_factory({self.site_packages!r}, {item.reference!r}, {managed_packages!r})\n",
+                    encoding="utf-8",
                 )
             references.append(reference)
         return references
