@@ -933,6 +933,47 @@ def setup(api):
             await self.prompt("Respond")
         self.assertEqual(len(self.model_requests), requests)
 
+    async def test_standard_close_releases_the_native_writer_after_the_active_turn(self):
+        self.model_gate = asyncio.Event()
+        turn = asyncio.create_task(self.prompt("Persist this turn before closing"))
+        try:
+            async with asyncio.timeout(30):
+                while not self.model_requests:
+                    await asyncio.sleep(0.01)
+            with self.assertRaises(RuntimeError) as busy:
+                await self.client.request("session/close", {"sessionId": self.session})
+            self.assertEqual(json.loads(str(busy.exception))["code"], -32000)
+        finally:
+            self.model_gate.set()
+            await turn
+
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            native_file = db.execute("SELECT file FROM sessions WHERE id=?", (self.session,)).fetchone()[0]
+        saved = Path(native_file).read_bytes()
+        self.assertEqual(await self.client.request("session/close", {"sessionId": self.session}), {})
+        env = {key: os.environ[key] for key in ["PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"] if key in os.environ}
+        env.update(HOME=str(self.root / "home"), USERPROFILE=str(self.root / "home"),
+                   AELIX_CODING_AGENT_DIR=str(self.root / "agent"), AELIX_SETTINGS_PATH=str(self.root / "agent/settings.json"))
+        cli = await asyncio.create_subprocess_exec(
+            EXECUTABLE, "--mode", "rpc", "--offline", "--no-extensions", "--session", native_file,
+            cwd=self.root, env=env, stdin=-1, stdout=-1, stderr=-1,
+        )
+        try:
+            cli.stdin.write(b'{"id":"ready","type":"get_state"}\n')
+            await cli.stdin.drain()
+            response = json.loads(await asyncio.wait_for(cli.stdout.readline(), 10))
+            self.assertEqual((response["id"], response["success"]), ("ready", True))
+            self.assertEqual(Path(native_file).read_bytes(), saved)
+        finally:
+            cli.stdin.close()
+            try:
+                await asyncio.wait_for(cli.wait(), 10)
+            except TimeoutError:
+                cli.kill()
+                await cli.wait()
+        result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session})
+        self.assertIn("configOptions", result)
+
     async def test_native_lock_holder_refuses_load_with_a_structured_error(self):
         import sqlite3
         import subprocess
@@ -984,6 +1025,8 @@ def setup(api):
             self.model_gate.set()
             await second
 
+        reopened = await AcpClient.start(self.root, EXECUTABLE)
+        self.addAsyncCleanup(reopened.close)
         try:
             parent = session_file(self.session)
             parent_bytes = parent.read_bytes()
@@ -1003,18 +1046,31 @@ def setup(api):
             prompt = {"sessionId": fork_id, "prompt": [{"type": "text", "text": "CHILD_NEXT"}]}
             await fork_client.request("session/prompt", prompt)
             self.assertIn("SECOND_PARENT_TURN", json.dumps(self.model_requests[-1]["messages"]))
-        finally:
-            await fork_client.close()
-        reopened = await AcpClient.start(self.root, EXECUTABLE)
-        try:
+            child_bytes = child.read_bytes()
+            # A second ACP transport can see the shared index but cannot close
+            # the fork worker it does not own, even with the valid child ID.
+            with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+                await self.client.request("session/close", {"sessionId": fork_id})
+            # The contender already has a live transport. Its first load must
+            # succeed immediately after the ACK while the owner process lives.
+            with self.assertRaisesRegex(RuntimeError, "-33001"):
+                await reopened.request("session/load", {**params, "sessionId": fork_id})
+            self.assertEqual(await fork_client.request("session/close", {"sessionId": fork_id}), {})
+            self.assertIsNone(fork_client.process.returncode)
+            self.assertEqual(child.read_bytes(), child_bytes)
+            self.assertEqual(parent.read_bytes(), parent_bytes)
             await reopened.request("session/load", {**params, "sessionId": fork_id})
             self.assertIn("SECOND_PARENT_TURN", reopened.text())
             self.assertIn("CHILD_NEXT", reopened.text())
-            await reopened.request("session/prompt", {**prompt, "prompt": [{"type": "text", "text": "AFTER_RESTART"}]})
+            resumed = {**prompt, "prompt": [{"type": "text", "text": "AFTER_CLOSE_ACK"}]}
+            self.assertEqual(await reopened.request("session/prompt", resumed), {"stopReason": "end_turn"})
+            self.assertIsNone(fork_client.process.returncode)
             self.assertIn("SECOND_PARENT_TURN", json.dumps(self.model_requests[-1]["messages"]))
+            self.assertIn("AFTER_CLOSE_ACK", child.read_text(encoding="utf-8"))
             self.assertEqual(parent.read_bytes(), parent_bytes)
         finally:
             await reopened.close()
+            await fork_client.close()
 
     async def test_standard_head_fork_preserves_compaction_and_recovers_context_on_the_child(self):
         await self.config("thinking_level", "high")

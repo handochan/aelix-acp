@@ -32,7 +32,7 @@ from .runtime import forks
 from .session import Session, text_content, tool_call
 
 __all__ = ["Server", "Session", "ProtocolError", "main", "tool_call", "text_content"]
-SESSION_MUTATIONS = {"session/load", "session/fork", "session/delete", "session/prompt",
+SESSION_MUTATIONS = {"session/load", "session/fork", "session/delete", "session/close", "session/prompt",
                      "session/set_mode", "session/set_model", "session/set_config_option", "_aelix/manage"}
 
 
@@ -194,11 +194,18 @@ class Server:
                 self.starting_ids.discard(identifier)
         return result
 
+    async def close_session(self, session):
+        if session.mutation_lock.locked():
+            raise ProtocolError("Session is busy", -32000)
+        async with session.mutation_lock:
+            await session.close()
+        return {}
+
     async def dispatch(self, method, params):
         require_object(params)
         if method in SESSION_MUTATIONS:
             session_id = require_string(params.get("sessionId"), "sessionId")
-            if method in ("session/load", "session/delete") and session_id in self.starting_ids:
+            if method in ("session/load", "session/delete", "session/close") and session_id in self.starting_ids:
                 raise ProtocolError("Session is already starting", -32000)
             registered = session_id in self.sessions or self.db.execute(
                 "SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
@@ -226,7 +233,7 @@ class Server:
                     "agentInfo": {"name": "aelix-acp", "title": f"Aelix {self.args.profile.title()}", "version": __version__},
                     "agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True, "image": True},
                                           "mcpCapabilities": {"http": True, "sse": True},
-                                          "sessionCapabilities": {"list": {}, "delete": {},
+                                          "sessionCapabilities": {"list": {}, "delete": {}, "close": {},
                                                                   "fork": {"_meta": {"aelix/expectedHead": 1}}},
                                           "_meta": {SUBAGENTS_META: {"version": 1, "on": "tool_call_update"},
                                                     "aelix/errors": {"sessionLocked": SESSION_LOCKED, "turnFailedAfterDispatch": TURN_FAILED_AFTER_DISPATCH}}},
@@ -294,6 +301,8 @@ class Server:
             finally:
                 self.starting_ids.discard(session_id)
             return {**session.selectors(), **({"sessionId": session_id} if method.endswith("new") else {})}
+        if method == "session/close":
+            return await self.close_session(self.session(params))
         if method == "session/delete":
             session_id = require_string(params.get("sessionId"), "sessionId")
             row = self.db.execute("SELECT profile FROM sessions WHERE id=?", (session_id,)).fetchone()
@@ -385,13 +394,11 @@ class Server:
             session = self.session(params)
             action = require_string(params.get("action"), "action")
             arguments = require_object(params.get("arguments", {}), "arguments")
+            if action == "sessions/close":
+                return await self.close_session(session)
             if session.mutation_lock.locked():
                 raise ProtocolError("Session is busy", -32000)
             async with session.mutation_lock:
-                if action == "sessions/close":
-                    await session.close()
-                    self.sessions.pop(session.id, None)
-                    return {}
                 await session.recover_after_compaction()
                 if action == "sessions/branch":
                     return await self.branch_session(session, arguments)
