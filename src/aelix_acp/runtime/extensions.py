@@ -47,6 +47,9 @@ async def _run_extension_action(server, session, raw) -> dict:
     except ValueError as error:
         raise ProtocolError(f"Invalid extension command: {error}") from None
     action, *arguments = parts
+    if action in WRITE_ACTIONS and os.environ.get("AELIX_ACP_STUDIO_MANAGED") == "1":
+        raise ProtocolError("Use the Extensions screen in Aelix Studio.", -32004,
+                            {"kind": "studio_extension_management_required", "action": action})
     if action in {"enable", "disable", "reload"}:
         if action == "reload":
             result = await session.rpc("aelix_control", method="resources/reload", params={},
