@@ -58,6 +58,22 @@ def fork_head_changed() -> ProtocolError:
                          {"kind": "fork_head_changed", "retryable": False})
 
 
+def session_changing() -> ProtocolError:
+    """A child intervention refused before anything was written (aelix-ai #612)."""
+    return ProtocolError("the session is changing", -32000, {"kind": "session_changing"})
+
+
+def delivery_unknown(action: str) -> ProtocolError:
+    """A child intervention a restart or close interrupted after its line was written (aelix-ai #612).
+
+    Native may have read it, so a steer or wrap-up may have reached the child.
+    """
+    return ProtocolError("the session changed while this request ran; its delivery is unknown",
+                         TURN_FAILED_AFTER_DISPATCH,
+                         {"kind": "turn_failed_after_dispatch", "retryable": False,
+                          "cause": {"kind": "session_changed", "command": action}})
+
+
 def after_dispatch(error: BaseException) -> ProtocolError:
     """Mark a failure that happened after native accepted work as not retryable.
 

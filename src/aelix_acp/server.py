@@ -28,12 +28,21 @@ from .runtime.extensions import run_extension_action, require_consent
 from .runtime.leases import acquire as acquire_lease
 from .runtime.leases import lease_path
 from .runtime import forks
+from .runtime.children import NESTED_TOOL_CALLS, nested_only
 
-from .session import Session, text_content, tool_call
+from .session import CONCURRENT_CONTROLS, Session, text_content, tool_call
+from .wire.errors import session_changing
 
 __all__ = ["Server", "Session", "ProtocolError", "main", "tool_call", "text_content"]
 SESSION_MUTATIONS = {"session/load", "session/fork", "session/delete", "session/close", "session/prompt",
                      "session/set_mode", "session/set_model", "session/set_config_option", "_aelix/manage"}
+# `_aelix/manage` actions forwarded to native control when native lists them.
+MANAGE_ACTIONS = frozenset({"resources/list", "resources/reload", "settings/get", "settings/set", "tools/set_active",
+                            "mcp/status", "mcp/configure", "auth/status", "auth/set_api_key", "auth/login",
+                            "auth/logout", "extensions/list", "agents/list", "agents/show", "agents/use",
+                            "agents/run", "permissions/get", "children/notices", *CONCURRENT_CONTROLS})
+# How long the adapter waits for the client's answer to a request it sent, unless the caller says.
+CLIENT_REQUEST_SECONDS = 290
 
 
 class Server:
@@ -47,6 +56,7 @@ class Server:
         self.pending = {}
         self.tasks = set()
         self.cleanup_tasks = set()
+        self.closing = False  # The client is gone: sessions end without sending.
         self.output_lock = asyncio.Lock()
         self.output = None
 
@@ -57,13 +67,25 @@ class Server:
                 self.output = StdoutWriter()
             await self.output.write(raw)
 
-    async def client_request(self, method, params):
+    async def client_request(self, method, params, *, withdraw=False, timeout=None):
+        """The client's result for one request, waited for up to `timeout` (CLIENT_REQUEST_SECONDS) seconds.
+
+        `withdraw` (a delegated child's question, aelix-ai #612 fix round 1,
+        P-LOW-1): a request the adapter stops waiting for before the client
+        answered is taken back with ACP's `$/cancel_request`, which a client may
+        ignore; its later answer is then dropped.
+        """
         request_id = "acp-" + uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
         try:
             await self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
-            return await asyncio.wait_for(future, 290)
+            return await asyncio.wait_for(future, timeout or CLIENT_REQUEST_SECONDS)
+        except (asyncio.CancelledError, TimeoutError):
+            if withdraw and not self.closing and (future.cancelled() or not future.done()):
+                with contextlib.suppress(Exception):
+                    await self.send({"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": request_id}})
+            raise
         finally:
             self.pending.pop(request_id, None)
 
@@ -203,6 +225,10 @@ class Server:
 
     async def dispatch(self, method, params):
         require_object(params)
+        if method == "_aelix/manage" and isinstance(params.get("action"), str) and params["action"] in CONCURRENT_CONTROLS:
+            # aelix-ai #612: neither the activity lease nor mutation_lock, which a
+            # running session/prompt or agents/run holds (Session.intervene).
+            return await self.intervene(params)
         if method in SESSION_MUTATIONS:
             session_id = require_string(params.get("sessionId"), "sessionId")
             if method in ("session/load", "session/delete", "session/close") and session_id in self.starting_ids:
@@ -215,6 +241,16 @@ class Server:
             if method == "session/fork":
                 raise ProtocolError("Saved session does not match this workspace and profile")
         return await self.dispatch_request(method, params)
+
+    async def intervene(self, params):
+        session_id = require_string(params.get("sessionId"), "sessionId")
+        arguments = require_object(params.get("arguments", {}), "arguments")
+        if session_id in self.starting_ids:
+            raise session_changing()
+        session = self.session(params)
+        if params["action"] not in session.controls.capabilities.get("methods", []):
+            raise ProtocolError("Unsupported management action")
+        return await session.intervene(params["action"], arguments)
 
     async def dispatch_request(self, method, params):
         if method == "initialize":
@@ -285,7 +321,10 @@ class Server:
                 if method == "session/load":
                     recorded = list(history(self.db, session_id))
                     if recorded:
+                        nesting = session.declares(NESTED_TOOL_CALLS)
                         for update in recorded:
+                            if not nesting and nested_only(update):
+                                continue  # aelix-ai #612: the loading client's opt-in, as live.
                             await self.send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
                     elif not session.fork_projection:
                         for update in await self.native_history(session):
@@ -418,9 +457,10 @@ class Server:
                     return {"enabled": enabled}
                 if action == "extensions/action":
                     return await self.extension_action(session, require_string(arguments["command"], "command") if "command" in arguments else arguments)
-                allowed = {"resources/list", "resources/reload", "settings/get", "settings/set", "tools/set_active", "mcp/status", "mcp/configure", "auth/status", "auth/set_api_key", "auth/login", "auth/logout", "extensions/list", "agents/list", "agents/show", "agents/use", "agents/run", "permissions/get"}
-                if action not in allowed or action not in session.controls.capabilities.get("methods", []):
+                if action not in MANAGE_ACTIONS or action not in session.controls.capabilities.get("methods", []):
                     raise ProtocolError("Unsupported management action")
+                if action == "children/notices":
+                    return await session.notice_turn()
                 if action == "mcp/configure":
                     result = await session.configure_mcp(arguments.get("servers"))
                 else:
@@ -525,6 +565,7 @@ class Server:
                 task.add_done_callback(self.tasks.discard)
         finally:
             reader.close()
+            self.closing = True
             for task in list(self.tasks):
                 task.cancel()
             await asyncio.gather(*self.tasks, return_exceptions=True)

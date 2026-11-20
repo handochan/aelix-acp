@@ -62,6 +62,10 @@ class AcpClient:
                         self.updates.append(message)
                         continue
                     self.requests.append(message)
+                    if message["method"] == "session/request_permission" and callable(self.permission):
+                        # A test decides each request, and may hold it open (an async answer).
+                        self.tasks.append(asyncio.create_task(self.answer_permission(message)))
+                        continue
                     if message["method"] == "session/request_permission":
                         result = {"outcome": {"outcome": "selected", "optionId": self.permission}}
                     elif self.dialog:
@@ -77,6 +81,13 @@ class AcpClient:
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(RuntimeError("Adapter stdout closed: " + self.stderr.decode(errors="replace")[-3000:]))
+
+    async def answer_permission(self, message):
+        option = self.permission(message["params"])
+        if asyncio.iscoroutine(option):
+            option = await option
+        outcome = {"outcome": "cancelled"} if option is None else {"outcome": "selected", "optionId": option}
+        await self.send({"jsonrpc": "2.0", "id": message["id"], "result": {"outcome": outcome}})
 
     async def read_errors(self):
         while chunk := await self.process.stderr.read(4096):

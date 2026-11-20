@@ -1,5 +1,30 @@
 # Productization evidence
 
+## Delegated children (aelix-ai #612) — 2026-11-20
+
+Candidate: this adapter with native aelix-ai
+`83714045439478b17ab0c61248dc5c414435927a` (`runtime-reference.json`), which
+has the `children/` family, `aelix_child`, `aelix_notice` and child approvals.
+Host: macOS arm64; Python 3.12.13 unless named. Commits are this branch's
+checkpoints. The product code is final at `8e932ac`; later commits change docs
+only. The live rows at `8533b45` ran on product code that changed after it:
+`91c4ed1` moved `CLIENT_REQUEST_SECONDS` to its own line (no behaviour change);
+the merge of aelix-acp main `dd772a6` brought `session/close`; fix round 2
+answers native for a dialog whose task a `session/cancel` ended before it first
+ran, and keeps `_aelix/notice` and `_aelix/subagent` from a client that is gone
+or was told the session was replaced. The cancel and restart rows ran again at
+`8e932ac`.
+
+| Level | What ran | Result |
+|---|---|---|
+| Source | `PYTHONPATH=src:tests python -m unittest discover -s tests` with `AELIX_ACP_TEST_AELIX` unset, at `8e932ac`, on Python 3.11.15, 3.12.13, 3.13.13 and 3.14.5 | 287 tests, OK on each (76 skipped: the native-process tests, and the `wire_call_id` comparison where the native is not importable) |
+| Source, coarse clock | `tests/test_children.py` and `tests/test_subagents.py` with `time.monotonic` quantised to 15.625 ms (Windows' clock on Python up to 3.12), at `8e932ac`, on 3.11.15 and 3.12.13 | 109 tests, OK on each (1 skipped) |
+| Native process | `python3 scripts/test_native.py --core <aelix-ai at the pin> --check-ref`, at `8e932ac`, including `tests/test_native_children.py` (17 tests, scripted loopback model) and aelix-acp #35's `session/close` tests | 287 tests in 172 s, OK; 1 skipped (the Windows Job test) |
+| Live provider | `openai/gpt-4.1-mini` through OpenRouter, the black-box test client, scratch HOME, agent dir and cwd. At `5ca9ad5`: steer, wrap-up and stop during `session/prompt`; `_aelix/notice` then `children/notices`; native aborts per cancel (1, 1, 1); close latency. At `8533b45`'s product code: Ask approval of `agent`; a child's question under its nested id, allow-once (file written) and reject-once (file absent); a spawned child's card entry after a second prompt (no null `profile` or `state`); a `children/stop` with a child's question open (`$/cancel_request` for its id, the nested card `failed`, a late Allow wrote nothing). At `8533b45` and again at `8e932ac`: `session/cancel` denying a background child's open question, with `$/cancel_request` (the file absent); a `workspace/trust` restart with a child's question open (restart 1.0 s, then 1.88 s; `$/cancel_request` for its id, the nested card `failed`, a late Allow wrote nothing) | Pass |
+| Close latency | A scripted model, `sessions/close`, `session/load` of the same session, `session/delete` and adapter shutdown, at `20f1d27`: idle, a spawned child held in its model call, a background `bash` job; and a native whose session end takes 8 s. Run again by the round-2 verifier at `91c4ed1` (load average about 28). Not run after the merge: `session/close` and `sessions/close` are one function (`Server.close_session`) since aelix-acp #35, and fix round 2 changed no close step | At `20f1d27`: 0.08–0.55 s from the request to the native gone (0.61–1.01 s for `session/load`, which starts a new native); 8.08–8.12 s for the slow end (8.60 s through `session/load`). At `91c4ed1`: 0.07–0.59 s (0.55–0.86 s); 8.08–8.63 s |
+| Host / UI | AionCore, Studio renderer | Not run |
+| Windows, Linux | Native suite and live | Not run here; left to CI (`windows-2022`, Ubuntu) |
+
 ## Beta realignment — 2026-10-31 (ACP #20)
 
 Candidate: this adapter on ACP main plus native aelix-ai

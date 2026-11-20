@@ -5,6 +5,10 @@ naming the tool call that started the child. The native `agent` tool runs
 sequentially (aelix_agents/tool.py `execution_mode="sequential"`), so at most
 one `agent` call is open at a time and a child belongs to the open one. A child
 seen earlier keeps its parent for events that arrive after that call ended.
+
+A native that also emits `aelix_child` (aelix-ai #612) adds four fields to a
+child's entry through `merge`: `lastText`, `stuck`, `wrappingUp` and `end`, and
+creates the entry for a spawned child that never sends `aelix_subagent`.
 """
 from __future__ import annotations
 
@@ -19,6 +23,8 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _EVENTS = {"subagent_start", "subagent_tool", "subagent_end"}
 _FIELDS = {"id": "id", "profile": "profile", "state": "state", "current_tool": "currentTool",
            "model": "model", "provider": "provider"}
+# Fields an `aelix_child` frame adds; an `aelix_subagent` snapshot keeps them.
+EXTRAS = ("lastText", "stuck", "wrappingUp", "end")
 
 
 def _text(value):
@@ -72,8 +78,27 @@ class SubagentTracker:
             return parent, self.meta(parent)
         # A resumed child (`agent action=resume`) moves to its new parent call.
         self.parents[child["id"]] = parent
+        previous = children.get(child["id"]) or {}
+        child.update({name: previous[name] for name in EXTRAS if name in previous})
         children[child["id"]] = child
         return parent, self.meta(parent)
+
+    def merge(self, parent: str, child_id: str, fields: dict) -> dict | None:
+        """Fold an `aelix_child` frame's fields into `parent`'s child; its `_meta`, or None if unchanged."""
+        children = self.children.setdefault(parent, {})
+        key = _text(child_id)
+        entry = children.get(key)
+        before = None if entry is None else dict(entry)
+        if entry is None:
+            if len(children) >= MAX_CHILDREN:
+                return None
+            entry = children[key] = {"id": key, "profile": None, "state": None, "currentTool": None,
+                                     "model": None, "provider": None, "event": None,
+                                     "elapsedMs": 0, "tokens": 0, "cost": 0.0}
+        self.parents[key] = parent
+        for name, value in fields.items():
+            entry[name] = value if isinstance(value, bool) or value is None else _text(value)
+        return self.meta(parent) if entry != before else None
 
     def meta(self, call_id) -> dict | None:
         children = self.children.get(call_id)
