@@ -1382,7 +1382,7 @@ def setup(api):
         (pkg / "aelix-plugin.toml").write_text(manifest, encoding="utf-8")
         return {"id": name, "defaultEnabled": not broken, "reference": str(wrapper), "entryPoints": [f"{module}:setup"]}
 
-    async def managed_adapter(self, generation, *entries, operator_extensions=()):
+    async def managed_adapter(self, generation, *entries, operator_extensions=(), studio_managed=False):
         snapshot = self.root / f"{generation}.json"
         snapshot.write_text(json.dumps({"version": 1, "generation": generation, "extensions": entries}), encoding="utf-8")
         launcher = self.root / "managed-launch.py"
@@ -1391,7 +1391,8 @@ def setup(api):
             "from aelix_coding_agent.cli.entry import main_sync\nmain_sync()\n", encoding="utf-8"
         )
         adapter = await AcpClient.start(self.root, sys.executable, prefix=(str(launcher),), extensions=operator_extensions,
-                                        adapter_args=("--managed-extensions", str(snapshot)))
+                                        adapter_args=("--managed-extensions", str(snapshot)),
+                                        extra_env={"AELIX_ACP_STUDIO_MANAGED": "1"} if studio_managed else None)
         self.addAsyncCleanup(adapter.close)
         return adapter
 
@@ -1409,6 +1410,29 @@ def setup(api):
     async def managed_states(self, adapter, session_id):
         result = await self.managed_request(adapter, session_id)
         return {row["extensionId"]: row["state"] for row in result["extensions"]}
+
+    async def test_studio_allows_managed_overrides_and_blocks_package_installs_in_the_same_session(self):
+        entry = dict(self.managed_pack("studio-pack"), defaultEnabled=False)
+        adapter = await self.managed_adapter("studio-g1", entry, studio_managed=True)
+        session = await self.open_managed(adapter)
+        self.assertEqual(await self.managed_states(adapter, session), {"studio-pack": "disabled"})
+        self.assertFalse((self.root / "studio-pack.setup").exists())
+
+        await self.managed_request(adapter, session, "set", extensionId=entry["id"], value="on")
+        self.assertTrue((self.root / "studio-pack.setup").exists())
+        self.assertEqual(await self.managed_states(adapter, session), {"studio-pack": "active"})
+        self.assertEqual([request["method"] for request in adapter.requests], ["session/request_permission"])
+
+        adapter.permission = "reject-once"
+        with self.assertRaises(RuntimeError) as caught:
+            await adapter.request("session/prompt", {"sessionId": session, "prompt": [
+                {"type": "text", "text": "/extension install ./absent-fixture.whl"},
+            ]})
+        error = json.loads(str(caught.exception))
+        self.assertEqual(error["code"], -32004)
+        self.assertEqual(error["data"], {"kind": "studio_extension_management_required", "action": "install"})
+        self.assertEqual([request["method"] for request in adapter.requests], ["session/request_permission"])
+        self.assertEqual(await self.managed_states(adapter, session), {"studio-pack": "active"})
 
     async def test_managed_extensions_recover_across_workers_adapters_and_generations(self):
         mcp = self.root / "managed.mcp"
