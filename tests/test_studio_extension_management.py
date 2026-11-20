@@ -51,7 +51,8 @@ class StudioExtensionManagementTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_studio_refuses_writes_before_approval_or_launch(self):
         with patch.dict(os.environ, {"AELIX_ACP_STUDIO_MANAGED": "1"}), patch(
-                "aelix_acp.runtime.extensions.asyncio.create_subprocess_exec") as spawn:
+                "aelix_acp.runtime.extensions.asyncio.create_subprocess_exec",
+                side_effect=AssertionError("Unexpected extension manager launch")) as spawn:
             for manager in (None, sys.executable):
                 self.server.args.extension_manager = manager
                 for command in ("install fixture", "install", "update fixture", "update", "remove fixture"):
@@ -62,12 +63,13 @@ class StudioExtensionManagementTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_studio_refuses_package_writes_via_management_api(self):
         with patch.dict(os.environ, {"AELIX_ACP_STUDIO_MANAGED": "1"}), patch(
-                "aelix_acp.runtime.extensions.asyncio.create_subprocess_exec") as spawn:
+                "aelix_acp.runtime.extensions.asyncio.create_subprocess_exec",
+                side_effect=AssertionError("Unexpected extension manager launch")) as spawn:
             for action in ("install", "update", "remove"):
-                with self.subTest(action=action):
-                    response = await self.request("_aelix/manage", action="extensions/action",
-                                                  arguments={"action": action, "target": "fixture"})
-                    self.assert_studio_refusal(response, action)
+                for arguments in ({"action": action, "target": "fixture"}, {"command": f"{action} fixture"}):
+                    with self.subTest(arguments=arguments):
+                        response = await self.request("_aelix/manage", action="extensions/action", arguments=arguments)
+                        self.assert_studio_refusal(response, action)
             self.server.client_request.assert_not_called()
             spawn.assert_not_called()
 
@@ -94,7 +96,12 @@ class StudioExtensionManagementTests(unittest.IsolatedAsyncioTestCase):
             for action in ("install", "update", "remove"):
                 with self.subTest(action=action):
                     await self.assert_manager_argv(f"{action} fixture", ["extension", action, "fixture", "--yes"], True)
-            os.environ["AELIX_ACP_STUDIO_MANAGED"] = "0"
-            await self.assert_manager_argv("update", ["extension", "update", "--yes"], True)
         self.assertEqual([call.args[0] for call in self.server.client_request.await_args_list],
-                         ["session/request_permission"] * 4)
+                         ["session/request_permission"] * 3)
+
+    async def test_studio_marker_requires_exact_value(self):
+        for value in ("0", " 1 "):
+            with self.subTest(value=value), patch.dict(os.environ, {"AELIX_ACP_STUDIO_MANAGED": value}):
+                await self.assert_manager_argv("update", ["extension", "update", "--yes"], True)
+        self.assertEqual([call.args[0] for call in self.server.client_request.await_args_list],
+                         ["session/request_permission"] * 2)
