@@ -40,18 +40,26 @@ class HostBytes:
         self.server = server
         self.read_lock = asyncio.Lock()
 
-    async def _request(self, params):
+    async def _request(self, params, current):
+        def check():
+            if not current():
+                raise InvalidGrant("stale-turn")
+
         # A retry is the same reverse read/finish, never a new queue submission.
         for _ in range(2):
             try:
                 async with self.read_lock:
-                    return await self.server.client_request(
-                        METHOD, params, timeout=4, max_response_bytes=MAX_REPLY
+                    check()
+                    result = await self.server.client_request(
+                        METHOD, params, timeout=4, max_response_bytes=MAX_REPLY, before_send=check
                     )
+                    check()
+                    return result
             except TimeoutError:
                 continue
             except (ProtocolError, OSError):
                 break
+        check()
         raise InvalidGrant("grant-unavailable")
 
     async def acquire(self, session_id, binding_id, ref, limit, *, current):
@@ -61,7 +69,7 @@ class HostBytes:
         identity = None
         while current():
             offset = len(body)
-            result = await self._request({**params, "offset": offset, "maxBytes": MAX_CHUNK})
+            result = await self._request({**params, "offset": offset, "maxBytes": MAX_CHUNK}, current)
             if set(result) != {"offset", "byteLength", "sha256", "eof", "data"}:
                 break
             length, sha256, encoded = (result["byteLength"], result["sha256"], result["data"])
@@ -96,7 +104,7 @@ class HostBytes:
                     break
                 if not current():
                     raise InvalidGrant("stale-turn")
-                finished = await self._request({**params, "offset": length, "finish": True})
+                finished = await self._request({**params, "offset": length, "finish": True}, current)
                 if set(finished) != {"released"} or finished["released"] is not True:
                     break
                 return body, sha256

@@ -57,6 +57,8 @@ def supports_running_input(state):
 
 def bind_session(session, result, binding_id):
     if binding_id is not None and supports_running_input(session.state):
+        if session.input_relay is not None:
+            session.input_relay.invalidate_images()
         session.input_relay = SessionRelay(session, binding_id)
         result.setdefault("_meta", {})[META_KEY] = {"bindingId": binding_id}
     return result
@@ -116,11 +118,21 @@ class SessionRelay:
         self.clock = clock
         self.turn_id = None
         self.acquiring_images = False
+        self.queue_order = {command: asyncio.Lock() for command in ("steer", "follow_up")}
+        self.image_acceptances = {}
         self.receipts: dict[str, Receipt] = {}
+
+    def invalidate_images(self):
+        # Each entry belongs to the original request, never a duplicate waiter.
+        for task, invalidated in self.image_acceptances.items():
+            if not invalidated:
+                self.image_acceptances[task] = True
+                task.cancel()
 
     def observe_prompt(self, streaming):
         if not streaming:
             self.turn_id = None
+            self.invalidate_images()
         elif self.turn_id is None:
             self.turn_id = getattr(self.session, "image_turn_id", None) or uuid.uuid4().hex
 
@@ -224,28 +236,47 @@ class SessionRelay:
 
         outcome = asyncio.get_running_loop().create_future()
         receipt = self.receipts[key] = Receipt(now, fingerprint, outcome)
-        issued = False
+        issued = locked = False
+        task = asyncio.current_task()
+        lock = self.queue_order[native_command]
+
+        def release_order():
+            nonlocal locked
+            if locked:
+                lock.release()
+                locked = False
 
         def issued_write():
             nonlocal issued
             issued = True
+            self.image_acceptances.pop(task, None)
+            release_order()
+
+        if pixels:
+            self.image_acceptances[task] = False
+            session = self.session
+            fence = (session.state.get("model"), session.image_generation, session.aborts)
 
         try:
-            # No suspension between the turn check and the native stdin write
-            # inside rpc(). Native can read it after its last drain.
-            if turn_id != self.active_turn():
-                result = {"accepted": False, "reason": "stale-turn"}
-            elif pixels:
-                async with asyncio.timeout(IMAGE_REQUEST_SECONDS):
-                    result = await self._write_images(native_command, turn_id, message, refs, receipt, issued_write)
-            else:
-                # H1 owns the caller deadline. Keep the native request
-                # correlated and the receipt pending until the stream settles.
-                await self.session.rpc(native_command, message=message, _timeout=None)
-                result = {"turnId": turn_id, "accepted": True, "delivery": "native-queue"}
+            async with asyncio.timeout(IMAGE_REQUEST_SECONDS if pixels else None):
+                await lock.acquire()
+                locked = True
+                if turn_id != self.active_turn():
+                    result = {"accepted": False, "reason": "stale-turn"}
+                elif pixels:
+                    result = await self._write_images(native_command, turn_id, message, refs, receipt, issued_write, fence)
+                else:
+                    # rpc() reaches stdin.write before its first suspension.
+                    release_order()
+                    await self.session.rpc(native_command, message=message, _timeout=None)
+                    result = {"turnId": turn_id, "accepted": True, "delivery": "native-queue"}
         except asyncio.CancelledError:
             if pixels and not issued:
-                outcome.set_result({"status": "completed", "result": {"accepted": False, "reason": "cancelled"}})
+                fenced = self.image_acceptances.get(task, False)
+                outcome.set_result({"status": "completed", "result": {
+                    "accepted": False, "reason": "stale-turn" if fenced else "cancelled"}})
+                if fenced and task.uncancel() == 0:
+                    return write_result(outcome.result())
             else:
                 outcome.set_result({"status": "unknown"})
             raise
@@ -265,25 +296,30 @@ class SessionRelay:
                 outcome.set_result({"status": "unknown"})
         else:
             outcome.set_result({"status": "completed", "result": result})
+        finally:
+            self.image_acceptances.pop(task, None)
+            release_order()
         return write_result(outcome.result())
 
-    async def _write_images(self, command, turn, message, refs, receipt, issued):
+    async def _write_images(self, command, turn, message, refs, receipt, issued, fence):
         session = self.session
         server = session.server
+        model, generation, stop = fence
+        task = asyncio.current_task()
+
+        def current():
+            return (not self.image_acceptances.get(task, True) and self.active_turn() == turn
+                    and session.aborts == stop and session.image_generation == generation
+                    and session.state.get("model") == model and session.input_relay is self
+                    and server.sessions.get(session.id) is session and session.id not in server.starting_ids)
+
+        if not current():
+            raise image_policy.ImageRejected("stale-turn")
         policy = self.image_policy()
         if not policy:
             raise image_policy.ImageRejected("model-unverified")
         if self.acquiring_images:
             raise image_policy.ImageRejected("image-acquisition-busy")
-        model = session.state.get("model")
-        generation = session.image_generation
-        stop = session.aborts
-
-        def current():
-            return (self.active_turn() == turn and session.aborts == stop and session.image_generation == generation
-                    and session.state.get("model") == model and session.input_relay is self
-                    and server.sessions.get(session.id) is session and session.id not in server.starting_ids)
-
         budget = image_policy.limits(policy)
         if len(refs) > budget["count"]:
             raise image_policy.ImageRejected("image-count")

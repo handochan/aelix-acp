@@ -62,6 +62,7 @@ def png_dimensions(raw):
 def jpeg_dimensions(raw):
     offset = 2
     dimensions = None
+    frame_components = set()
     while offset + 4 <= min(len(raw), MAX_HEADER):
         if raw[offset] != 0xFF:
             break
@@ -80,10 +81,19 @@ def jpeg_dimensions(raw):
             components = raw[offset + 8]
             if raw[offset + 3] != 8 or components not in (1, 3, 4) or size != 8 + 3 * components:
                 break
+            frame_components = set(raw[offset + 9 : end : 3])
+            if len(frame_components) != components:
+                break
             height, width = struct.unpack_from(">HH", raw, offset + 4)
             dimensions = (width, height)
         if marker == 0xDA:
-            if dimensions and size >= 6 and end < len(raw) and size == 6 + 2 * raw[offset + 3]:
+            if not dimensions or size < 8 or end >= len(raw):
+                break
+            scans = raw[offset + 3]
+            if size != 6 + 2 * scans:
+                break
+            scan_components = set(raw[offset + 4 : end - 3 : 2])
+            if scans and len(scan_components) == scans and scan_components <= frame_components:
                 return dimensions
             break
         offset = end

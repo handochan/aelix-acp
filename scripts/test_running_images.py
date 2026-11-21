@@ -27,6 +27,7 @@ class HostFixture(ProbeServer):
         self.root = root
         self.acquired = {}
         self.reads = 0
+        self.reverse_hold = None
 
     async def client_request(self, method, params, **kwargs):
         assert method == host_bytes.METHOD
@@ -34,6 +35,10 @@ class HostFixture(ProbeServer):
         ref, offset = params["ref"], params["offset"]
         data = (self.root / "images" / self.grants[ref]).read_bytes()
         self.reads += 1
+        if self.reverse_hold is not None:
+            entered, release = self.reverse_hold
+            entered.set()
+            await release.wait()
         reader = self.acquired.setdefault(ref, params["readerId"])
         assert reader == params["readerId"]
         if params.get("finish"):
@@ -128,6 +133,9 @@ class RunningImages(Probe):
         assert (Path(self.worker.socket_dir) / "image-ready").exists()
 
     async def spawn(self, *args, **kwargs):
+        # Reuse the spike's write tap without replacing the product's pipe limit.
+        assert kwargs["limit"] == 65536
+        self.reader_limit = kwargs["limit"]
         process = await super().spawn(*args, **kwargs)
         read = process.stdout.read
         frame_size = 0
@@ -170,6 +178,27 @@ class RunningImages(Probe):
             await asyncio.sleep(0.01)
         raise AssertionError("No active turn")
 
+    async def assert_queue_order(self, mode, payload, text_id, text):
+        sent = self.native_writes["steer" if mode == "steer" else "follow_up"]
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.server.reverse_hold = (entered, release)
+        image = asyncio.create_task(self.relay(f"input/{mode}-images", payload))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            later = asyncio.create_task(
+                self.relay(
+                    f"input/{mode}", {"turnId": payload["turnId"], "requestId": key(text_id), "message": text}
+                )
+            )
+            await asyncio.sleep(0)
+            assert self.native_writes["steer" if mode == "steer" else "follow_up"] == sent and not later.done()
+        finally:
+            self.server.reverse_hold = None
+            release.set()
+        receipt, text_receipt = await asyncio.gather(image, later)
+        assert receipt["accepted"] and text_receipt["accepted"]
+        return receipt
+
     async def exercise(self):
         # Fill real file history with 32 MiB raw, then add real tool results.
         for index in range(8):
@@ -188,24 +217,45 @@ class RunningImages(Probe):
         }
         turn = await self.running_turn()
         payload = {"turnId": turn, "requestId": key(1), "message": " ", "grants": ["steer"]}
-        accepted = await self.relay("input/steer-images", payload)
+        accepted = await self.assert_queue_order("steer", payload, 11, "text after steer image")
         assert accepted["captionAdded"] and accepted["inputKind"] == "pixels"
         reads = self.server.reads
         assert await self.relay("input/steer-images", payload) == accepted and self.server.reads == reads
         assert (await self.relay("requests/lookup", {"requestId": key(1)}))["result"] == accepted
         follow_up = {**payload, "requestId": key(2), "message": "queued follow-up", "grants": ["followup"]}
-        assert not (await self.relay("input/follow-up-images", follow_up))["captionAdded"]
+        assert not (await self.assert_queue_order("follow-up", follow_up, 12, "text after follow-up image"))[
+            "captionAdded"
+        ]
         too_large = {**payload, "requestId": key(3), "grants": ["large1", "large2"]}
         assert await self.relay("input/steer-images", too_large) == {
             "accepted": False,
             "reason": "native-line-limit",
         }
-        assert self.native_writes["steer"] == 1
+        assert self.native_writes["steer"] == 2
         self.gate.set()
         self.additional_tool_calls = 2
         await task
         assert any(image_policy.CAPTION in row["blocks"] for req in self.requests for row in req["messages"])
         assert any("f0.png" in req["images"] for req in self.requests)
+        provider_rows = [req["messages"] for req in self.requests]
+
+        def first(text):
+            return next(
+                (mi, ri)
+                for mi, rows in enumerate(provider_rows)
+                for ri, row in enumerate(rows)
+                if text in row["blocks"]
+            )
+
+        tool = next(
+            (mi, ri)
+            for mi, rows in enumerate(provider_rows)
+            for ri, row in enumerate(rows)
+            if row["role"] == "tool"
+        )
+        assert tool < first(image_policy.CAPTION) < first("text after steer image")
+        assert first("text after steer image")[0] < first("queued follow-up")[0]
+        assert first("queued follow-up") < first("text after follow-up image")
         assert self.server.tool_image_base64_bytes == []
         # Post-projection injection and actual HTTP rejection must both permit
         # the next explicit input in the same file/session.
@@ -250,7 +300,7 @@ class RunningImages(Probe):
         await self.prompt("after Stop")
         assert self.requests[-1]["status"] == 200
         assert (await self.relay("requests/lookup", {"requestId": key(4)}))["result"] == late_receipt
-        assert self.native_writes["follow_up"] == 2
+        assert self.native_writes["follow_up"] == 3
 
         # Small images hit the count limit independently of the raw budget.
         for index in range(6):

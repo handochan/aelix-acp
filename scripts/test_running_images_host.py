@@ -19,7 +19,18 @@ from spike_image_window import Probe, sse
 from test_running_images import key
 
 
-async def host_run(root, host_bin, aelix):
+def marker_variants(marker):
+    variants = {marker}
+    for _ in range(2):
+        variants.update(
+            json.dumps(value, ensure_ascii=ascii_only)[1:-1]
+            for value in tuple(variants)
+            for ascii_only in (False, True)
+        )
+    return {value.encode("utf-8") for value in variants}
+
+
+async def host_run(root, host_bin, aelix, *, expect_sdk_leak=False):
     for item in ("home", "agent", "workspace", "host", "images"):
         (root / item).mkdir()
     probe = Probe(root, aelix)
@@ -27,10 +38,20 @@ async def host_run(root, host_bin, aelix):
     fixture = root / "images/private-file-marker.png"
     raw = fixture.read_bytes()
     prompt_marker = "private-synthetic-prompt-marker"
-    error_marker = "private-synthetic-provider-error"
+    error_marker = 'private-provider-error-문-"'
+    standard = {
+        "assistant": 'private-assistant-delta-문-"',
+        "tool": 'private-tool-path-문-"',
+        "rpcError": 'private-standard-error-문-"',
+    }
+    tool_path = root / "workspace" / (standard["tool"] + ".txt")
+    tool_path.write_text("Synthetic tool result.", encoding="utf-8")
+    wire_control = root / "standard-frame-markers.jsonl"
+    inject_tool = False
     reject = False
 
     async def endpoint(reader, writer):
+        nonlocal inject_tool
         try:
             header = (await reader.readuntil(b"\r\n\r\n")).splitlines()
             length = next(
@@ -50,7 +71,16 @@ async def host_run(root, host_bin, aelix):
                 ).encode()
                 status, media = "400 Bad Request", "application/json"
             else:
-                response = sse(payload["model"])
+                if inject_tool:
+                    inject_tool = False
+                    response = sse(
+                        payload["model"],
+                        tool_call_id="trace_control",
+                        tool_name="read",
+                        arguments={"path": str(tool_path)},
+                    )
+                else:
+                    response = sse(payload["model"], text=standard["assistant"])
                 status, media = "200 OK", "text/event-stream"
             header = (
                 f"HTTP/1.1 {status}\r\nContent-Type: {media}\r\nContent-Length: {len(response)}\r\n"
@@ -110,7 +140,9 @@ async def host_run(root, host_bin, aelix):
         "outputTokens": 4096,
     }
     launcher = root / "launch.py"
-    launcher.write_text(f"""import sys
+    launcher.write_text(f"""import json
+import sys
+from pathlib import Path
 sys.path.insert(0, {str(source)!r})
 import aelix_acp.server as server
 
@@ -118,6 +150,30 @@ class TestServer(server.Server):
     def __init__(self, args):
         super().__init__(args)
         self.image_policies = ({policy!r},)
+        self.fixture_prompt_ids = set()
+
+    async def handle(self, message):
+        identifier = message.get("id")
+        if message.get("method") == "session/prompt":
+            self.fixture_prompt_ids.add(identifier)
+        try:
+            await super().handle(message)
+        finally:
+            self.fixture_prompt_ids.discard(identifier)
+
+    async def send(self, message, **kwargs):
+        # Positive control at the ACP/Host boundary, after normal ACP sanitization.
+        markers = {standard!r}
+        error = message.get("error")
+        if isinstance(error, dict) and message.get("id") in self.fixture_prompt_ids:
+            assert {error_marker!r} not in str(error)
+            message = {{**message, "error": {{**error, "message": markers["rpcError"]}}}}
+        wire = json.dumps(message, ensure_ascii=False)
+        observed = [key for key, value in markers.items() if json.dumps(value, ensure_ascii=False)[1:-1] in wire]
+        if observed:
+            with Path({str(wire_control)!r}).open("a", encoding="utf-8") as out:
+                out.write(json.dumps(observed) + "\\n")
+        await super().send(message, **kwargs)
 
 server.Server = TestServer
 server.main()
@@ -180,18 +236,20 @@ server.main()
         proc.stdin.write(token.encode())
         await proc.stdin.drain()
         proc.stdin.close()
-        async with asyncio.timeout(15):
-            while proc.returncode is None:
-                try:
-                    await api("/api/assistants")
-                    return proc
-                except OSError:
-                    await asyncio.sleep(0.1)
-                except BaseException:
-                    proc.terminate()
-                    await proc.wait()
-                    raise
-        raise AssertionError(f"Host exited during startup ({proc.returncode})")
+        try:
+            async with asyncio.timeout(45):
+                while proc.returncode is None:
+                    try:
+                        await api("/api/assistants")
+                        return proc
+                    except OSError:
+                        await asyncio.sleep(0.1)
+            raise AssertionError(f"Host exited during startup ({proc.returncode})")
+        except BaseException:
+            if proc.returncode is None:
+                proc.terminate()
+                await proc.wait()
+            raise
 
     port = None
     proc = await start()
@@ -247,6 +305,18 @@ server.main()
             )
             return result["result"]
 
+        async def wait_idle():
+            async with asyncio.timeout(10):
+                while True:
+                    runtime = (await api(scope)).get("runtime") or {}
+                    if (
+                        runtime.get("state") in ("idle", None)
+                        and not runtime.get("is_processing")
+                        and runtime.get("turn_id") is None
+                    ):
+                        return
+                    await asyncio.sleep(0.05)
+
         await api(scope + "/messages", "POST", {"content": prompt_marker})
         await asyncio.wait_for(probe.arrivals.get(), 10)
         async with asyncio.timeout(5):
@@ -276,12 +346,19 @@ server.main()
         async with asyncio.timeout(5):
             while (await call("input/image-state", {}))["status"] != "available":
                 await asyncio.sleep(0.05)
-            while (await call("input/state", {}))["active"]:
+        await wait_idle()
+        inject_tool = True
+        seen = len(probe.requests)
+        await api(scope + "/messages", "POST", {"content": "exercise standard tool frame"})
+        async with asyncio.timeout(10):
+            while len(probe.requests) < seen + 2:
                 await asyncio.sleep(0.05)
+        await wait_idle()
+        seen = len(probe.requests)
         reject = True
         await api(scope + "/messages", "POST", {"content": "receive injected provider error"})
-        async with asyncio.timeout(5):
-            while len(probe.requests) < 3:
+        async with asyncio.timeout(15):
+            while len(probe.requests) <= seen or '"rpcError"' not in wire_control.read_text(encoding="utf-8"):
                 await asyncio.sleep(0.05)
             state_payload = {"bindingId": binding, "method": "_aelix/session/input/image-state", "payload": {}}
             while True:
@@ -300,21 +377,52 @@ server.main()
     logs = (root / "host-captured.log").read_bytes()
     logs += b"".join(p.read_bytes() for p in (root / "host/logs").glob("*") if p.is_file())
     assert b"TRACE" in logs
-    for marker in (b"private-file-marker.png", prompt_marker.encode(), error_marker.encode()):
-        assert marker not in logs, "Private fixture marker escaped into diagnostics"
+    observed = {
+        name for line in wire_control.read_text(encoding="utf-8").splitlines() for name in json.loads(line)
+    }
+    assert observed == set(standard), (observed, set(standard))
+    for marker in ("private-file-marker.png", prompt_marker, error_marker):
+        assert not any(variant in logs for variant in marker_variants(marker)), (
+            "Private fixture marker in diagnostics"
+        )
+    leaked = sorted(
+        name for name, marker in standard.items() if any(variant in logs for variant in marker_variants(marker))
+    )
+    if expect_sdk_leak:
+        assert leaked, "The old SDK TRACE positive control did not log any standard frame marker"
+    else:
+        assert not leaked, f"Standard frame markers in Host diagnostics: {leaked}"
     assert base64.b64encode(raw)[:76] not in logs
     assert hashlib.sha256(raw).hexdigest().encode() not in logs
     assert original["grants"][0]["id"].encode() not in logs
-    print(json.dumps({"hostBytes": True, "idempotentPrepare": True, "providerImages": 1, "logMarkers": 0}))
+    print(
+        json.dumps(
+            {
+                "hostBytes": True,
+                "idempotentPrepare": True,
+                "providerImages": 1,
+                "observedStandardFrames": sorted(observed),
+                "loggedStandardMarkers": leaked,
+            }
+        )
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", type=Path, required=True)
     parser.add_argument("--aelix", type=Path, required=True)
+    parser.add_argument("--expect-sdk-leak", action="store_true", help="positive control for the old H-1 binary")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="acp-h1-pair-") as location:
-        asyncio.run(host_run(Path(location).resolve(), args.host.resolve(), args.aelix.resolve()))
+        asyncio.run(
+            host_run(
+                Path(location).resolve(),
+                args.host.resolve(),
+                args.aelix.resolve(),
+                expect_sdk_leak=args.expect_sdk_leak,
+            )
+        )
 
 
 if __name__ == "__main__":

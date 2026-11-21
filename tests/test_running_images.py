@@ -6,6 +6,7 @@ import hashlib
 import json
 import struct
 import unittest
+import weakref
 import zlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -18,10 +19,19 @@ from aelix_acp import image_policy
 from aelix_acp.runtime import host_bytes, native_frames, session_relay
 from aelix_acp.session import Session
 from aelix_acp.wire.errors import ProtocolError
+from aelix_acp.wire.transport import StdoutWriter
 
 
 def png_chunk(kind, data):
     return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+
+def malformed_jpegs():
+    header = bytes.fromhex("ffd8 ffc0000b080001000101011100")
+    return (
+        header + bytes.fromhex("ffda000600003f0000"),  # Zero scan components.
+        header + bytes.fromhex("ffda0008010200003f0000"),
+    )  # Component 2 absent from SOF.
 
 
 def png(width=1, height=1, before_data=b""):
@@ -114,6 +124,47 @@ class HostBytesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["offset"] for item in sent], [0, 30, 30, len(raw), len(raw)])
         self.assertEqual(call.await_args.kwargs["max_response_bytes"], 192 * 1024)
 
+    async def test_fence_after_lock_and_before_retry(self):
+        current = True
+
+        async def timed_out(*args, **kwargs):
+            nonlocal current
+            current = False
+            raise TimeoutError()
+
+        call = AsyncMock(side_effect=timed_out)
+        source = host_bytes.HostBytes(SimpleNamespace(client_request=call))
+        with self.assertRaisesRegex(host_bytes.InvalidGrant, "stale-turn"):
+            await source.acquire("s", "b", "g", 100, current=lambda: current)
+        self.assertEqual(call.await_count, 1)
+
+        current = True
+        async with source.read_lock:
+            waiter = asyncio.create_task(source.acquire("s", "b", "g", 100, current=lambda: current))
+            await asyncio.sleep(0)
+            current = False
+        with self.assertRaisesRegex(host_bytes.InvalidGrant, "stale-turn"):
+            await waiter
+        self.assertEqual(call.await_count, 1)
+
+    async def test_fence_after_acp_writer_credit(self):
+        writer = StdoutWriter.__new__(StdoutWriter)
+        writer.credit = asyncio.Semaphore(0)
+        writer.queue = SimpleNamespace(put_nowait=AsyncMock())
+        writer.pending = set()
+
+        def guard():
+            raise host_bytes.InvalidGrant("stale-turn")
+
+        send = asyncio.create_task(writer.write(b"pull", before_queue=guard))
+        await asyncio.sleep(0)
+        writer.credit.release()
+        with self.assertRaisesRegex(host_bytes.InvalidGrant, "stale-turn"):
+            await send
+        self.assertFalse(writer.pending)
+        self.assertFalse(writer.credit.locked())
+        writer.queue.put_nowait.assert_not_called()
+
     async def test_bad_length_digest_eof_are_never_finished(self):
         raw = png()
         reply = {
@@ -185,9 +236,10 @@ class ImageRelayTests(unittest.IsolatedAsyncioTestCase):
         async def rpc(method, **kwargs):
             if method == "get_state":
                 return {"isStreaming": True, "model": self.session.state["model"]}
-            current, issued = kwargs["_image_write"]
-            self.assertTrue(current())
-            issued()
+            if hooks := kwargs.get("_image_write"):
+                current, issued = hooks
+                self.assertTrue(current())
+                issued()
             return {}
 
         self.session.rpc = AsyncMock(side_effect=rpc)
@@ -285,6 +337,139 @@ class ImageRelayTests(unittest.IsolatedAsyncioTestCase):
             {"status": "unknown"},
         )
 
+    async def test_malformed_jpeg_sos_never_writes_a_queue(self):
+        for index, raw in enumerate(malformed_jpegs(), 1):
+            self.server.host_bytes.acquire.return_value = raw, hashlib.sha256(raw).hexdigest()
+            self.assertEqual(await self.submit(index), {"accepted": False, "reason": "invalid-image-header"})
+        self.session.rpc.assert_not_awaited()
+
+    async def test_order_shared_by_text_and_images_per_mode(self):
+        original_rpc = self.session.rpc.side_effect
+        original_grant = self.server.host_bytes.acquire.return_value
+        for index, mode in enumerate(("steer", "follow-up"), 1):
+            with self.subTest(mode=mode):
+                accepting, release, written, ack = (asyncio.Event() for _ in range(4))
+                writes = []
+
+                async def acquire(*args, accepting=accepting, release=release, **kwargs):
+                    accepting.set()
+                    await release.wait()
+                    return original_grant
+
+                async def rpc(method, *, writes=writes, written=written, ack=ack, **kwargs):
+                    result = await original_rpc(method, **kwargs)
+                    if method != "get_state":
+                        writes.append(kwargs["message"])
+                        if "_image_write" in kwargs:
+                            written.set()
+                            await ack.wait()
+                    return result
+
+                self.session.rpc.side_effect = rpc
+                self.server.host_bytes.acquire.side_effect = acquire
+                prefix = "_aelix/session/input/"
+                image = asyncio.create_task(
+                    self.request(
+                        prefix + mode + "-images",
+                        {**self.input(index * 10, message="first image"), "grants": ["original"]},
+                    )
+                )
+                await accepting.wait()
+                text = asyncio.create_task(
+                    self.request(prefix + mode, self.input(index * 10 + 1, message="next text"))
+                )
+                other = "follow-up" if mode == "steer" else "steer"
+                self.assertTrue(
+                    (await self.request(prefix + other, self.input(index * 10 + 2, message="other mode")))[
+                        "accepted"
+                    ]
+                )
+                self.assertEqual(writes, ["other mode"])
+                release.set()
+                await written.wait()
+                self.assertTrue((await asyncio.wait_for(text, 1))["accepted"])
+                self.assertFalse(image.done())  # Wire order is sufficient, even before the first ACK.
+                ack.set()
+                self.assertTrue((await image)["accepted"])
+                self.assertEqual(writes, ["other mode", "first image", "next text"])
+
+    async def test_fence_cancels_first_middle_finish_and_cleans_acp_buffers(self):
+        class Buffer(bytearray):
+            pass
+
+        raw = png()
+        for number, boundary in enumerate(("first", "middle", "finish"), 1):
+            old_relay = self.session.input_relay = self.relay
+            self.session.invalidate_image_acceptance = Session.invalidate_image_acceptance.__get__(self.session)
+            self.session.cancelled = False
+            old_relay.turn_id = self.turn_id
+            entered = asyncio.Event()
+            seen, buffers = [], []
+
+            def alloc(buffers=buffers):
+                body = Buffer()
+                buffers.append(weakref.ref(body))
+                return body
+
+            async def reverse(method, params, *, seen=seen, boundary=boundary, entered=entered, **kwargs):
+                offset = params["offset"]
+                seen.append((offset, params.get("finish") is True))
+                if {"first": offset == 0, "middle": offset == 30, "finish": params.get("finish") is True}[
+                    boundary
+                ]:
+                    entered.set()
+                    await asyncio.Event().wait()
+                end = min(offset + 30, len(raw))
+                return {
+                    "offset": offset,
+                    "byteLength": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "eof": end == len(raw),
+                    "data": base64.b64encode(raw[offset:end]).decode(),
+                }
+
+            self.server.host_bytes = host_bytes.HostBytes(SimpleNamespace(client_request=reverse))
+            with patch.object(host_bytes, "bytearray", alloc, create=True):
+                pending = asyncio.create_task(self.submit(number))
+                await asyncio.wait_for(entered.wait(), 1)
+                self.assertIsNotNone(buffers[0]())
+                if boundary == "first":
+                    self.session.void_questions = lambda predicate: None
+                    self.session.context = SimpleNamespace(manual_compaction=False)
+                    self.session.tool_arrived = asyncio.Event()
+                    self.session.management_task = None
+                    self.session.permission_connections = self.session.permissions = self.session.ui_tasks = set()
+                    self.session.controls = SimpleNamespace(capabilities={})
+                    self.session.abort = AsyncMock()
+                    await Session.cancel(self.session)
+                elif boundary == "middle":
+                    self.session.image_generation = "replacement"
+                    self.session.interventions = {}
+                    Session.raise_fence(self.session)
+                else:
+                    session_relay.bind_session(self.session, {}, "binding-2")
+                self.assertEqual(await asyncio.wait_for(pending, 1), {"accepted": False, "reason": "stale-turn"})
+            self.assertEqual(len(seen), number)
+            self.assertIsNone(buffers[0]())
+            self.assertFalse(old_relay.acquiring_images)
+            self.assertFalse(old_relay.image_acceptances)
+            self.assertFalse(self.server.host_bytes.read_lock.locked())
+            self.session.changing = 0
+        await self.assert_rpc_error(
+            session_relay.LOOKUP_METHOD, {"requestId": self.input(3)["requestId"]}, session_relay.SCOPE_DENIED
+        )
+        self.session.rpc.assert_not_awaited()
+
+    async def test_default_policy_advertises_state_with_pixels_disabled(self):
+        from aelix_acp.server import Server
+
+        default = Server(SimpleNamespace(state_dir=self.session.socket_dir))
+        self.addCleanup(default.db.close)
+        self.server.image_policies = default.image_policies
+        self.assertEqual(await self.submit(), {"accepted": False, "reason": "model-unverified"})
+        self.server.host_bytes.acquire.assert_not_awaited()
+        self.session.rpc.assert_not_awaited()
+
     async def test_image_methods_require_a_host_offer_even_with_a_binding(self):
         self.server.host_bytes = None
         with self.assertRaises(ProtocolError) as error:
@@ -293,21 +478,56 @@ class ImageRelayTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NativeFrameTests(unittest.IsolatedAsyncioTestCase):
-    async def test_oversized_events_drain_to_the_next_response(self):
-        stream = asyncio.StreamReader()
-        identity = b"0" * 32
-        reply = b'{"type":"response","command":"steer","success":true,"id":"' + identity + b'"}\n'
-        stream.feed_data(
-            b'{"messages":["' + b"x" * 130_000 + b'"],"type":"agent_end"}\n'
-            b'{"tool_call_id":"tool","result":"' + b"x" * 130_000 + b'","type":"tool_execution_end"}\n' + reply
-        )
+    async def test_oversized_tool_end_status_and_next_rpc(self):
+        stream = asyncio.StreamReader(limit=65536)
+        identity = "0" * 32
+        reply = {"type": "response", "command": "steer", "success": True, "id": identity}
+        large = "x" * (native_frames.FRAME_LIMIT + 8192)
+        stream.feed_data(b'{"messages":["ignored"],"type":"agent_end"}\n')
+        for frame in (
+            {
+                "tool_call_id": "good",
+                "result": {"content": [large], "details": {"isError": True}, "is_error": False},
+                "is_error": False,
+                "type": "tool_execution_end",
+            },
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "bad",
+                "result": {"content": [large], "isError": True, "details": {"isError": False}},
+                "isError": False,
+            },
+            {
+                "tool_call_id": "outer",
+                "result": {"content": [large], "is_error": False},
+                "is_error": True,
+                "type": "tool_execution_end",
+            },
+            reply,
+        ):
+            stream.feed_data((json.dumps(frame) + "\n").encode())
         stream.feed_eof()
-        with patch.object(native_frames, "FRAME_LIMIT", 1024):
-            results = [frame async for frame in native_frames.read_frames(stream)]
-        self.assertEqual(len(results), 2)
-        self.assertEqual(native_frames.TOOL_ID.match(results[0][0])[1], b'"tool"')
-        self.assertTrue(native_frames.TOOL_END.search(results[0][1]))
-        self.assertEqual(results[1], (reply, None))
+        future = asyncio.get_running_loop().create_future()
+        worker = SimpleNamespace(
+            proc=SimpleNamespace(stdout=stream),
+            private_host=True,
+            pending={identity: future},
+            rpc_closed=False,
+            tool_arrived=asyncio.Event(),
+            _close_task=True,
+            done=None,
+            failure=None,
+            invalidate_image_acceptance=lambda: None,
+            event=AsyncMock(),
+        )
+        worker.rpc_frames = Session.rpc_frames.__get__(worker)
+        await Session.read_rpc(worker)
+        self.assertEqual(worker.failure, None)
+        self.assertEqual(future.result(), {})
+        self.assertEqual(
+            [(args.args[0]["toolCallId"], args.args[0]["isError"]) for args in worker.event.await_args_list],
+            [("good", False), ("bad", True), ("outer", True)],
+        )
 
     async def test_serialized_native_line_check_uses_exact_utf8_bytes(self):
         written = []

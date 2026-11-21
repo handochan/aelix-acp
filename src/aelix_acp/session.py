@@ -230,6 +230,8 @@ class Session:
         self.launch_mode = mode
 
     async def start(self, session_file=None, *, fork_source=None, fork_preferences=None, managed_change=None):
+        if self.input_relay is not None:
+            self.input_relay.observe_prompt(False)
         launch_prefix = getattr(self.server.args, "aelix_arg", [])
         prefix_options = {argument.split("=", 1)[0] for argument in launch_prefix}
         if prefix_options.intersection(SESSION_SELECTORS):
@@ -694,16 +696,14 @@ class Session:
 
     async def rpc_frames(self):
         if self.private_host:
-            async for line, tail in native_frames.read_frames(self.proc.stdout):
-                if tail is not None:
+            async for line, envelope in native_frames.read_frames(self.proc.stdout):
+                if envelope is not None:
                     if response := native_frames.RESPONSE.match(line):
                         future = self.pending.get(response[2].decode("ascii"))
                         if future is not None and not future.done():
                             future.set_exception(ProtocolError("Native response exceeds the frame limit", -32603))
-                    elif native_frames.TOOL_END.search(tail) or native_frames.TOOL_END.search(line[:40]):
-                        if tool := native_frames.TOOL_ID.match(line):
-                            await self.event({"type": "tool_execution_end", "toolCallId": json.loads(tool[1]),
-                                              "isError": bool(native_frames.TOOL_FAILED.search(tail))})
+                    elif envelope:
+                        await self.event(envelope)
                     continue
                 yield line
         else:
@@ -737,6 +737,7 @@ class Session:
             self.failure = "Aelix stream failed" if self.private_host else f"Aelix stream failed: {exc}"
         finally:
             self.rpc_closed = True
+            self.invalidate_image_acceptance()
             self.tool_arrived.set()
             for future in self.pending.values():
                 if not future.done():
@@ -1227,6 +1228,7 @@ class Session:
         self.server.starting_ids.add(self.id)
         # Children actions are refused until this returns; close() below ends those in flight.
         self.changing += 1
+        self.invalidate_image_acceptance()
         if self.turn_active:
             self.dispatched = True  # Replacing the worker is itself an effect.
         held_lease = self.lease
@@ -1295,6 +1297,10 @@ class Session:
             self.server.starting_ids.discard(self.id)
             self.changing -= 1
 
+    def invalidate_image_acceptance(self):
+        if self.input_relay is not None:
+            self.input_relay.invalidate_images()
+
     def raise_fence(self):
         """A close begins (aelix-ai #612; a restart's too): end the child interventions waiting for native.
 
@@ -1307,6 +1313,7 @@ class Session:
         ones alone (fix round 2, F1).
         """
         self.changing += 1
+        self.invalidate_image_acceptance()
         for task, answer in list(self.interventions.items()):
             if not task.done() and (answer is None or not answer.done()):
                 self.fenced.add(task)
@@ -1620,6 +1627,7 @@ class Session:
             # Keep waiting for the actual manual compaction outcome.
             return
         self.cancelled = True
+        self.invalidate_image_acceptance()
         self.image_epoch = None
         self.tool_arrived.set()
         if self.management_task and not self.management_task.done():
@@ -1639,6 +1647,7 @@ class Session:
 
     async def close(self):
         if self._close_task is None:
+            self.invalidate_image_acceptance()
             self._close_task = asyncio.create_task(self._close())
             self.server.cleanup_tasks.add(self._close_task)
             self._close_task.add_done_callback(self.server.cleanup_tasks.discard)

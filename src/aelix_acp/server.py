@@ -68,14 +68,17 @@ class Server:
         self.output = None
         self.managed_extensions = getattr(args, "managed_extensions", None)
 
-    async def send(self, message):
+    async def send(self, message, *, before_send=None):
         async with self.output_lock:
             raw = encode_frame(message)
             if self.output is None:
                 self.output = StdoutWriter()
-            await self.output.write(raw)
+            if before_send is None:
+                await self.output.write(raw)
+            else:
+                await self.output.write(raw, before_queue=before_send)
 
-    async def client_request(self, method, params, *, withdraw=False, timeout=None, max_response_bytes=None):
+    async def client_request(self, method, params, *, withdraw=False, timeout=None, max_response_bytes=None, before_send=None):
         """The client's result for one request, waited for up to `timeout` (CLIENT_REQUEST_SECONDS) seconds.
 
         `withdraw` (a delegated child's question, aelix-ai #612 fix round 1,
@@ -89,7 +92,11 @@ class Server:
         if max_response_bytes is not None:
             self.response_limits[request_id] = max_response_bytes
         try:
-            await self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+            frame = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+            if before_send is None:
+                await self.send(frame)
+            else:
+                await self.send(frame, before_send=before_send)
             return await asyncio.wait_for(future, timeout or CLIENT_REQUEST_SECONDS)
         except (asyncio.CancelledError, TimeoutError):
             if withdraw and not self.closing and (future.cancelled() or not future.done()):
