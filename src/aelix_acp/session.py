@@ -22,7 +22,9 @@ import uuid
 from .wire.errors import (ProtocolError, BackendError, after_dispatch, delivery_unknown, fork_head_changed,
                           is_native_session_locked, require_object, require_string, session_changing, session_locked)
 from .wire.process import terminate_owned
-from .wire.transport import StdoutWriter
+from .wire.transport import StdoutWriter, encode_frame
+from . import image_policy
+from .runtime import native_frames
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
 from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event,
@@ -150,6 +152,10 @@ class Session:
         self.cancelled = False
         self.turn_active = False
         self.input_relay = None
+        self.private_host = getattr(server, "host_bytes", None) is not None
+        self.image_generation = None
+        self.image_epoch = None
+        self.image_turn_id = None
         self.dispatched = False
         self.tools = {}
         self.tool_arrived = asyncio.Event()
@@ -224,6 +230,8 @@ class Session:
         self.launch_mode = mode
 
     async def start(self, session_file=None, *, fork_source=None, fork_preferences=None, managed_change=None):
+        if self.input_relay is not None:
+            self.input_relay.observe_prompt(False)
         launch_prefix = getattr(self.server.args, "aelix_arg", [])
         prefix_options = {argument.split("=", 1)[0] for argument in launch_prefix}
         if prefix_options.intersection(SESSION_SELECTORS):
@@ -279,6 +287,11 @@ class Session:
             args += ["-e", extension]
         # Consent sees arguments after other trusted extension hooks.
         args += ["-e", str(PACKAGE / "bridge.py")]
+        policies = self.server.image_policies if self.private_host else ()
+        if policies:
+            args += ["-e", str(PACKAGE / "image_policy.py")]
+        self.image_generation = uuid.uuid4().hex
+        self.image_epoch = self.image_turn_id = None
         # Adapter defaults must not suppress native resume. Explicit native
         # route arguments retain their original provider and model binding.
         if not resume_file or prefix_options & NATIVE_ROUTE_ARGUMENTS:
@@ -299,6 +312,12 @@ class Session:
         for name in ("AELIX_ACP_SOCKET", "AELIX_ACP_ENDPOINT", "AELIX_ACP_PERMISSION_TOKEN", "AELIX_ACP_FORK_SOURCE",
                      "AELIX_ACP_SELECTOR_STARTUP_FILE"):
             env.pop(name, None)
+        env.pop("AELIX_ACP_IMAGE_POLICIES", None)
+        if self.private_host:
+            for name in ("ANTHROPIC_LOG", "OPENAI_LOG", "GEMINI_NEXT_GEN_API_LOG"):
+                env.pop(name, None)
+            if policies:
+                env["AELIX_ACP_IMAGE_POLICIES"] = json.dumps(policies)
         guard_selectors = bool(saved_agent and resume_file)
         if guard_selectors:
             env["AELIX_ACP_SELECTOR_STARTUP_FILE"] = str(Path(resume_file).resolve())
@@ -323,7 +342,7 @@ class Session:
         self.proc = await asyncio.create_subprocess_exec(
             *args, cwd=self.cwd, env=env, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            limit=FRAME_LIMIT, **({} if sys.platform == "win32" else {"start_new_session": True}))
+            limit=65536 if self.private_host else FRAME_LIMIT, **({} if sys.platform == "win32" else {"start_new_session": True}))
         if self.worker_job:
             # The native RPC child receives no command before it joins the job;
             # its later tool/MCP descendants inherit the owned lifetime.
@@ -619,7 +638,7 @@ class Session:
             if self.lease is not None:
                 self.record(self.save)
 
-    async def rpc(self, command, *, _timeout=45, **kwargs):
+    async def rpc(self, command, *, _timeout=45, _image_write=None, **kwargs):
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
@@ -630,7 +649,18 @@ class Session:
                 raise ProtocolError(self.failure or "Aelix RPC stream is closed", -32603)
             if not self.proc or self.proc.returncode is not None:
                 raise ProtocolError("Aelix child is not running", -32603)
-            self.proc.stdin.write((json.dumps({"id": request_id, "type": command, **kwargs}) + "\n").encode())
+            frame = {"id": request_id, "type": command, **kwargs}
+            if _image_write is None:
+                raw = (json.dumps(frame) + "\n").encode()
+            else:
+                raw = encode_frame(frame)
+                if len(raw) > image_policy.MAX_NATIVE_LINE:
+                    raise image_policy.ImageRejected("native-line-limit")
+                current, issued = _image_write
+                if not current():
+                    raise image_policy.ImageRejected("stale-turn")
+                issued()  # write() can fail after handing bytes to the pipe.
+            self.proc.stdin.write(raw)
             await self.proc.stdin.drain()
             # Queue writes have their own receipts. A late drain must not
             # change the dispatch outcome tracked for another prompt.
@@ -652,20 +682,38 @@ class Session:
 
     async def read_stderr(self):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        writer = StdoutWriter(sys.stderr.fileno())
+        writer = None if self.private_host else StdoutWriter(sys.stderr.fileno())
         try:
             while chunk := await self.proc.stderr.read(4096):
                 # Bounded copy for native refusals reported only on stderr.
                 self.stderr_tail = (self.stderr_tail + chunk)[-STDERR_TAIL:]
-                text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
-                await writer.write(text.encode("utf-8"))
+                if writer is not None:
+                    text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
+                    await writer.write(text.encode("utf-8"))
         finally:
-            writer.close()
+            if writer is not None:
+                writer.close()
+
+    async def rpc_frames(self):
+        if self.private_host:
+            async for line, envelope in native_frames.read_frames(self.proc.stdout):
+                if envelope is not None:
+                    if response := native_frames.RESPONSE.match(line):
+                        future = self.pending.get(response[2].decode("ascii"))
+                        if future is not None and not future.done():
+                            future.set_exception(ProtocolError("Native response exceeds the frame limit", -32603))
+                    elif envelope:
+                        await self.event(envelope)
+                    continue
+                yield line
+        else:
+            while line := await self.proc.stdout.readline():
+                yield line
 
     async def read_rpc(self):
         self.reader = asyncio.current_task()
         try:
-            while line := await self.proc.stdout.readline():
+            async for line in self.rpc_frames():
                 try:
                     event = json.loads(line)
                     if not isinstance(event, dict):
@@ -681,13 +729,15 @@ class Session:
                         elif is_native_session_locked(event.get("error", "")):
                             future.set_exception(session_locked(self.id, "native"))
                         else:
-                            future.set_exception(BackendError(str(event.get("error", "RPC failed")), event.get("command", "unknown")))
+                            detail = "Native RPC failed" if self.private_host else str(event.get("error", "RPC failed"))
+                            future.set_exception(BackendError(detail, event.get("command", "unknown")))
                 else:
                     await self.event(event)
         except Exception as exc:
-            self.failure = f"Aelix stream failed: {exc}"
+            self.failure = "Aelix stream failed" if self.private_host else f"Aelix stream failed: {exc}"
         finally:
             self.rpc_closed = True
+            self.invalidate_image_acceptance()
             self.tool_arrived.set()
             for future in self.pending.values():
                 if not future.done():
@@ -700,9 +750,16 @@ class Session:
                 self.server.cleanup_tasks.add(task)
                 task.add_done_callback(self.server.cleanup_tasks.discard)
 
+    def clear_image_sample(self):
+        if self.socket_dir and self.image_epoch:
+            with contextlib.suppress(OSError):
+                (Path(self.socket_dir) / "image-state.json").unlink(missing_ok=True)
+
     async def event(self, event):
         kind = event.get("type")
         if kind in ("compaction_start", "compaction_end"):
+            if kind == "compaction_start":
+                self.clear_image_sample()
             await self.context.native_compaction_event(event)
         elif kind == "message_start" and (event.get("message") or {}).get("role") == "assistant":
             self.failure = None
@@ -729,7 +786,7 @@ class Session:
                 failed = event.get("isError", event.get("is_error", False)) or result.get("is_error", result.get("isError", False))
                 update = {"sessionUpdate": "tool_call_update", "toolCallId": call_id,
                           "status": ("failed" if failed else "completed") if kind.endswith("end") else "in_progress",
-                          "rawOutput": result,
+                          **({} if self.private_host else {"rawOutput": result}),
                           "content": [{"type": "content", "content": {"type": "text", "text": text_content(result.get("content"))}}]}
                 if kind.endswith("end"):
                     self.subagents.tool_ended(call_id)
@@ -749,12 +806,14 @@ class Session:
                             await self.update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text",
                                 "text": f"\n[AionUi 분석 미리보기]({preview})\n"}})
                         except (OSError, ValueError) as exc:
-                            print(f"[aelix-acp] Standalone preview unavailable: {exc}", file=sys.stderr)
+                            detail = type(exc).__name__ if self.private_host else str(exc)
+                            print(f"[aelix-acp] Standalone preview unavailable: {detail}", file=sys.stderr)
         elif kind == "message_end":
             message = event.get("message") or {}
             error = message.get("errorMessage") or message.get("error_message")
             if error:
-                self.failure = error
+                self.failure = "Native model request failed" if self.private_host else error
+                self.clear_image_sample()
         elif kind == "aelix_subagent":
             await self.subagent_progress(event.get("event"), event.get("data") or {})
         elif kind == "aelix_child":
@@ -1169,6 +1228,7 @@ class Session:
         self.server.starting_ids.add(self.id)
         # Children actions are refused until this returns; close() below ends those in flight.
         self.changing += 1
+        self.invalidate_image_acceptance()
         if self.turn_active:
             self.dispatched = True  # Replacing the worker is itself an effect.
         held_lease = self.lease
@@ -1237,6 +1297,10 @@ class Session:
             self.server.starting_ids.discard(self.id)
             self.changing -= 1
 
+    def invalidate_image_acceptance(self):
+        if self.input_relay is not None:
+            self.input_relay.invalidate_images()
+
     def raise_fence(self):
         """A close begins (aelix-ai #612; a restart's too): end the child interventions waiting for native.
 
@@ -1249,6 +1313,7 @@ class Session:
         ones alone (fix round 2, F1).
         """
         self.changing += 1
+        self.invalidate_image_acceptance()
         for task, answer in list(self.interventions.items()):
             if not task.done() and (answer is None or not answer.done()):
                 self.fenced.add(task)
@@ -1500,6 +1565,9 @@ class Session:
         self.tools.clear()
         self.subagents.clear()  # Per turn; self.children (spawned children's parents) stays.
         try:
+            if self.private_host and self.server.image_policies:
+                self.image_epoch = self.image_turn_id = uuid.uuid4().hex
+                (Path(self.socket_dir) / "image-epoch").write_text(self.image_epoch, encoding="ascii")
             timeout = getattr(self.server.args, "turn_timeout", 600)
             async with asyncio.timeout(timeout or None):
                 await send()
@@ -1559,6 +1627,8 @@ class Session:
             # Keep waiting for the actual manual compaction outcome.
             return
         self.cancelled = True
+        self.invalidate_image_acceptance()
+        self.image_epoch = None
         self.tool_arrived.set()
         if self.management_task and not self.management_task.done():
             self.management_task.cancel()
@@ -1577,6 +1647,7 @@ class Session:
 
     async def close(self):
         if self._close_task is None:
+            self.invalidate_image_acceptance()
             self._close_task = asyncio.create_task(self._close())
             self.server.cleanup_tasks.add(self._close_task)
             self._close_task.add_done_callback(self.server.cleanup_tasks.discard)

@@ -28,7 +28,7 @@ from .wire.transport import decode_frame, encode_frame, StdoutWriter
 from .runtime.extensions import run_extension_action, require_consent
 from .runtime.leases import acquire as acquire_lease
 from .runtime.leases import lease_path
-from .runtime import forks, session_relay
+from .runtime import forks, host_bytes, session_relay
 from .runtime.children import NESTED_TOOL_CALLS, nested_only
 
 from .session import CONCURRENT_CONTROLS, Session, text_content, tool_call
@@ -52,10 +52,15 @@ class Server:
         self.db = open_store(args.state_dir)
         self.initialized = False
         self.relay_enabled = False
+        self.host_bytes = None
+        # Populate only with exact provider/model/API/endpoint routes that pass
+        # final HTTP, Stop and log qualification with the pinned distribution.
+        self.image_policies = ()
         self.active_request_ids = set()
         self.sessions = {}
         self.starting_ids = set()
         self.pending = {}
+        self.response_limits = {}
         self.tasks = set()
         self.cleanup_tasks = set()
         self.closing = False  # The client is gone: sessions end without sending.
@@ -63,14 +68,17 @@ class Server:
         self.output = None
         self.managed_extensions = getattr(args, "managed_extensions", None)
 
-    async def send(self, message):
+    async def send(self, message, *, before_send=None):
         async with self.output_lock:
             raw = encode_frame(message)
             if self.output is None:
                 self.output = StdoutWriter()
-            await self.output.write(raw)
+            if before_send is None:
+                await self.output.write(raw)
+            else:
+                await self.output.write(raw, before_queue=before_send)
 
-    async def client_request(self, method, params, *, withdraw=False, timeout=None):
+    async def client_request(self, method, params, *, withdraw=False, timeout=None, max_response_bytes=None, before_send=None):
         """The client's result for one request, waited for up to `timeout` (CLIENT_REQUEST_SECONDS) seconds.
 
         `withdraw` (a delegated child's question, aelix-ai #612 fix round 1,
@@ -81,8 +89,14 @@ class Server:
         request_id = "acp-" + uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
+        if max_response_bytes is not None:
+            self.response_limits[request_id] = max_response_bytes
         try:
-            await self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+            frame = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+            if before_send is None:
+                await self.send(frame)
+            else:
+                await self.send(frame, before_send=before_send)
             return await asyncio.wait_for(future, timeout or CLIENT_REQUEST_SECONDS)
         except (asyncio.CancelledError, TimeoutError):
             if withdraw and not self.closing and (future.cancelled() or not future.done()):
@@ -91,6 +105,7 @@ class Server:
             raise
         finally:
             self.pending.pop(request_id, None)
+            self.response_limits.pop(request_id, None)
 
     def session(self, params):
         try:
@@ -231,6 +246,8 @@ class Server:
         require_object(params)
         if handler := session_relay.REQUESTS.get(method):
             return await self.relay_request(handler, params)
+        if self.host_bytes is not None and (handler := session_relay.IMAGE_REQUESTS.get(method)):
+            return await self.relay_request(handler, params)
         if method.startswith(session_relay.METHOD_PREFIX):
             raise ProtocolError("Unsupported session relay method.", -32601)
         if method == "_aelix/manage" and isinstance(params.get("action"), str) and params["action"] in CONCURRENT_CONTROLS:
@@ -287,6 +304,8 @@ class Server:
             self.client_capabilities = capabilities
             relay_ad = session_relay.advertisement(capabilities)
             self.relay_enabled = relay_ad is not None
+            if self.relay_enabled and host_bytes.offered(capabilities):
+                self.host_bytes = host_bytes.HostBytes(self)
             return {"protocolVersion": 1,
                     "agentInfo": {"name": "aelix-acp", "title": f"Aelix {self.args.profile.title()}", "version": __version__},
                     "agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True, "image": True},
@@ -295,6 +314,7 @@ class Server:
                                                                   "fork": {"_meta": {"aelix/expectedHead": 1}}},
                                           "_meta": {SUBAGENTS_META: {"version": 1, "on": "tool_call_update"},
                                                     **({session_relay.META_KEY: relay_ad} if relay_ad else {}),
+                                                    **({host_bytes.META_KEY: {"version": 1}} if self.host_bytes else {}),
                                                     "aelix/errors": {"sessionLocked": SESSION_LOCKED, "turnFailedAfterDispatch": TURN_FAILED_AFTER_DISPATCH}}},
                     "_meta": {"aelix/control": {"version": 1, "methods": ["_aelix/capabilities", "_aelix/manage"],
                               "clientActionCapability": "aelix/clientActions"},
@@ -351,6 +371,8 @@ class Server:
                         for update in recorded:
                             if not nesting and nested_only(update):
                                 continue  # aelix-ai #612: the loading client's opt-in, as live.
+                            if session.private_host:
+                                update.pop("rawOutput", None)
                             await self.send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
                     elif not session.fork_projection:
                         for update in await self.native_history(session):
@@ -550,7 +572,8 @@ class Server:
                     error["data"] = exc.data
                 await self.send({"jsonrpc": "2.0", "id": request_id, "error": error})
             else:
-                print(f"[aelix-acp] {exc}", file=sys.stderr)
+                detail = type(exc).__name__ if self.host_bytes else str(exc)
+                print(f"[aelix-acp] {detail}", file=sys.stderr)
         finally:
             self.active_request_ids.discard(request_id)
 
@@ -574,7 +597,10 @@ class Server:
                 if "method" not in message:
                     future = self.pending.get(message.get("id"))
                     if future and not future.done():
-                        if "error" in message:
+                        limit = self.response_limits.get(message.get("id"))
+                        if limit is not None and len(line.removesuffix(b"\n")) > limit:
+                            future.set_exception(ProtocolError("Client response exceeds the byte limit"))
+                        elif "error" in message:
                             error = message["error"]
                             future.set_exception(ProtocolError("Client request failed", -32603,
                                 {"kind": "client_error", "code": error.get("code") if isinstance(error, dict) else None}))

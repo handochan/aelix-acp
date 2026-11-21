@@ -48,12 +48,12 @@ def make_image(label, size=None):
             + struct.pack(">I", zlib.crc32(chunk)) + sample[-12:])
 
 
-def sse(model, *, tool_call_id=None):
-    delta = {"role": "assistant", "content": "fixture response"}
+def sse(model, *, tool_call_id=None, text="fixture response", tool_name="fixture_image", arguments=None):
+    delta = {"role": "assistant", "content": text}
     if tool_call_id:
         delta = {"role": "assistant", "tool_calls": [
             {"index": 0, "id": tool_call_id, "type": "function",
-             "function": {"name": "fixture_image", "arguments": "{}"}}]}
+             "function": {"name": tool_name, "arguments": json.dumps(arguments or {})}}]}
     frames = []
     for update, finish in [(delta, None), ({}, "tool_calls" if tool_call_id else "stop")]:
         frame = {"id": "fixture", "object": "chat.completion.chunk", "created": 0, "model": model,

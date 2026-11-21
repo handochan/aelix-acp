@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+from pathlib import Path
 from dataclasses import dataclass
 import hashlib
 import json
 import time
 import uuid
 
+from .. import image_policy
+from . import host_bytes
 from ..wire.errors import ProtocolError, require_object, require_string
 from ..wire.transport import encode_frame
 
@@ -21,6 +25,7 @@ RECEIPT_TTL = 600
 # ID at most. This limits stored result bytes as well as the number of keys.
 MAX_RECEIPTS = 256
 MAX_RELAY_FRAME = 256 * 1024
+IMAGE_REQUEST_SECONDS = 120
 
 
 def advertisement(capabilities):
@@ -29,7 +34,8 @@ def advertisement(capabilities):
             or type(offer["version"]) is not int or offer["version"] != 1
             or type(offer["notifications"]) is not bool):
         return None
-    return {"version": 1, "requests": list(REQUESTS), "notifications": []}
+    requests = [*REQUESTS, *IMAGE_REQUESTS] if host_bytes.offered(capabilities) else list(REQUESTS)
+    return {"version": 1, "requests": requests, "notifications": []}
 
 
 def open_binding(metadata):
@@ -51,6 +57,8 @@ def supports_running_input(state):
 
 def bind_session(session, result, binding_id):
     if binding_id is not None and supports_running_input(session.state):
+        if session.input_relay is not None:
+            session.input_relay.invalidate_images()
         session.input_relay = SessionRelay(session, binding_id)
         result.setdefault("_meta", {})[META_KEY] = {"bindingId": binding_id}
     return result
@@ -94,6 +102,13 @@ class Receipt:
     first_seen: float
     fingerprint: bytes
     outcome: asyncio.Future
+    digests: bytes = b""
+    content_fingerprint: bytes | None = None
+
+    def matches(self, fingerprint):
+        if self.content_fingerprint is None:
+            return self.fingerprint == fingerprint
+        return self.content_fingerprint == hashlib.sha256(fingerprint + self.digests).digest()
 
 
 class SessionRelay:
@@ -102,13 +117,24 @@ class SessionRelay:
         self.binding_id = binding_id
         self.clock = clock
         self.turn_id = None
+        self.acquiring_images = False
+        self.queue_order = {command: asyncio.Lock() for command in ("steer", "follow_up")}
+        self.image_acceptances = {}
         self.receipts: dict[str, Receipt] = {}
+
+    def invalidate_images(self):
+        # Each entry belongs to the original request, never a duplicate waiter.
+        for task, invalidated in self.image_acceptances.items():
+            if not invalidated:
+                self.image_acceptances[task] = True
+                task.cancel()
 
     def observe_prompt(self, streaming):
         if not streaming:
             self.turn_id = None
+            self.invalidate_images()
         elif self.turn_id is None:
-            self.turn_id = uuid.uuid4().hex
+            self.turn_id = getattr(self.session, "image_turn_id", None) or uuid.uuid4().hex
 
     def active_turn(self):
         session = self.session
@@ -128,6 +154,46 @@ class SessionRelay:
     async def follow_up(self, payload):
         return await self._write("follow_up", payload)
 
+    async def steer_images(self, payload):
+        return await self._write("steer", payload, pixels=True)
+
+    async def follow_up_images(self, payload):
+        return await self._write("follow_up", payload, pixels=True)
+
+    def image_policy(self):
+        session = self.session
+        if not session.socket_dir or not (Path(session.socket_dir) / "image-ready").is_file():
+            return None
+        return image_policy.policy_for(session.state.get("model"), session.server.image_policies)
+
+    async def image_state(self, payload):
+        require_fields(payload, set())
+        session = self.session
+        model = session.state.get("model") or {}
+        name = "/".join(image_policy.model_fields(model)[:2]) if model.get("provider") and model.get("id") else None
+        policy = self.image_policy()
+        turn_id = self.active_turn()
+        reason = ("model-text-only" if model and "image" not in model.get("input", []) else
+                  "model-unverified" if not policy else "no-active-turn" if not turn_id else None)
+        budget = image_policy.limits(policy) if policy else None
+        remaining = ({**budget, "rawBytes": min(budget["rawBytes"], image_policy.MAX_SUBMISSION_BYTES),
+                      "count": min(budget["count"], image_policy.MAX_SUBMISSION_COUNT),
+                      "nativeLineBytes": image_policy.MAX_NATIVE_LINE} if budget and turn_id else None)
+        result = {"status": "unavailable", "model": name, "available": reason is None, "reason": reason,
+                  "turnId": turn_id, "budget": budget, "remaining": remaining}
+        epoch = session.image_epoch
+        if policy and epoch and not session.cancelled and not session.changing and not session.rpc_closed:
+            path = Path(session.socket_dir) / "image-state.json"
+            try:
+                with path.open("rb") as file:
+                    sample = json.loads(file.read(4096))
+                if sample.pop("epoch", None) == epoch and sample.get("model") == name:
+                    result.update(sample, status="available", workerGeneration=session.image_generation,
+                                  requestTurnId=session.image_turn_id)
+            except (OSError, ValueError):
+                pass
+        return result
+
     async def lookup(self, payload):
         require_fields(payload, {"requestId"})
         receipt = self.receipts.get(request_key(payload["requestId"]))
@@ -135,14 +201,26 @@ class SessionRelay:
             return {"status": "unavailable"}
         return receipt.outcome.result() if receipt.outcome.done() else {"status": "pending"}
 
-    async def _write(self, native_command, payload):
-        require_fields(payload, {"turnId", "message", "requestId"})
+    async def _write(self, native_command, payload, *, pixels=False):
+        fields = {"turnId", "message", "requestId"}
+        require_fields(payload, fields | {"grants"} if pixels else fields)
         turn_id = require_string(payload["turnId"], "turnId")
-        message = require_string(payload["message"], "message")
+        message = payload["message"] if pixels else require_string(payload["message"], "message")
+        if not isinstance(message, str):
+            raise ProtocolError("message must be a string.")
         key = request_key(payload["requestId"])
         if len(turn_id) > 128 or len(message.encode("utf-8")) > 64 * 1024:
             raise ProtocolError("Session relay input exceeds the size limit.")
-        fingerprint = hashlib.sha256(json.dumps([native_command, turn_id, message]).encode("utf-8")).digest()
+        fingerprint_fields = [native_command, turn_id, message]
+        if pixels:
+            refs = payload["grants"]
+            if (not isinstance(refs, list) or not 1 <= len(refs) <= image_policy.MAX_SUBMISSION_COUNT
+                    or not all(host_bytes.valid_ref(ref) for ref in refs) or len(set(refs)) != len(refs)):
+                raise ProtocolError("Invalid image grants.")
+            # H-1 makes each ID an immutable commitment to the prepared bytes.
+            # Reserve before reverse reads, then bind the verified digests.
+            fingerprint_fields.extend((1, image_policy.CAPTION_VERSION, refs))
+        fingerprint = hashlib.sha256(json.dumps(fingerprint_fields).encode("utf-8")).digest()
         now = self.clock()
         # A pending write retains its slot until it settles, even after lookup
         # expires. Duplicate waiters never cancel the original write.
@@ -150,34 +228,133 @@ class SessionRelay:
             if receipt.outcome.done() and now - receipt.first_seen >= RECEIPT_TTL:
                 del self.receipts[old_key]
         if prior := self.receipts.get(key):
-            if prior.fingerprint != fingerprint:
+            if not prior.matches(fingerprint):
                 raise ProtocolError("Conflicting requestId.")
             return write_result(await asyncio.shield(prior.outcome))
         if len(self.receipts) >= MAX_RECEIPTS:
             return {"accepted": False, "reason": "dedup-capacity"}
 
         outcome = asyncio.get_running_loop().create_future()
-        self.receipts[key] = Receipt(now, fingerprint, outcome)
+        receipt = self.receipts[key] = Receipt(now, fingerprint, outcome)
+        issued = locked = False
+        task = asyncio.current_task()
+        lock = self.queue_order[native_command]
+
+        def release_order():
+            nonlocal locked
+            if locked:
+                lock.release()
+                locked = False
+
+        def issued_write():
+            nonlocal issued
+            issued = True
+            self.image_acceptances.pop(task, None)
+            release_order()
+
+        if pixels:
+            self.image_acceptances[task] = False
+            session = self.session
+            fence = (session.state.get("model"), session.image_generation, session.aborts)
+
         try:
-            # No suspension between the turn check and the native stdin write
-            # inside rpc(). Native can read it after its last drain.
-            if turn_id != self.active_turn():
-                result = {"accepted": False, "reason": "stale-turn"}
-            else:
-                # H1 owns the caller deadline. Keep the native request
-                # correlated and the receipt pending until the stream settles.
-                await self.session.rpc(native_command, message=message, _timeout=None)
-                result = {"turnId": turn_id, "accepted": True, "delivery": "native-queue"}
+            async with asyncio.timeout(IMAGE_REQUEST_SECONDS if pixels else None):
+                await lock.acquire()
+                locked = True
+                if turn_id != self.active_turn():
+                    result = {"accepted": False, "reason": "stale-turn"}
+                elif pixels:
+                    result = await self._write_images(native_command, turn_id, message, refs, receipt, issued_write, fence)
+                else:
+                    # rpc() reaches stdin.write before its first suspension.
+                    release_order()
+                    await self.session.rpc(native_command, message=message, _timeout=None)
+                    result = {"turnId": turn_id, "accepted": True, "delivery": "native-queue"}
         except asyncio.CancelledError:
-            outcome.set_result({"status": "unknown"})
+            if pixels and not issued:
+                fenced = self.image_acceptances.get(task, False)
+                outcome.set_result({"status": "completed", "result": {
+                    "accepted": False, "reason": "stale-turn" if fenced else "cancelled"}})
+                if fenced and task.uncancel() == 0:
+                    return write_result(outcome.result())
+            else:
+                outcome.set_result({"status": "unknown"})
             raise
+        except TimeoutError:
+            if pixels and not issued:
+                outcome.set_result({"status": "completed", "result": {"accepted": False, "reason": "source-timeout"}})
+            else:
+                outcome.set_result({"status": "unknown"})
+        except (host_bytes.InvalidGrant, image_policy.ImageRejected) as error:
+            outcome.set_result({"status": "completed", "result": {"accepted": False, "reason": str(error)}})
         except Exception:
             # Native enqueues before calling queue_update hooks. Even an
             # explicit native error can follow an enqueue, so keep uncertainty.
-            outcome.set_result({"status": "unknown"})
+            if pixels and not issued:
+                outcome.set_result({"status": "completed", "result": {"accepted": False, "reason": "preflight-unavailable"}})
+            else:
+                outcome.set_result({"status": "unknown"})
         else:
             outcome.set_result({"status": "completed", "result": result})
+        finally:
+            self.image_acceptances.pop(task, None)
+            release_order()
         return write_result(outcome.result())
+
+    async def _write_images(self, command, turn, message, refs, receipt, issued, fence):
+        session = self.session
+        server = session.server
+        model, generation, stop = fence
+        task = asyncio.current_task()
+
+        def current():
+            return (not self.image_acceptances.get(task, True) and self.active_turn() == turn
+                    and session.aborts == stop and session.image_generation == generation
+                    and session.state.get("model") == model and session.input_relay is self
+                    and server.sessions.get(session.id) is session and session.id not in server.starting_ids)
+
+        if not current():
+            raise image_policy.ImageRejected("stale-turn")
+        policy = self.image_policy()
+        if not policy:
+            raise image_policy.ImageRejected("model-unverified")
+        if self.acquiring_images:
+            raise image_policy.ImageRejected("image-acquisition-busy")
+        budget = image_policy.limits(policy)
+        if len(refs) > budget["count"]:
+            raise image_policy.ImageRejected("image-count")
+        left = min(image_policy.MAX_SUBMISSION_BYTES, budget["rawBytes"])
+        images, digests = [], []
+        self.acquiring_images = True
+        try:
+            for ref in refs:
+                body, digest = await server.host_bytes.acquire(session.id, self.binding_id, ref,
+                                                               min(budget["imageBytes"], left), current=current)
+                mime = image_policy.inspect_image(body, max_side=budget["sidePixels"])
+                images.append({"type": "image", "mimeType": mime, "data": base64.b64encode(body).decode("ascii")})
+                digests.append(digest)
+                left -= len(body)
+            del body
+            caption = not message.strip()
+            native_message = image_policy.CAPTION if caption else message
+            text_bytes = len(native_message.encode("utf-8"))
+            if text_bytes + sum(len(image["data"]) for image in images) >= policy["bodyBytes"]:
+                raise image_policy.ImageRejected("provider-body-limit")
+            if text_bytes + len(images) * policy["imageTokens"] + policy["outputTokens"] > policy["contextTokens"]:
+                raise image_policy.ImageRejected("provider-context-limit")
+            live = await session.rpc("get_state", _timeout=5)
+            if (not live.get("isStreaming", live.get("is_streaming", False))
+                    or live.get("isCompacting", live.get("is_compacting", False))
+                    or live.get("model") != model or not current()):
+                raise image_policy.ImageRejected("stale-turn")
+            receipt.digests = bytes.fromhex("".join(digests))
+            receipt.content_fingerprint = hashlib.sha256(receipt.fingerprint + receipt.digests).digest()
+            await session.rpc(command, message=native_message, images=images,
+                              _timeout=None, _image_write=(current, issued))
+        finally:
+            self.acquiring_images = False
+        return {"accepted": True, "delivery": "native-queue", "turnId": turn, "inputKind": "pixels",
+                "captionAdded": caption}
 
 
 # This finite table is both the wire advertisement and the only relay dispatch.
@@ -186,4 +363,10 @@ REQUESTS = {
     METHOD_PREFIX + "input/steer": SessionRelay.steer,
     METHOD_PREFIX + "input/follow-up": SessionRelay.follow_up,
     LOOKUP_METHOD: SessionRelay.lookup,
+}
+
+IMAGE_REQUESTS = {
+    METHOD_PREFIX + "input/steer-images": SessionRelay.steer_images,
+    METHOD_PREFIX + "input/follow-up-images": SessionRelay.follow_up_images,
+    METHOD_PREFIX + "input/image-state": SessionRelay.image_state,
 }

@@ -28,11 +28,17 @@ class StdoutWriter:
         self.stopped = threading.Event()
         threading.Thread(target=self.pump, name="acp-stdout", daemon=True).start()
 
-    async def write(self, raw):
+    async def write(self, raw, *, before_queue=None):
         await self.credit.acquire()
+        if before_queue is not None:
+            try:
+                before_queue()
+            except BaseException:
+                self.credit.release()
+                raise
         future = self.loop.create_future()
         self.pending.add(future)
-        self.queue.put_nowait((raw, future))
+        self.queue.put_nowait((raw, future, before_queue is not None))
         await future
 
     def settle(self, future, error):
@@ -49,10 +55,12 @@ class StdoutWriter:
             item = self.queue.get()
             if item is None:
                 return
-            raw, future = item
+            raw, future, withdrawable = item
             error = None
             try:
-                view = memoryview(raw)
+                # A reverse pull cancelled while waiting in the writer queue
+                # can still be dropped before any bytes reach the descriptor.
+                view = memoryview(b"" if withdrawable and future.cancelled() else raw)
                 while view:
                     written = os.write(self.fd, view)
                     if not written:
