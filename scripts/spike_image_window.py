@@ -48,14 +48,14 @@ def make_image(label, size=None):
             + struct.pack(">I", zlib.crc32(chunk)) + sample[-12:])
 
 
-def sse(model, *, tool=False):
+def sse(model, *, tool_call_id=None):
     delta = {"role": "assistant", "content": "fixture response"}
-    if tool:
+    if tool_call_id:
         delta = {"role": "assistant", "tool_calls": [
-            {"index": 0, "id": "call_image", "type": "function",
+            {"index": 0, "id": tool_call_id, "type": "function",
              "function": {"name": "fixture_image", "arguments": "{}"}}]}
     frames = []
-    for update, finish in [(delta, None), ({}, "tool_calls" if tool else "stop")]:
+    for update, finish in [(delta, None), ({}, "tool_calls" if tool_call_id else "stop")]:
         frame = {"id": "fixture", "object": "chat.completion.chunk", "created": 0, "model": model,
                  "choices": [{"index": 0, "delta": update, "finish_reason": finish}]}
         frames.append("data: " + json.dumps(frame) + "\n\n")
@@ -66,6 +66,8 @@ async def image_state(relay, payload):
     # Test registration uses ACP's actual binding check. Read one immutable
     # snapshot without contacting native, admitting work, or sending a notice.
     session_relay.require_fields(payload, set())
+    if not relay.session.socket_dir or relay.session.rpc_closed:
+        return {"status": "unavailable"}
     path = Path(relay.session.socket_dir) / "image-window.json"
     try:
         return {"status": "available", **json.loads(path.read_text(encoding="utf-8"))}
@@ -77,9 +79,15 @@ class ProbeServer(Server):
     def __init__(self, args):
         super().__init__(args)
         self.methods = Counter()
+        self.tool_image_base64_bytes = []
 
     async def send(self, message):
-        self.methods[message.get("method")] += 1
+        method = message.get("method")
+        self.methods[method] += 1
+        if method == "session/update":
+            output = message["params"]["update"].get("rawOutput") or {}
+            self.tool_image_base64_bytes.extend(len(block["data"]) for block in output.get("content", [])
+                                                if block.get("type") == "image")
 
 
 class Probe:
@@ -94,12 +102,15 @@ class Probe:
         self.arrivals = asyncio.Queue()
         self.gate = asyncio.Event()
         self.hold_tool_request = False
+        self.additional_tool_calls = 0
         self.provider_cap = 20
         self.provider_raw_cap = 8 * MIB
         self.deny_auth = False
         self.results = {}
         self.native_spawn = asyncio.create_subprocess_exec
-        self.capture_large_stdout = False
+        self.reader_limit = session.FRAME_LIMIT
+        self.fail_next = None
+        self.native_env = {}
 
     def fixtures(self, *, overflow):
         (self.root / "agent").mkdir()
@@ -114,11 +125,7 @@ class Probe:
         small = ["tool-before.png", "tool-added.png", "steer-before.png", "steer.jpg", "steer-added.png"]
         small += [f"{label}{i}.png" for label, count in (("f", 4), ("n", 9)) for i in range(count)]
         for label, size in [*sizes.items(), *((label, None) for label in small)]:
-            data = make_image(label, size)
-            (book / label).write_bytes(data)
-            mime = "image/jpeg" if label.endswith(".jpg") else "image/png"
-            self.images[label] = {"mime": mime, "sha256": digest(data), "rawBytes": len(data)}
-            self.labels[digest(data)] = label
+            self.add_image(label, size)
         self.policy()
         # Use the real bundled bridge and extend its setup only in this
         # temporary ACP package. The native wheel and source checkout are read-only.
@@ -135,6 +142,14 @@ def setup(api):
     _original_setup(api)
 """, encoding="utf-8")
         return package
+
+    def add_image(self, label, size):
+        data = make_image(label, size)
+        (self.root / "images" / label).write_bytes(data)
+        mime = "image/jpeg" if label.endswith(".jpg") else "image/png"
+        fingerprint = digest(data)
+        self.images[label] = {"mime": mime, "sha256": fingerprint, "rawBytes": len(data)}
+        self.labels[fingerprint] = label
 
     def policy(self, *, count=20, raw=8 * MIB):
         (self.root / "policy.json").write_text(json.dumps({"count": count, "rawBytes": raw}))
@@ -188,11 +203,19 @@ def setup(api):
             images = [label for label, _, _ in sizes]
             placeholders = sum(block.count(PLACEHOLDER) for row in rows
                                for block in row["blocks"] if isinstance(block, str))
-            is_tool = self.hold_tool_request and rows[-1]["blocks"][0] == "run tool"
-            if is_tool:
+            tool_call_id = None
+            if self.hold_tool_request and rows[-1]["blocks"][0] == "run tool":
+                tool_call_id = "call_image"
                 self.arrivals.put_nowait(None)
                 await self.gate.wait()
-            if self.deny_auth:
+            elif self.additional_tool_calls:
+                tool_call_id = f"call_image_{self.additional_tool_calls}"
+                self.additional_tool_calls -= 1
+            error_code = None
+            if self.fail_next:
+                status, error, error_code = self.fail_next
+                self.fail_next = None
+            elif self.deny_auth:
                 status, error = 401, "fixture credentials rejected"
             elif len(images) > self.provider_cap:
                 status, error = 400, "fixture image count exceeded"
@@ -200,14 +223,18 @@ def setup(api):
                 status, error = 400, "fixture image bytes exceeded"
             else:
                 status, error = 200, None
+            wire_id = f"http-{len(self.requests) + 1}"
             self.requests.append({"status": status, "error": error, "httpBytes": length, "rawBytes": raw,
+                                  "providerRequestId": wire_id, "model": request["model"],
                                   "base64Bytes": sum(b64 for _, _, b64 in sizes), "images": images,
                                   "placeholders": placeholders, "messages": rows})
-            response = (json.dumps({"error": {"message": error, "type": "invalid_request_error"}}).encode()
-                        if error else sse(request["model"], tool=is_tool))
+            response = (json.dumps({"error": {"message": error, "type": "invalid_request_error",
+                                              "code": error_code}}).encode()
+                        if error else sse(request["model"], tool_call_id=tool_call_id))
             media = "application/json" if error else "text/event-stream"
             writer.write(f"HTTP/1.1 {status} Fixture\r\nContent-Type: {media}\r\nConnection: close\r\n"
-                         f"Content-Length: {len(response)}\r\n\r\n".encode() + response)
+                         f"X-Fixture-Request: {wire_id}\r\nContent-Length: {len(response)}\r\n\r\n".encode()
+                         + response)
             await writer.drain()
         finally:
             writer.close()
@@ -221,7 +248,8 @@ def setup(api):
                  "contextWindow": 196608, "maxTokens": 4096}
         base_url = f"http://127.0.0.1:{port}/v1"
         (self.root / "agent/models.json").write_text(json.dumps({"providers": {"fixture": {
-            "baseUrl": base_url, "api": "openai-completions", "apiKey": "fixture-key", "models": [model]}}}))
+            "baseUrl": base_url, "api": "openai-completions", "apiKey": "fixture-key",
+            "models": [model, {**model, "id": "two", "name": "Alternate Fixture"}]}}}))
         (self.root / "agent/settings.json").write_text(json.dumps({
             "defaultProvider": "fixture", "defaultModel": "one",
             "compaction": {"enabled": False, "keepRecentTokens": 0}}))
@@ -238,12 +266,14 @@ def setup(api):
         self.session_id = created["sessionId"]
         assert created["_meta"][META]["bindingId"] == self.binding
         for name in ("autoRetryEnabled", "autoCompactionEnabled"):
-            await self.server.dispatch("session/set_config_option", {
-                "sessionId": self.session_id, "configId": name, "value": "false"})
+            await self.config(name, "false")
+
+    async def config(self, name, value):
+        return await self.server.dispatch("session/set_config_option", {
+            "sessionId": self.session_id, "configId": name, "value": value})
 
     async def spawn(self, *args, **kwargs):
-        if self.capture_large_stdout:
-            kwargs["limit"] = 32 * MIB
+        kwargs["limit"] = self.reader_limit
         process = await self.native_spawn(*args, **kwargs)
         write, readline = process.stdin.write, process.stdout.readline
 
@@ -286,7 +316,7 @@ def setup(api):
         images = [{"mimeType": mime, "data": data} for mime, data in map(self.encoded, labels)]
         await self.worker.rpc(command, message=text, images=images)
 
-    async def prompt(self, text, labels=(), *, fail=False, anchor=None):
+    async def prompt(self, text, labels=(), *, fail=False, anchor=None, stop_reason="end_turn"):
         blocks = [{"type": "text", "text": text}]
         blocks += [{"type": "image", "mimeType": mime, "data": data}
                    for mime, data in map(self.encoded, labels)]
@@ -299,7 +329,7 @@ def setup(api):
                 raise
             assert exc.code == -33002 and exc.data["retryable"] is False, (exc.code, exc.data)
             return exc.code
-        assert not fail and answer == {"stopReason": "end_turn"}, answer
+        assert not fail and answer == {"stopReason": stop_reason}, answer
         return answer
 
     def assert_request(self, index, names, *, omitted, status=200):
@@ -313,14 +343,17 @@ def setup(api):
         return actual
 
     async def assert_state(self, request, sequence, omitted, reason=None):
-        expected = {"status": "available", "requestSequence": sequence,
-                    "keptCount": len(request["images"]), "keptRawBytes": request["rawBytes"],
-                    "omittedCount": omitted, "reasons": {reason: omitted} if omitted else {}}
         before = self.native_writes.copy()
-        for _ in range(2):
-            assert await self.state() == expected
+        actual = await self.state()
+        assert actual == {"status": "available", "requestSequence": sequence,
+            "workerGeneration": actual["workerGeneration"], "turnSequence": actual["turnSequence"],
+            "providerRequestId": request["providerRequestId"], "model": f"fixture/{request['model']}",
+            "keptCount": len(request["images"]), "keptRawBytes": request["rawBytes"], "omittedCount": omitted,
+            "reasons": {reason: omitted} if omitted else {}}, actual
+        assert actual["workerGeneration"] and actual["turnSequence"] > 0
+        assert await self.state() == actual
         assert self.native_writes == before
-        return expected
+        return actual
 
     def transcript_path(self):
         return Path(self.server.db.execute("SELECT file FROM sessions WHERE id=?", (self.session_id,)).fetchone()[0])
@@ -361,10 +394,9 @@ def setup(api):
         prompt = asyncio.create_task(self.prompt("run tool", [d]))
         try:
             await asyncio.wait_for(self.arrivals.get(), timeout=10)
-            active = {"status": "available", "requestSequence": 3, "keptCount": 4, "keptRawBytes": 8 * MIB,
-                      "omittedCount": 0, "reasons": {}}
-            assert await self.state() == active
-            self.results["activeRequestState"] = active
+            active = await self.state()
+            assert active == {"status": "unavailable"}  # HTTP receipt is still outstanding.
+            self.results["beforeResponseState"] = active
             await self.queue("steer", "steer", ["steer-before.png"])
             await self.queue("follow_up", "follow-up", follow)
         finally:
@@ -438,6 +470,7 @@ def setup(api):
         assert request["error"] == "fixture image count exceeded"
         assert len(self.requests) == 11 and self.native_writes["prompt"] == prior_writes["prompt"] + 1
         assert self.disk()[:len(rejected)] == rejected
+        assert await self.state() == {"status": "unavailable"}
         self.results["providerRejection"] = {"acpError": error, "retryable": False}
         self.policy(count=19)
         await self.prompt("recover by explicit input")
@@ -495,7 +528,7 @@ def setup(api):
                    for row in self.requests[index]["messages"] for block in row["blocks"])
         self.results["compactionHttpRequests"] = len(summary_requests)
         assert any(kind == "compaction_end" for kind, _ in self.native_lines)
-        assert await self.state() == self.results["forkState"]
+        assert await self.state() == {"status": "unavailable"}
         compacted = self.disk()
         assert compacted[:len(child_lines)] == child_lines
         active = (await self.worker.rpc("get_messages"))["messages"]
@@ -511,11 +544,12 @@ def setup(api):
         self.hold_tool_request = True
         self.gate.set()
         worker = self.worker
-        error = await self.prompt("run tool", large_user, fail=not self.capture_large_stdout)
+        measuring = self.reader_limit > session.FRAME_LIMIT
+        error = await self.prompt("run tool", large_user, fail=not measuring)
         assert len(self.requests) == 2
         self.assert_request(0, large_user, omitted=0)
         self.assert_request(1, large_tool, omitted=2)
-        if self.capture_large_stdout:
+        if measuring:
             assert not worker.rpc_closed
             agent_end = next(size for kind, size in self.native_lines if kind == "agent_end")
             assert agent_end > session.FRAME_LIMIT
@@ -529,7 +563,7 @@ def setup(api):
                if name in os.environ}
         env.update(HOME=str(self.root), USERPROFILE=str(self.root),
                    AELIX_CODING_AGENT_DIR=str(self.root / "agent"),
-                   AELIX_SETTINGS_PATH=str(self.root / "agent/settings.json"))
+                   AELIX_SETTINGS_PATH=str(self.root / "agent/settings.json"), **self.native_env)
         with patch.dict(os.environ, env, clear=True), \
              patch.object(session, "PACKAGE", package), \
              patch.object(asyncio, "create_subprocess_exec", self.spawn), \
@@ -553,7 +587,8 @@ def setup(api):
         for kind, size in self.native_lines:
             stdout[kind] = max(stdout[kind], size)
         return {**self.results, "httpRequests": self.requests, "nativeStdoutMaxLineBytes": dict(stdout),
-                "nativeWrites": dict(self.native_writes), "fixtureImages": self.images}
+                "nativeWrites": dict(self.native_writes), "fixtureImages": self.images,
+                "ordinaryToolUpdateImageBase64Bytes": self.server.tool_image_base64_bytes}
 
 
 def main():
@@ -565,7 +600,8 @@ def main():
     def run(*, overflow=False, capture=False):
         with tempfile.TemporaryDirectory(prefix="acp43-", dir="/tmp" if os.name != "nt" else None) as directory:
             probe = Probe(Path(directory).resolve(), args.aelix.resolve())
-            probe.capture_large_stdout = capture
+            if capture:
+                probe.reader_limit = 32 * MIB
             return asyncio.run(probe.run(overflow=overflow))
 
     result = run()
