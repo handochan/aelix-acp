@@ -15,8 +15,11 @@ import tempfile
 from pathlib import Path
 from urllib import error, request
 
-from spike_image_window import Probe, sse
-from test_running_images import key
+STANDARD_MARKERS = {
+    "assistant": r"private-assistant-delta-문-\"",
+    "tool": "private-tool-path-문",
+    "rpcError": r"private-standard-error-문-\"",
+}
 
 
 def marker_variants(marker):
@@ -31,6 +34,9 @@ def marker_variants(marker):
 
 
 async def host_run(root, host_bin, aelix, *, expect_sdk_leak=False):
+    from spike_image_window import Probe, sse
+    from test_running_images import key
+
     for item in ("home", "agent", "workspace", "host", "images"):
         (root / item).mkdir()
     probe = Probe(root, aelix)
@@ -39,11 +45,7 @@ async def host_run(root, host_bin, aelix, *, expect_sdk_leak=False):
     raw = fixture.read_bytes()
     prompt_marker = "private-synthetic-prompt-marker"
     error_marker = 'private-provider-error-문-"'
-    standard = {
-        "assistant": 'private-assistant-delta-문-"',
-        "tool": 'private-tool-path-문-"',
-        "rpcError": 'private-standard-error-문-"',
-    }
+    standard = STANDARD_MARKERS
     tool_path = root / "workspace" / (standard["tool"] + ".txt")
     tool_path.write_text("Synthetic tool result.", encoding="utf-8")
     wire_control = root / "standard-frame-markers.jsonl"

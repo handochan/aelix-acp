@@ -1,11 +1,13 @@
 """Consume native JSONL using bounded memory, including large image histories."""
 
+import asyncio
 import json
 import re
 
 CONTROL_PREFIX = 1024
 FRAME_LIMIT = 16 * 1024**2
 HISTORY_LIMIT = 64 * 1024**2
+TOOL_SCAN_BYTES = 8 * 1024
 # Native dataclass AgentEndEvent serializes its messages first, while some
 # workers emit a type-first object. Neither form carries control state.
 IGNORED = re.compile(rb'^\s*\{\s*(?:"messages"\s*:\s*\[|"type"\s*:\s*"(?:agent_end|turn_end)"\s*[,}])')
@@ -119,6 +121,15 @@ class ToolEnvelope:
         return {}
 
 
+async def _scan_tool(tool, data):
+    # A dense JSON array takes much longer to scan than a single image string.
+    # Yield even when the pipe already has data and StreamReader.read can
+    # complete without suspending.
+    for offset in range(0, len(data), TOOL_SCAN_BYTES):
+        tool.feed(data[offset : offset + TOOL_SCAN_BYTES])
+        await asyncio.sleep(0)
+
+
 async def read_frames(reader):
     """Yield a bounded line or a prefix and projected envelope for a large frame."""
 
@@ -133,17 +144,19 @@ async def read_frames(reader):
             end = len(chunk) if newline < 0 else newline + 1
             if oversized:
                 if tool is not None:
-                    tool.feed(chunk[start:end])
+                    await _scan_tool(tool, chunk[start:end])
             elif not ignored:
                 line.extend(chunk[start:end])
                 if limit is None and (len(line) >= CONTROL_PREFIX or newline >= 0):
-                    ignored = IGNORED.match(line) is not None
-                    response = RESPONSE.match(line)
+                    prefix = line[:CONTROL_PREFIX]
+                    ignored = IGNORED.match(prefix) is not None
+                    response = RESPONSE.match(prefix)
                     limit = HISTORY_LIMIT if response and response[1] == b"get_messages" else FRAME_LIMIT
                 if limit is not None and len(line) > limit:
-                    if not ignored and TOOL_CANDIDATE.match(line) and not RESPONSE.match(line):
+                    prefix = line[:CONTROL_PREFIX]
+                    if not ignored and TOOL_CANDIDATE.match(prefix) and not RESPONSE.match(prefix):
                         tool = ToolEnvelope()
-                        tool.feed(line)
+                        await _scan_tool(tool, line)
                     del line[CONTROL_PREFIX:]
                     oversized = True
             if newline >= 0:

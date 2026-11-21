@@ -4,12 +4,15 @@ import asyncio
 import base64
 import hashlib
 import json
+import ntpath
 import struct
+import sys
 import unittest
 import weakref
 import zlib
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, TemporaryFile
+from time import thread_time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -477,41 +480,58 @@ class ImageRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error.exception.code, -32601)
 
 
+class HostFixtureTests(unittest.TestCase):
+    def test_tool_filename_is_portable_and_wire_markers_still_escape(self):
+        from scripts.test_running_images_host import STANDARD_MARKERS, marker_variants
+
+        filename = STANDARD_MARKERS["tool"] + ".txt"
+        self.assertNotRegex(filename, r'[<>:"/\\|?*]')
+        if hasattr(ntpath, "isreserved"):
+            self.assertFalse(ntpath.isreserved(filename))
+        for kind in ("assistant", "rpcError"):
+            marker = STANDARD_MARKERS[kind]
+            self.assertIn('"', marker)
+            self.assertIn("\\", marker)
+            escaped = json.dumps(marker, ensure_ascii=False)[1:-1].encode()
+            self.assertIn(escaped, marker_variants(marker))
+            self.assertNotEqual(escaped, marker.encode())
+
+
 class NativeFrameTests(unittest.IsolatedAsyncioTestCase):
-    async def test_oversized_tool_end_status_and_next_rpc(self):
-        stream = asyncio.StreamReader(limit=65536)
-        identity = "0" * 32
-        reply = {"type": "response", "command": "steer", "success": True, "id": identity}
-        large = "x" * (native_frames.FRAME_LIMIT + 8192)
-        stream.feed_data(b'{"messages":["ignored"],"type":"agent_end"}\n')
-        for frame in (
-            {
-                "tool_call_id": "good",
-                "result": {"content": [large], "details": {"isError": True}, "is_error": False},
-                "is_error": False,
-                "type": "tool_execution_end",
-            },
-            {
-                "type": "tool_execution_end",
-                "toolCallId": "bad",
-                "result": {"content": [large], "isError": True, "details": {"isError": False}},
-                "isError": False,
-            },
-            {
-                "tool_call_id": "outer",
-                "result": {"content": [large], "is_error": False},
-                "is_error": True,
-                "type": "tool_execution_end",
-            },
-            reply,
-        ):
-            stream.feed_data((json.dumps(frame) + "\n").encode())
-        stream.feed_eof()
-        future = asyncio.get_running_loop().create_future()
+    async def assert_oversized_tools(self, body, cases):
+        # Feed an actual subprocess pipe at the deployed reader limit. Build
+        # the synthetic input outside the timing window.
+        self.assertGreater(len(body), native_frames.FRAME_LIMIT)
+        with TemporaryFile() as stream:
+            stream.write(b'{"messages":["ignored"],"type":"agent_end"}\n')
+            for index, (prefix, suffix, call_id, _) in enumerate(cases):
+                stream.write(prefix)
+                stream.write(body)
+                stream.write(suffix + b"\n")
+                reply = {
+                    "type": "response",
+                    "command": "steer",
+                    "success": True,
+                    "id": f"{index:032x}",
+                    "data": {"acked": call_id},
+                }
+                stream.write(json.dumps(reply).encode() + b"\n")
+            stream.seek(0)
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import shutil, sys; shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)",
+                stdin=stream,
+                stdout=asyncio.subprocess.PIPE,
+                limit=65536,
+            )
+
+        loop = asyncio.get_running_loop()
+        pending = {f"{index:032x}": loop.create_future() for index in range(len(cases))}
         worker = SimpleNamespace(
-            proc=SimpleNamespace(stdout=stream),
+            proc=process,
             private_host=True,
-            pending={identity: future},
+            pending=pending,
             rpc_closed=False,
             tool_arrived=asyncio.Event(),
             _close_task=True,
@@ -521,12 +541,89 @@ class NativeFrameTests(unittest.IsolatedAsyncioTestCase):
             event=AsyncMock(),
         )
         worker.rpc_frames = Session.rpc_frames.__get__(worker)
-        await Session.read_rpc(worker)
-        self.assertEqual(worker.failure, None)
-        self.assertEqual(future.result(), {})
+        timer_period = 0.005
+        gaps = []
+        finished = False
+
+        async def timer():
+            previous = loop.time(), thread_time()
+            while not finished:
+                await asyncio.sleep(timer_period)
+                now = loop.time(), thread_time()
+                gaps.append((now[0] - previous[0], now[1] - previous[1]))
+                previous = now
+
+        tick = asyncio.create_task(timer())
+        try:
+            await asyncio.sleep(0)
+            async with asyncio.timeout(60):
+                await Session.read_rpc(worker)
+                self.assertEqual(await process.wait(), 0)
+        finally:
+            finished = True
+            await tick
+            if process.returncode is None:
+                process.kill()
+                await process.stdout.read()
+                await process.wait()
+
+        self.assertIsNone(worker.failure)
         self.assertEqual(
-            [(args.args[0]["toolCallId"], args.args[0]["isError"]) for args in worker.event.await_args_list],
-            [("good", False), ("bad", True), ("outer", True)],
+            [(entry.args[0]["toolCallId"], entry.args[0]["isError"]) for entry in worker.event.await_args_list],
+            [(call_id, failed) for _, _, call_id, failed in cases],
+        )
+        self.assertEqual(
+            [future.result() for future in pending.values()], [{"acked": call_id} for _, _, call_id, _ in cases]
+        )
+        # Keep off-CPU runner delays out of the parser budget. The wall gap
+        # stays in the diagnostic so CPU work and scheduling are distinguishable.
+        wall_gap = max(wall for wall, _ in gaps)
+        active_gap = max(cpu for _, cpu in gaps) + timer_period
+        self.assertLess(
+            active_gap,
+            0.030,
+            f"Longest 5 ms timer gaps: {active_gap * 1000:.1f} ms active, {wall_gap * 1000:.1f} ms wall",
+        )
+
+    async def test_oversized_tool_string_status_ack_and_responsiveness(self):
+        body = b'"' + b"x" * (native_frames.FRAME_LIMIT + 8192) + b'"'
+        prefix = b'{"tool_call_id":"good","result":{"content":['
+        await self.assert_oversized_tools(
+            body,
+            (
+                (
+                    prefix,
+                    b'],"details":{"isError":true},"is_error":false},"is_error":false,"type":"tool_execution_end"}',
+                    "good",
+                    False,
+                ),
+                (
+                    prefix.replace(b'"good"', b'"outer"'),
+                    b'],"is_error":false},"is_error":true,"type":"tool_execution_end"}',
+                    "outer",
+                    True,
+                ),
+            ),
+        )
+
+    async def test_oversized_tool_array_status_ack_and_responsiveness(self):
+        record = (
+            json.dumps(
+                {"nested": [{"isError": False}, {"escaped": '\\"', "items": [1, 2, 3], "text": "x" * 256}]}
+            ).encode()
+            + b","
+        )
+        body = b"[" + record * (native_frames.FRAME_LIMIT // len(record) + 1024) + b"{}]"
+        await self.assert_oversized_tools(
+            body,
+            (
+                (
+                    b'{"type":"tool_execution_end","toolCallId":"array","result":{"details":',
+                    b',"isError":true},"isError":false}',
+                    "array",
+                    True,
+                ),
+            ),
         )
 
     async def test_serialized_native_line_check_uses_exact_utf8_bytes(self):
