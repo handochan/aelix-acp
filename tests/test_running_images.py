@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import ntpath
+import runpy
 import struct
 import sys
 import unittest
@@ -12,7 +13,6 @@ import weakref
 import zlib
 from pathlib import Path
 from tempfile import TemporaryDirectory, TemporaryFile
-from time import thread_time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -482,14 +482,17 @@ class ImageRelayTests(unittest.IsolatedAsyncioTestCase):
 
 class HostFixtureTests(unittest.TestCase):
     def test_tool_filename_is_portable_and_wire_markers_still_escape(self):
-        from scripts.test_running_images_host import STANDARD_MARKERS, marker_variants
+        script = Path(__file__).resolve().parents[1] / "scripts" / "test_running_images_host.py"
+        fixture = runpy.run_path(str(script))
+        markers = fixture["STANDARD_MARKERS"]
+        marker_variants = fixture["marker_variants"]
 
-        filename = STANDARD_MARKERS["tool"] + ".txt"
+        filename = markers["tool"] + ".txt"
         self.assertNotRegex(filename, r'[<>:"/\\|?*]')
         if hasattr(ntpath, "isreserved"):
             self.assertFalse(ntpath.isreserved(filename))
         for kind in ("assistant", "rpcError"):
-            marker = STANDARD_MARKERS[kind]
+            marker = markers[kind]
             self.assertIn('"', marker)
             self.assertIn("\\", marker)
             escaped = json.dumps(marker, ensure_ascii=False)[1:-1].encode()
@@ -541,27 +544,36 @@ class NativeFrameTests(unittest.IsolatedAsyncioTestCase):
             event=AsyncMock(),
         )
         worker.rpc_frames = Session.rpc_frames.__get__(worker)
-        timer_period = 0.005
-        gaps = []
-        finished = False
+        # Each timer is queued before a scan. Measure how many slices can
+        # run before the loop services it, as well as its elapsed delay.
+        ticks = []
+        slices = largest_slice = 0
+        timer_idle = asyncio.Event()
+        timer_idle.set()
+        feed = native_frames.ToolEnvelope.feed
 
-        async def timer():
-            previous = loop.time(), thread_time()
-            while not finished:
-                await asyncio.sleep(timer_period)
-                now = loop.time(), thread_time()
-                gaps.append((now[0] - previous[0], now[1] - previous[1]))
-                previous = now
+        def tick(started):
+            nonlocal slices
+            ticks.append((loop.time() - started, slices))
+            slices = 0
+            timer_idle.set()
 
-        tick = asyncio.create_task(timer())
+        def observe_scan(envelope, data):
+            nonlocal largest_slice, slices
+            if timer_idle.is_set():
+                timer_idle.clear()
+                loop.call_later(0, tick, loop.time())
+            slices += 1
+            largest_slice = max(largest_slice, len(data))
+            feed(envelope, data)
+
         try:
-            await asyncio.sleep(0)
             async with asyncio.timeout(60):
-                await Session.read_rpc(worker)
+                with patch.object(native_frames.ToolEnvelope, "feed", observe_scan):
+                    await Session.read_rpc(worker)
                 self.assertEqual(await process.wait(), 0)
+                await timer_idle.wait()
         finally:
-            finished = True
-            await tick
             if process.returncode is None:
                 process.kill()
                 await process.stdout.read()
@@ -575,14 +587,16 @@ class NativeFrameTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [future.result() for future in pending.values()], [{"acked": call_id} for _, _, call_id, _ in cases]
         )
-        # Keep off-CPU runner delays out of the parser budget. The wall gap
-        # stays in the diagnostic so CPU work and scheduling are distinguishable.
-        wall_gap = max(wall for wall, _ in gaps)
-        active_gap = max(cpu for _, cpu in gaps) + timer_period
+        self.assertTrue(ticks)
+        self.assertLessEqual(largest_slice, 8 * 1024)
+        # A ready continuation may run just ahead of the due timer.
+        self.assertLessEqual(max(count for _, count in ticks), 2)
+        # Check elapsed time without treating a rare VM scheduling pause as
+        # a stall in the scanner. The slice checks cover every callback.
+        elapsed = sorted(gap for gap, _ in ticks)
+        p95 = elapsed[(95 * len(elapsed) + 99) // 100 - 1]
         self.assertLess(
-            active_gap,
-            0.030,
-            f"Longest 5 ms timer gaps: {active_gap * 1000:.1f} ms active, {wall_gap * 1000:.1f} ms wall",
+            p95, 0.030, f"Scanner timer gaps: p95 {p95 * 1000:.1f} ms, max {elapsed[-1] * 1000:.1f} ms"
         )
 
     async def test_oversized_tool_string_status_ack_and_responsiveness(self):
