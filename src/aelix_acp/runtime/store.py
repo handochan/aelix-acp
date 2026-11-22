@@ -1,6 +1,7 @@
 """Private, migration-compatible ACP session index and session preferences."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,9 @@ def open_store(directory: str) -> sqlite3.Connection:
         db.execute("ALTER TABLE turns ADD COLUMN fingerprint TEXT")
     db.execute("CREATE TABLE IF NOT EXISTS events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, value TEXT NOT NULL)")
     db.execute("CREATE INDEX IF NOT EXISTS events_session ON events(session_id,sequence)")
+    db.execute("""CREATE TABLE IF NOT EXISTS recovered_history (
+        session_id TEXT NOT NULL, position INTEGER NOT NULL, value TEXT,
+        PRIMARY KEY(session_id,position)) WITHOUT ROWID""")
     db.commit()
     return db
 
@@ -67,9 +71,46 @@ def insert_history(db: sqlite3.Connection, session_id: str, updates) -> None:
                    ((session_id, json.dumps(update, ensure_ascii=False, allow_nan=False)) for update in updates))
 
 
+async def cache_recovered_history(db: sqlite3.Connection, session_id: str, updates) -> None:
+    """Stage short batches, then publish the entire cache with one marker."""
+    # The activity lease serializes recovery for this session. Clear anything
+    # left by an interrupted recovery before staging a new one.
+    while True:
+        with db:
+            deleted = db.execute("""DELETE FROM recovered_history WHERE session_id=? AND position IN (
+                SELECT position FROM recovered_history WHERE session_id=? LIMIT 32)""", (session_id, session_id))
+        if not deleted.rowcount:
+            break
+        await asyncio.sleep(0)
+
+    batch = []
+    chars = 0
+    for position, update in enumerate(updates):
+        value = json.dumps(update, ensure_ascii=False, allow_nan=False)
+        batch.append((session_id, position, value))
+        chars += len(value)
+        if chars >= 64 * 1024 or len(batch) == 32:
+            with db:
+                db.executemany("INSERT INTO recovered_history VALUES(?,?,?)", batch)
+            batch.clear()
+            chars = 0
+            await asyncio.sleep(0)
+    with db:
+        db.executemany("INSERT INTO recovered_history VALUES(?,?,?)", batch)
+        db.execute("INSERT INTO recovered_history VALUES(?,-1,NULL)", (session_id,))
+
+
 def history(db: sqlite3.Connection, session_id: str):
-    for row in db.execute("SELECT value FROM events WHERE session_id=? ORDER BY sequence", (session_id,)):
-        yield json.loads(row[0])
+    # A replay can await client output while this connection records live
+    # updates. Keep the same cutoff for the lifetime of the cursor.
+    (last,) = db.execute("SELECT max(sequence) FROM events WHERE session_id=?", (session_id,)).fetchone()
+    if db.execute("SELECT 1 FROM recovered_history WHERE session_id=? AND position=-1", (session_id,)).fetchone():
+        for (value,) in db.execute("SELECT value FROM recovered_history WHERE session_id=? AND position>=0 "
+                                   "ORDER BY position", (session_id,)):
+            yield json.loads(value)
+    for (value,) in db.execute("SELECT value FROM events WHERE session_id=? AND sequence<=? ORDER BY sequence",
+                               (session_id, last)):
+        yield json.loads(value)
 
 
 def recorded_turn(db: sqlite3.Connection, session_id: str, request_key: str, fingerprint: str | None = None) -> dict | None:

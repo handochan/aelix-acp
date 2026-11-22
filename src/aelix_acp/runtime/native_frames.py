@@ -4,6 +4,8 @@ import asyncio
 import json
 import re
 
+from . import native_history
+
 CONTROL_PREFIX = 1024
 FRAME_LIMIT = 16 * 1024**2
 HISTORY_LIMIT = 64 * 1024**2
@@ -12,8 +14,8 @@ TOOL_SCAN_BYTES = 8 * 1024
 # workers emit a type-first object. Neither form carries control state.
 IGNORED = re.compile(rb'^\s*\{\s*(?:"messages"\s*:\s*\[|"type"\s*:\s*"(?:agent_end|turn_end)"\s*[,}])')
 RESPONSE = re.compile(
-    rb'^\s*\{\s*"type"\s*:\s*"response",\s*"command"\s*:\s*"([a-z_]+)",'
-    rb'\s*"success"\s*:\s*(?:true|false),\s*"id"\s*:\s*"([0-9a-f]{32})"'
+    rb'^\s*\{\s*"type"\s*:\s*"response",\s*"command"\s*:\s*"(?P<command>[a-z_]+)",'
+    rb'\s*"success"\s*:\s*(?P<success>true|false),\s*"id"\s*:\s*"(?P<id>[0-9a-f]{32})"'
 )
 TOOL_CANDIDATE = re.compile(rb'^\s*\{\s*"(?:tool_call_id|toolCallId|type)"\s*:')
 SYMBOL = re.compile(rb'["{}\[\]:,\s]')
@@ -130,29 +132,58 @@ async def _scan_tool(tool, data):
         await asyncio.sleep(0)
 
 
-async def read_frames(reader):
-    """Yield a bounded line or a prefix and projected envelope for a large frame."""
+async def _scan_history(history, data):
+    for offset in range(0, len(data), native_history.SCAN_BYTES):
+        history.feed(data[offset : offset + native_history.SCAN_BYTES])
+        await asyncio.sleep(0)
+
+
+async def read_frames(reader, *, private, wants_history):
+    """Yield a line, its oversized tool envelope, or a projected history response."""
 
     line = bytearray()
     limit = None
-    tool = None
+    tool = history = None
+    history_id = None
     ignored = oversized = False
     while chunk := await reader.read(65536):
         start = 0
         while start < len(chunk):
             newline = chunk.find(b"\n", start)
             end = len(chunk) if newline < 0 else newline + 1
-            if oversized:
+            if history_id is not None:
+                if history is not None and not wants_history(history_id):
+                    history = None
+                if history is not None:
+                    try:
+                        await _scan_history(history, chunk[start:end])
+                    except native_history.InvalidHistory:
+                        history = None  # Drain this line, then return a fixed error.
+            elif oversized:
                 if tool is not None:
                     await _scan_tool(tool, chunk[start:end])
             elif not ignored:
                 line.extend(chunk[start:end])
                 if limit is None and (len(line) >= CONTROL_PREFIX or newline >= 0):
                     prefix = line[:CONTROL_PREFIX]
-                    ignored = IGNORED.match(prefix) is not None
+                    ignored = private and IGNORED.match(prefix) is not None
                     response = RESPONSE.match(prefix)
-                    limit = HISTORY_LIMIT if response and response[1] == b"get_messages" else FRAME_LIMIT
+                    history_response = response and response["command"] == b"get_messages"
+                    if history_response:
+                        request_id = response["id"].decode("ascii")
+                        if wants_history(request_id):
+                            history_id = request_id
+                            if response["success"] == b"true":
+                                try:
+                                    history = native_history.HistoryResponse(prefix, response.end())
+                                    await _scan_history(history, line[history.start:])
+                                except native_history.InvalidHistory:
+                                    history = None
+                            line.clear()
+                    limit = HISTORY_LIMIT if private and history_response else FRAME_LIMIT
                 if limit is not None and len(line) > limit:
+                    if not private:
+                        raise ValueError("Native response exceeds the frame limit")
                     prefix = line[:CONTROL_PREFIX]
                     if not ignored and TOOL_CANDIDATE.match(prefix) and not RESPONSE.match(prefix):
                         tool = ToolEnvelope()
@@ -160,9 +191,15 @@ async def read_frames(reader):
                     del line[CONTROL_PREFIX:]
                     oversized = True
             if newline >= 0:
-                if not ignored:
-                    yield line, (tool.event() if tool is not None else {}) if oversized else None
+                if history_id is not None:
+                    try:
+                        messages = history.finish() if history is not None else None
+                    except native_history.InvalidHistory:
+                        messages = None
+                    yield None, None, (history_id, messages)
+                elif not ignored:
+                    yield line, (tool.event() if tool is not None else {}) if oversized else None, None
                 line = bytearray()
-                limit = tool = None
+                limit = tool = history = history_id = None
                 ignored = oversized = False
             start = end
