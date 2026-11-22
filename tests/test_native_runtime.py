@@ -1313,6 +1313,33 @@ def setup(api):
         await self.prompt("WRITE_TEST", "stable-request")
         self.assertEqual(len(self.model_requests), count)
 
+    async def test_generic_reopened_worker_forwards_only_path_free_runtime_diagnostics(self):
+        await self.prompt("seed saved history")
+        await self.client.close()
+        extension = self.root / "runtime_stderr.py"
+        extension.write_text(textwrap.dedent("""
+            from pathlib import Path
+            import sys
+
+            def setup(api):
+                async def log(_event, ctx):
+                    print(f"warning from {Path(ctx.cwd) / 'ABS_PATH_SENTINEL'}", file=sys.stderr, flush=True)
+                    print("warning from RELATIVE_PATH_SENTINEL.jsonl.", file=sys.stderr, flush=True)
+                    print("Warning: ACP_REOPEN_RUNTIME_DIAGNOSTIC", file=sys.stderr, flush=True)
+                api.on("before_agent_start", log)
+        """), encoding="utf-8")
+        self.client = await AcpClient.start(self.root, EXECUTABLE, extensions=[extension])
+        await self.client.request("session/load", {"sessionId": self.session, "cwd": str(self.root), "mcpServers": []})
+        self.assertEqual((await self.prompt("exercise reopened runtime"))["stopReason"], "end_turn")
+        async with asyncio.timeout(5):
+            while b"ACP_REOPEN_RUNTIME_DIAGNOSTIC" not in self.client.stderr:
+                await asyncio.sleep(0.01)
+        await self.client.close()
+        self.assertIn(b"Warning: ACP_REOPEN_RUNTIME_DIAGNOSTIC", self.client.stderr)
+        self.assertNotIn(os.fsencode(self.root), self.client.stderr)
+        self.assertNotIn(b"ABS_PATH_SENTINEL", self.client.stderr)
+        self.assertNotIn(b"RELATIVE_PATH_SENTINEL", self.client.stderr)
+
     async def test_process_restart_restores_history_and_model_selection(self):
         await self.config("model", "fixture/two")
         await self.prompt("Respond")

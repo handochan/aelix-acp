@@ -146,8 +146,9 @@ It discards unused tool arguments while scanning. Oversized arguments and
 tool results get fixed placeholders on their existing call IDs. The adapter
 bounds retained history JSON to 64 MiB and normal tool-result content to
 1 MiB. It stages short SQLite batches off the event loop and publishes the
-complete cache before replay. Generic ACP clients receive a fixed warning
-when native recovers a damaged transcript on reopen.
+complete cache before replay. Generic ACP clients receive path-free stderr
+lines from reopened workers and a fixed warning for damaged transcript
+recovery.
 
 Incomplete or over-budget history returns `native_history_unavailable`.
 Native still serializes the response as a single line, so replies on that

@@ -21,6 +21,7 @@ from aelix_acp.runtime import host_bytes, native_frames, native_history, session
 from aelix_acp.runtime.store import append_event, cache_recovered_history, history, open_store
 from aelix_acp.server import Server
 from aelix_acp.session import Session
+from aelix_acp.wire.diagnostics import MAX_LINE_BYTES, RECOVERY_NOTICE, ReopenDiagnostics
 from support import AcpClient
 
 MIB = 1024**2
@@ -31,6 +32,41 @@ EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
 def response(messages):
     return json.dumps({"type": "response", "command": "get_messages", "success": True,
                        "id": REQUEST_ID, "data": {"messages": messages}}).encode() + b"\n"
+
+
+class ReopenDiagnosticsTests(unittest.TestCase):
+    def test_split_diagnostics_keep_safe_lines_and_drop_path_bearing_lines(self):
+        filename = "/workspace/private\nSPLIT_PATH_SENTINEL"
+        raw = (
+            f"WARNING:aelix_agent_core.session.jsonl_storage:Recovered damaged session file {filename}: skipped 1 line\n"
+            f"Recovered damaged session file {filename}: skipped 1 line\n"
+            "absolute /private/ABS_PATH_SENTINEL\n"
+            "windows C:\\workspace\\WINDOWS_PATH_SENTINEL\n"
+            "drive C:DRIVE_PATH_SENTINEL\n"
+            "relative RELATIVE_PATH_SENTINEL.jsonl.\n"
+            "dotfile .123DOTFILE_SENTINEL.\n"
+            "rotated log ROTATED_PATH_SENTINEL.log.1.\n"
+            "numeric suffix NUMERIC_PATH_SENTINEL.42!\n"
+            "path: BARE_PATH_SENTINEL\n"
+            "encoded %2fprivate%2fENCODED_PATH_SENTINEL\n"
+            "WARNING:aelix_agent_core.harness:Runtime diagnostic available with version 1.2.3.\r\n"
+            "안전한 런타임 진단.\n"
+        ).encode()
+        raw += b"x" * MAX_LINE_BYTES + b"/LEAK_FROM_LONG_LINE\nFinal safe diagnostic"
+        prefix = b"[aelix:fixture] "
+        expected = [
+            RECOVERY_NOTICE,
+            prefix + b"WARNING:aelix_agent_core.harness:Runtime diagnostic available with version 1.2.3.\n",
+            prefix + "안전한 런타임 진단.\n".encode(),
+            prefix + b"Final safe diagnostic\n",
+        ]
+        for size in (1, 13, 4096):
+            with self.subTest(chunk=size):
+                diagnostics = ReopenDiagnostics(filename, "fixture")
+                actual = [line for offset in range(0, len(raw), size)
+                          for line in diagnostics.feed(raw[offset:offset + size])]
+                actual.append(diagnostics.finish())
+                self.assertEqual(actual, expected)
 
 
 class NativeHistoryFrames(unittest.IsolatedAsyncioTestCase):
