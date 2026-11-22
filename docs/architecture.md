@@ -141,12 +141,18 @@ request R7), native's refusal text is the only signal; one function in
 
 Session load prefers recorded ACP history. When it is missing, the adapter
 scans the pinned native `get_messages` response in chunks, replaces native
-image blocks with text placeholders, and recovers text and tool calls in
-order. The adapter stages short SQLite batches and publishes the complete
-cache before replay. It decodes transcript text in pieces, bounds retained
-JSON to 64 MiB, and caps tool-result update content at 1 MiB. Incomplete or over-budget history returns
-`native_history_unavailable`. Native still serializes the response as a
-single line, so replies on that pipe can arrive only after the line ends.
+images with text placeholders, and recovers text and tool calls in order.
+It discards unused tool arguments while scanning. Oversized arguments and
+tool results get fixed placeholders on their existing call IDs. The adapter
+bounds retained history JSON to 64 MiB and normal tool-result content to
+1 MiB. It stages short SQLite batches off the event loop and publishes the
+complete cache before replay. Generic ACP clients receive a fixed warning
+when native recovers a damaged transcript on reopen.
+
+Incomplete or over-budget history returns `native_history_unavailable`.
+Native still serializes the response as a single line, so replies on that
+pipe arrive after the line ends. The stdio measurement script is
+[`scripts/measure_native_history.py`](../scripts/measure_native_history.py).
 
 ## Delegated children (aelix-ai #612)
 

@@ -27,7 +27,7 @@ from . import image_policy
 from .runtime import native_frames, native_history
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
-from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event,
+from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event, append_live_event,
                             insert_history, begin_turn, finish_turn, recorded_turn)
 from .runtime.commands import (BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND,
                                compact_instructions, execute as execute_slash)
@@ -195,6 +195,7 @@ class Session:
         self.context = SessionContext(self)
         self.compaction_recovery_needed = False
         self.mutation_lock = asyncio.Lock()
+        self.history_lock = asyncio.Lock()
         self._pending_extension_change = None
         self._verifying_extension_recovery = False
         self.restore_launch_preferences()
@@ -355,7 +356,7 @@ class Session:
                 self.proc.kill()
                 await self.proc.wait()
                 raise
-        self.stderr_task = asyncio.create_task(self.read_stderr())
+        self.stderr_task = asyncio.create_task(self.read_stderr(reopening=resume_file is not None))
         self.tasks = {asyncio.create_task(self.read_rpc()), self.stderr_task}
         try:
             self.state = await self.rpc("get_state")
@@ -685,16 +686,24 @@ class Session:
             if _project_history:
                 self.history_requests.discard(request_id)
 
-    async def read_stderr(self):
+    async def read_stderr(self, *, reopening=False):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         writer = None if self.private_host else StdoutWriter(sys.stderr.fileno())
+        reported_recovery = False
         try:
             while chunk := await self.proc.stderr.read(4096):
-                # Bounded copy for native refusals reported only on stderr.
+                # Keep the bounded tail for lock detection. On reopen, native
+                # stderr can contain the transcript path, including in late
+                # fragments read after stdout has already acknowledged startup.
                 self.stderr_tail = (self.stderr_tail + chunk)[-STDERR_TAIL:]
-                if writer is not None:
+                if writer is None:
+                    continue
+                if not reopening:
                     text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
                     await writer.write(text.encode("utf-8"))
+                elif not reported_recovery and b"Recovered damaged session file " in self.stderr_tail:
+                    reported_recovery = True
+                    await writer.write(b"[aelix-acp] Native session recovered from damaged history.\n")
         finally:
             if writer is not None:
                 writer.close()
@@ -720,6 +729,8 @@ class Session:
                         future.set_exception(native_history.unavailable())
                     else:
                         future.set_result(messages)
+                # The suspended reader must not retain the future or its result.
+                del projected, messages, future
             elif envelope is not None:
                 if response := native_frames.RESPONSE.match(line):
                     future = self.pending.get(response["id"].decode("ascii"))
@@ -1022,7 +1033,8 @@ class Session:
         await self.update(update)
 
     async def update(self, update):
-        append_event(self.server.db, self.id, update)
+        async with self.history_lock:
+            await append_live_event(self.server.db, self.id, update)
         await self.notify("session/update", {"sessionId": self.id, "update": update})
 
     async def notify(self, method, params):

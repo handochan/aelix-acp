@@ -133,6 +133,10 @@ async def _scan_tool(tool, data):
 
 
 async def _scan_history(history, data):
+    # The reader bounds data to one pipe read. Pure image runs need only
+    # a linear byte check, so let the next pipe read yield without per-slice timers.
+    if history.skip_base64_run(data):
+        return
     for offset in range(0, len(data), native_history.SCAN_BYTES):
         history.feed(data[offset : offset + native_history.SCAN_BYTES])
         await asyncio.sleep(0)
@@ -196,7 +200,9 @@ async def read_frames(reader, *, private, wants_history):
                         messages = history.finish() if history is not None else None
                     except native_history.InvalidHistory:
                         messages = None
+                    history = None
                     yield None, None, (history_id, messages)
+                    del messages
                 elif not ignored:
                     yield line, (tool.event() if tool is not None else {}) if oversized else None, None
                 line = bytearray()

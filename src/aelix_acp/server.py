@@ -164,7 +164,7 @@ class Server:
             raise native_history.unavailable() from None
         if updates:
             try:
-                await cache_recovered_history(self.db, session.id, updates)
+                await cache_recovered_history(self.args.state_dir, session.id, updates)
             except (OSError, sqlite3.Error, ValueError):
                 raise native_history.unavailable() from None
         return updates
@@ -173,21 +173,23 @@ class Server:
         role = message.get("role")
         if role not in ("user", "assistant", "toolResult"):
             return  # Harness-only messages aren't transcript rows.
-        blocks = native_history.content_blocks(message)
         if role == "toolResult":
             call_id = native_history.tool_identity(message.get("tool_call_id") or message.get("toolCallId"))
             yield {"sessionUpdate": "tool_call_update", "toolCallId": call_id,
                    "status": "failed" if message.get("is_error") or message.get("isError") else "completed",
-                   "content": native_history.tool_content(blocks)}
+                   "content": native_history.tool_content(message)}
             return
         kind = "user_message_chunk" if role == "user" else "agent_message_chunk"
         has_text = False
-        for block in blocks:
+        for block in native_history.content_blocks(message):
             block_type = block.get("type")
             if role == "assistant" and block_type == "toolCall":
                 call_id = native_history.tool_identity(block.get("tool_call_id") or block.get("id"))
                 name = native_history.tool_identity(block.get("tool_name") or block.get("name"))
-                yield {"sessionUpdate": "tool_call", **tool_call(call_id, name, {}, session.cwd, "in_progress")}
+                update = {"sessionUpdate": "tool_call", **tool_call(call_id, name, {}, session.cwd, "in_progress")}
+                if block.get("argumentsOmitted") is True:
+                    update["content"] = native_history.omitted_tool_content(native_history.TOOL_ARGUMENTS_OMITTED)
+                yield update
                 has_text = False
             elif parts := native_history.display_parts(block):
                 if has_text and block_type == "text":
