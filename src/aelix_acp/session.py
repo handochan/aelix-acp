@@ -24,10 +24,10 @@ from .wire.errors import (ProtocolError, BackendError, after_dispatch, delivery_
 from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter, encode_frame
 from . import image_policy
-from .runtime import native_frames
+from .runtime import native_frames, native_history
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
-from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event,
+from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event, append_live_event,
                             insert_history, begin_turn, finish_turn, recorded_turn)
 from .runtime.commands import (BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND,
                                compact_instructions, execute as execute_slash)
@@ -145,6 +145,7 @@ class Session:
         self.initial_mode = initial_mode
         self.proc = None
         self.pending = {}
+        self.history_requests = set()
         self.tasks = set()
         self.done = None
         self.failure = None
@@ -194,6 +195,7 @@ class Session:
         self.context = SessionContext(self)
         self.compaction_recovery_needed = False
         self.mutation_lock = asyncio.Lock()
+        self.history_lock = asyncio.Lock()
         self._pending_extension_change = None
         self._verifying_extension_recovery = False
         self.restore_launch_preferences()
@@ -342,7 +344,7 @@ class Session:
         self.proc = await asyncio.create_subprocess_exec(
             *args, cwd=self.cwd, env=env, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            limit=65536 if self.private_host else FRAME_LIMIT, **({} if sys.platform == "win32" else {"start_new_session": True}))
+            limit=65536, **({} if sys.platform == "win32" else {"start_new_session": True}))
         if self.worker_job:
             # The native RPC child receives no command before it joins the job;
             # its later tool/MCP descendants inherit the owned lifetime.
@@ -638,10 +640,12 @@ class Session:
             if self.lease is not None:
                 self.record(self.save)
 
-    async def rpc(self, command, *, _timeout=45, _image_write=None, **kwargs):
+    async def rpc(self, command, *, _timeout=45, _image_write=None, _project_history=False, **kwargs):
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
+        if _project_history:
+            self.history_requests.add(request_id)
         if (task := asyncio.current_task()) in self.interventions:
             self.interventions[task] = future  # raise_fence reads whether native answered.
         try:
@@ -679,6 +683,8 @@ class Session:
                 raise ProtocolError(f"Aelix RPC {command} timed out", -32007, {"kind": "timeout", "command": command}) from None
         finally:
             self.pending.pop(request_id, None)
+            if _project_history:
+                self.history_requests.discard(request_id)
 
     async def read_stderr(self):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -694,20 +700,37 @@ class Session:
             if writer is not None:
                 writer.close()
 
+    async def read_native_history(self):
+        try:
+            messages = await self.rpc("get_messages", _project_history=True)
+        except (ProtocolError, ConnectionError, OSError):
+            raise native_history.unavailable() from None
+        if not isinstance(messages, list):
+            raise native_history.unavailable()
+        return messages
+
     async def rpc_frames(self):
-        if self.private_host:
-            async for line, envelope in native_frames.read_frames(self.proc.stdout):
-                if envelope is not None:
-                    if response := native_frames.RESPONSE.match(line):
-                        future = self.pending.get(response[2].decode("ascii"))
-                        if future is not None and not future.done():
-                            future.set_exception(ProtocolError("Native response exceeds the frame limit", -32603))
-                    elif envelope:
-                        await self.event(envelope)
-                    continue
-                yield line
-        else:
-            while line := await self.proc.stdout.readline():
+        async for line, envelope, projected in native_frames.read_frames(
+            self.proc.stdout, private=self.private_host, wants_history=self.history_requests.__contains__
+        ):
+            if projected is not None:
+                request_id, messages = projected
+                future = self.pending.get(request_id)
+                if future is not None and not future.done():
+                    if messages is None:
+                        future.set_exception(native_history.unavailable())
+                    else:
+                        future.set_result(messages)
+                # The suspended reader must not retain the future or its result.
+                del projected, messages, future
+            elif envelope is not None:
+                if response := native_frames.RESPONSE.match(line):
+                    future = self.pending.get(response["id"].decode("ascii"))
+                    if future is not None and not future.done():
+                        future.set_exception(ProtocolError("Native response exceeds the frame limit", -32603))
+                elif envelope:
+                    await self.event(envelope)
+            else:
                 yield line
 
     async def read_rpc(self):
@@ -1002,7 +1025,8 @@ class Session:
         await self.update(update)
 
     async def update(self, update):
-        append_event(self.server.db, self.id, update)
+        async with self.history_lock:
+            await append_live_event(self.server.db, self.id, update)
         await self.notify("session/update", {"sessionId": self.id, "update": update})
 
     async def notify(self, method, params):

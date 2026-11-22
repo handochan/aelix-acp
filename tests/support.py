@@ -19,14 +19,15 @@ class AcpClient:
         self.dialog = None
 
     @classmethod
-    async def start(cls, root, aelix, *, extensions=(), capabilities=None, prefix=(), adapter_args=(), extra_env=None):
+    async def start(cls, root, aelix, *, extensions=(), capabilities=None, prefix=(), adapter_args=(), extra_env=None,
+                    entry=("-m", "aelix_acp.server")):
         source = str(Path(__file__).resolve().parents[1] / "src")
         env = {key: os.environ[key] for key in ["PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"] if key in os.environ}
         env.update(HOME=str(root / "home"), USERPROFILE=str(root / "home"), PYTHONPATH=source,
                    AELIX_CODING_AGENT_DIR=str(root / "agent"), AELIX_SETTINGS_PATH=str(root / "agent/settings.json"))
         if extra_env is not None:
             env.update(extra_env)
-        argv = [sys.executable, "-m", "aelix_acp.server", "--aelix", str(aelix), "--state-dir", str(root / "state")]
+        argv = [sys.executable, *entry, "--aelix", str(aelix), "--state-dir", str(root / "state")]
         argv.extend(adapter_args)
         argv.extend("--aelix-arg=" + arg for arg in prefix)
         for extension in extensions:

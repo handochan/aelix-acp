@@ -535,6 +535,7 @@ class NativeFrameTests(unittest.IsolatedAsyncioTestCase):
             proc=process,
             private_host=True,
             pending=pending,
+            history_requests=set(),
             rpc_closed=False,
             tool_arrived=asyncio.Event(),
             _close_task=True,

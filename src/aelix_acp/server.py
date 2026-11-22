@@ -7,6 +7,7 @@ import sqlite3
 import asyncio
 import contextlib
 import json
+from itertools import chain
 import os
 from pathlib import Path
 import shutil
@@ -19,7 +20,8 @@ import math
 from . import __version__
 from .wire.errors import (ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH,
                           fork_head_changed, require_object, require_string)
-from .runtime.store import open_store, load_preferences, history, legacy_permission_mode, save_preferences
+from .runtime.store import (open_store, load_preferences, history, legacy_permission_mode,
+                            save_preferences, cache_recovered_history)
 from .runtime.controls import MODE_IDS
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
@@ -28,7 +30,7 @@ from .wire.transport import decode_frame, encode_frame, StdoutWriter
 from .runtime.extensions import run_extension_action, require_consent
 from .runtime.leases import acquire as acquire_lease
 from .runtime.leases import lease_path
-from .runtime import forks, host_bytes, session_relay
+from .runtime import forks, host_bytes, native_history, session_relay
 from .runtime.children import NESTED_TOOL_CALLS, nested_only
 
 from .session import CONCURRENT_CONTROLS, Session, text_content, tool_call
@@ -149,15 +151,56 @@ class Server:
         return {"sessionId": identifier, "parentSessionId": session.id}
 
     async def native_history(self, session):
-        backend = await session.rpc("get_messages")
+        messages = await session.read_native_history()
         updates = []
-        for message in backend.get("messages", []):
-            role = message.get("role")
-            text = text_content(message.get("content"))
-            if role in ("user", "assistant") and text:
-                updates.append({"sessionUpdate": "user_message_chunk" if role == "user" else "agent_message_chunk",
-                                "content": {"type": "text", "text": text}})
+        try:
+            for message in messages:
+                for update in self.native_message_updates(session, message):
+                    if len(updates) >= native_history.MAX_UPDATES:
+                        raise native_history.InvalidHistory
+                    updates.append(update)
+                await asyncio.sleep(0)
+        except (native_history.InvalidHistory, UnicodeError):
+            raise native_history.unavailable() from None
+        if updates:
+            try:
+                await cache_recovered_history(self.args.state_dir, session.id, updates)
+            except (OSError, sqlite3.Error, ValueError):
+                raise native_history.unavailable() from None
         return updates
+
+    def native_message_updates(self, session, message):
+        role = message.get("role")
+        if role not in ("user", "assistant", "toolResult"):
+            return  # Harness-only messages aren't transcript rows.
+        if role == "toolResult":
+            call_id = native_history.tool_identity(message.get("tool_call_id") or message.get("toolCallId"))
+            yield {"sessionUpdate": "tool_call_update", "toolCallId": call_id,
+                   "status": "failed" if message.get("is_error") or message.get("isError") else "completed",
+                   "content": native_history.tool_content(message)}
+            return
+        kind = "user_message_chunk" if role == "user" else "agent_message_chunk"
+        has_text = False
+        for block in native_history.content_blocks(message):
+            block_type = block.get("type")
+            if role == "assistant" and block_type == "toolCall":
+                call_id = native_history.tool_identity(block.get("tool_call_id") or block.get("id"))
+                name = native_history.tool_identity(block.get("tool_name") or block.get("name"))
+                update = {"sessionUpdate": "tool_call", **tool_call(call_id, name, {}, session.cwd, "in_progress")}
+                if block.get("argumentsOmitted") is True:
+                    update["content"] = native_history.omitted_tool_content(native_history.TOOL_ARGUMENTS_OMITTED)
+                yield update
+                has_text = False
+            elif parts := native_history.display_parts(block):
+                if has_text and block_type == "text":
+                    yield {"sessionUpdate": kind, "content": native_history.text_block("\n")}
+                has_text = block_type == "text"
+                # JSON escapes can take six bytes. Keep outbound frames small
+                # even when a single native text block spans many MiB.
+                for text in parts:
+                    for offset in range(0, len(text), native_history.TEXT_CHUNK):
+                        yield {"sessionUpdate": kind,
+                               "content": native_history.text_block(text[offset:offset + native_history.TEXT_CHUNK])}
 
     async def fork_head(self, params):
         parent = require_string(params.get("sessionId"), "sessionId")
@@ -365,10 +408,10 @@ class Server:
                 self.sessions[session_id] = session
                 await session.commands()
                 if method == "session/load":
-                    recorded = list(history(self.db, session_id))
-                    if recorded:
+                    recorded = history(self.db, session_id)
+                    if (first := next(recorded, None)) is not None:
                         nesting = session.declares(NESTED_TOOL_CALLS)
-                        for update in recorded:
+                        for update in chain((first,), recorded):
                             if not nesting and nested_only(update):
                                 continue  # aelix-ai #612: the loading client's opt-in, as live.
                             if session.private_host:
@@ -376,7 +419,8 @@ class Server:
                             await self.send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
                     elif not session.fork_projection:
                         for update in await self.native_history(session):
-                            await session.update(update)
+                            await session.notify("session/update", {"sessionId": session_id, "update": update})
+                            await asyncio.sleep(0)
                     await session.publish_context_usage()
                     session.save()
                 await session.publish_recovery_warnings()
@@ -411,6 +455,7 @@ class Server:
                         self.db.execute("DELETE FROM preferences WHERE session_id=?", (session_id,))
                         self.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
                         self.db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
+                        self.db.execute("DELETE FROM recovered_history WHERE session_id=?", (session_id,))
                         self.db.execute("DELETE FROM turns WHERE session_id=?", (session_id,))
             except BaseException:
                 if live and self.sessions.get(session_id) is live:

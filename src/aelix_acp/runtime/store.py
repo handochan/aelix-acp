@@ -1,10 +1,16 @@
 """Private, migration-compatible ACP session index and session preferences."""
 from __future__ import annotations
 
+import asyncio
+from contextlib import closing
 import json
 import os
 from pathlib import Path
 import sqlite3
+from threading import Event
+from time import monotonic
+
+WRITE_TIMEOUT = 10
 
 
 def open_store(directory: str) -> sqlite3.Connection:
@@ -13,7 +19,7 @@ def open_store(directory: str) -> sqlite3.Connection:
     filename = root / "sessions.sqlite3"
     if filename.is_symlink():
         raise ValueError("Session database must not be a symbolic link")
-    db = sqlite3.connect(filename, timeout=10)
+    db = sqlite3.connect(filename, timeout=WRITE_TIMEOUT)
     os.chmod(filename, 0o600)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=FULL")
@@ -25,6 +31,9 @@ def open_store(directory: str) -> sqlite3.Connection:
         db.execute("ALTER TABLE turns ADD COLUMN fingerprint TEXT")
     db.execute("CREATE TABLE IF NOT EXISTS events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, value TEXT NOT NULL)")
     db.execute("CREATE INDEX IF NOT EXISTS events_session ON events(session_id,sequence)")
+    db.execute("""CREATE TABLE IF NOT EXISTS recovered_history (
+        session_id TEXT NOT NULL, position INTEGER NOT NULL, value TEXT,
+        PRIMARY KEY(session_id,position)) WITHOUT ROWID""")
     db.commit()
     return db
 
@@ -67,9 +76,110 @@ def insert_history(db: sqlite3.Connection, session_id: str, updates) -> None:
                    ((session_id, json.dumps(update, ensure_ascii=False, allow_nan=False)) for update in updates))
 
 
+def _write_busy(error):
+    return (getattr(error, "sqlite_errorcode", 0) & 255) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
+async def append_live_event(db: sqlite3.Connection, session_id: str, update: dict) -> None:
+    """Keep live updates from busy-waiting behind a recovery or another writer."""
+    if update.get("sessionUpdate") not in HISTORY_UPDATES:
+        return
+    deadline = monotonic() + WRITE_TIMEOUT
+    while True:
+        db.execute("PRAGMA busy_timeout=0")
+        try:
+            append_event(db, session_id, update)
+            return
+        except sqlite3.OperationalError as exc:
+            if not _write_busy(exc) or monotonic() >= deadline:
+                raise
+        finally:
+            db.execute(f"PRAGMA busy_timeout={WRITE_TIMEOUT * 1000}")
+        await asyncio.sleep(0.01)
+
+
+async def cache_recovered_history(directory: str, session_id: str, updates) -> None:
+    """Keep SQLite work and lock waits off the event loop for recovery."""
+    stop = Event()
+
+    async def write():
+        try:
+            await asyncio.to_thread(_cache_recovered_history, directory, session_id, updates, stop)
+        except Exception as exc:
+            # A cancelled shield can log an inner task's exception on Python
+            # 3.14. Return the error to this caller's fixed diagnostic path.
+            return exc
+        return None
+
+    worker = asyncio.create_task(write())
+    try:
+        failure = await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # The load owns the lease until this writer is finished, including
+        # when the client goes away. Staged rows remain invisible on retry.
+        stop.set()
+        await worker
+        raise
+    if failure is not None:
+        raise failure
+
+
+def _recovery_transaction(db, stop, sql, rows, *, finish=None):
+    deadline = monotonic() + WRITE_TIMEOUT
+    while not stop.is_set():
+        try:
+            with db:
+                cursor = db.executemany(sql, rows)
+                if finish is not None:
+                    if stop.is_set():
+                        raise InterruptedError
+                    db.execute(finish[0], finish[1])
+            return cursor.rowcount
+        except sqlite3.OperationalError as exc:
+            if not _write_busy(exc) or monotonic() >= deadline:
+                raise
+            stop.wait(0.01)
+    raise InterruptedError
+
+
+def _cache_recovered_history(directory, session_id, updates, stop):
+    filename = Path(directory).expanduser() / "sessions.sqlite3"
+    if filename.is_symlink():
+        raise ValueError("Session database must not be a symbolic link")
+    # This connection is only used on the worker thread. Keep individual
+    # transactions short so unrelated live events can acquire the writer slot.
+    with closing(sqlite3.connect(filename, timeout=0.05)) as db:
+        db.execute("PRAGMA synchronous=FULL")
+        cleanup = """DELETE FROM recovered_history WHERE session_id=? AND position IN (
+            SELECT position FROM recovered_history WHERE session_id=? LIMIT 32)"""
+        while _recovery_transaction(db, stop, cleanup, [(session_id, session_id)]):
+            pass
+        insert = "INSERT INTO recovered_history VALUES(?,?,?)"
+        batch = []
+        chars = 0
+        for position, update in enumerate(updates):
+            value = json.dumps(update, ensure_ascii=False, allow_nan=False)
+            batch.append((session_id, position, value))
+            chars += len(value)
+            if chars >= 64 * 1024 or len(batch) == 32:
+                _recovery_transaction(db, stop, insert, batch)
+                batch.clear()
+                chars = 0
+        marker = ("INSERT INTO recovered_history VALUES(?,-1,NULL)", (session_id,))
+        _recovery_transaction(db, stop, insert, batch, finish=marker)
+
+
 def history(db: sqlite3.Connection, session_id: str):
-    for row in db.execute("SELECT value FROM events WHERE session_id=? ORDER BY sequence", (session_id,)):
-        yield json.loads(row[0])
+    # A replay can await client output while this connection records live
+    # updates. Keep the same cutoff for the lifetime of the cursor.
+    (last,) = db.execute("SELECT max(sequence) FROM events WHERE session_id=?", (session_id,)).fetchone()
+    if db.execute("SELECT 1 FROM recovered_history WHERE session_id=? AND position=-1", (session_id,)).fetchone():
+        for (value,) in db.execute("SELECT value FROM recovered_history WHERE session_id=? AND position>=0 "
+                                   "ORDER BY position", (session_id,)):
+            yield json.loads(value)
+    for (value,) in db.execute("SELECT value FROM events WHERE session_id=? AND sequence<=? ORDER BY sequence",
+                               (session_id, last)):
+        yield json.loads(value)
 
 
 def recorded_turn(db: sqlite3.Connection, session_id: str, request_key: str, fingerprint: str | None = None) -> dict | None:

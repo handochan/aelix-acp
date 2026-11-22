@@ -139,10 +139,21 @@ startup or on a session switch) and a second adapter's ACP lease become
 request R7), native's refusal text is the only signal; one function in
 `wire/errors.py` matches it so R7 can replace it.
 
-Known unresolved candidate limitation: native JSONL is bounded to 16 MiB too.
-An oversized aggregate event or `get_messages` response can close its actor.
-Large branch-history acceptance needs compact native lifecycle events and
-paged/bounded history; no such new core API is introduced by this adapter fix.
+Session load prefers recorded ACP history. When it is missing, the adapter
+scans the pinned native `get_messages` response in chunks, replaces native
+images with text placeholders, and recovers text and tool calls in order.
+It discards unused tool arguments while scanning. Oversized arguments and
+tool results get fixed placeholders on their existing call IDs. The adapter
+bounds retained history JSON to 64 MiB and normal tool-result content to
+1 MiB. It stages short SQLite batches off the event loop and publishes the
+complete cache before replay. Generic ACP clients receive native stderr
+through the existing passthrough. The Studio Host path suppresses native
+stderr. ACP reports incomplete or over-budget fallback history with
+`native_history_unavailable` and the fixed message
+`Native session history is unavailable`.
+Native still serializes the response as a single line, so replies on that
+pipe arrive after the line ends. The stdio measurement script is
+[`scripts/measure_native_history.py`](../scripts/measure_native_history.py).
 
 ## Delegated children (aelix-ai #612)
 
