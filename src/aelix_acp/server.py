@@ -60,7 +60,7 @@ class Server:
         self.image_policies = ()
         self.active_request_ids = set()
         self.sessions = {}
-        self.restarting_sessions = {}
+        self.pending_stop_sessions = {}
         self.starting_ids = set()
         self.pending = {}
         self.response_limits = {}
@@ -410,6 +410,9 @@ class Server:
                 session.client_mcp = params.get("mcpServers", [])
                 async with session.publication_lock:
                     await session.start(session_file)
+                    if method == "session/load":
+                        # Stop can address the worker while replay and publication are pending.
+                        self.pending_stop_sessions[session_id] = session
                     await session.commands()
                     if method == "session/load":
                         await session.live_history.flush()
@@ -438,6 +441,7 @@ class Server:
                     await session.close()
                 raise
             finally:
+                self.pending_stop_sessions.pop(session_id, None)
                 self.starting_ids.discard(session_id)
             result = {**session.selectors(), **({"sessionId": session_id} if method.endswith("new") else {})}
             return session_relay.bind_session(session, result, binding_id)
@@ -515,7 +519,7 @@ class Server:
                 return await session.prompt(params.get("prompt"), metadata.get("aelix/requestId"), anchor)
         if method == "session/cancel":
             session_id = require_string(params.get("sessionId"), "sessionId")
-            session = self.restarting_sessions.get(session_id) or self.session(params)
+            session = self.pending_stop_sessions.get(session_id) or self.session(params)
             await session.cancel()
             return {}
         if method in ("session/set_mode", "session/set_model", "session/set_config_option"):

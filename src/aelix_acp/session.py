@@ -1314,7 +1314,7 @@ class Session:
                     await self.save()
                 if managed_change is not None:
                     # Only Stop can address the candidate before publication.
-                    self.server.restarting_sessions[self.id] = self
+                    self.server.pending_stop_sessions[self.id] = self
                 snapshot = await self.start(filename, managed_change=managed_change)
                 await self.commands()
                 if preserve_history:
@@ -1336,7 +1336,7 @@ class Session:
             raise
         finally:
             self.extension_commit_started = False
-            self.server.restarting_sessions.pop(self.id, None)
+            self.server.pending_stop_sessions.pop(self.id, None)
             self.server.starting_ids.discard(self.id)
             self.changing -= 1
 
