@@ -101,15 +101,27 @@ async def append_live_event(db: sqlite3.Connection, session_id: str, update: dic
 async def cache_recovered_history(directory: str, session_id: str, updates) -> None:
     """Keep SQLite work and lock waits off the event loop for recovery."""
     stop = Event()
-    worker = asyncio.create_task(asyncio.to_thread(_cache_recovered_history, directory, session_id, updates, stop))
+
+    async def write():
+        try:
+            await asyncio.to_thread(_cache_recovered_history, directory, session_id, updates, stop)
+        except Exception as exc:
+            # A cancelled shield can log an inner task's exception on Python
+            # 3.14. Return the error to this caller's fixed diagnostic path.
+            return exc
+        return None
+
+    worker = asyncio.create_task(write())
     try:
-        await asyncio.shield(worker)
+        failure = await asyncio.shield(worker)
     except asyncio.CancelledError:
         # The load owns the lease until this writer is finished, including
         # when the client goes away. Staged rows remain invisible on retry.
         stop.set()
-        await asyncio.gather(worker, return_exceptions=True)
+        await worker
         raise
+    if failure is not None:
+        raise failure
 
 
 def _recovery_transaction(db, stop, sql, rows, *, finish=None):

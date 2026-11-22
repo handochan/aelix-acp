@@ -228,6 +228,9 @@ class HistoryReplayTests(unittest.IsolatedAsyncioTestCase):
         ) as blocker:
             entered = asyncio.Event()
             loop = asyncio.get_running_loop()
+            unhandled = []
+            self.addCleanup(loop.set_exception_handler, loop.get_exception_handler())
+            loop.set_exception_handler(lambda _, event: unhandled.append(event))
             transaction = store._recovery_transaction
 
             def observed(*args, **kwargs):
@@ -242,6 +245,7 @@ class HistoryReplayTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await asyncio.wait_for(recovery, 2)
             blocker.rollback()
+            self.assertEqual(unhandled, [])
             self.assertEqual(list(history(db, "fixture")), [])
             await cache_recovered_history(directory, "fixture", [update])
             self.assertEqual(list(history(db, "fixture")), [update])
