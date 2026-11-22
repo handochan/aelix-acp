@@ -202,6 +202,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
         self.session.proc = SimpleNamespace(stdin=self.stdin, returncode=None)
 
     async def asyncTearDown(self):
+        await self.session.live_history.flush()
         self.server.db.close()
         self.tmp.cleanup()
 
@@ -973,7 +974,7 @@ class ReplayTests(unittest.IsolatedAsyncioTestCase):
         server = await self.server(capabilities)
         session = Session(server, "session", self.root)
         session.proc = SimpleNamespace(stdin=Stdin(), returncode=None)
-        session.save()
+        await session.save()
         for event in ({"type": "tool_execution_start", "toolCallId": "call-1", "toolName": "agent", "args": {}},
                       state(), frame("tool_start", seq=2, callId="c1", name="read", args="a"),
                       frame("tool_end", seq=3, callId="c1", status="ok"), frame("text", seq=4, text="done"),
@@ -983,12 +984,17 @@ class ReplayTests(unittest.IsolatedAsyncioTestCase):
                                                                name="read", args="b"),
                       state(child="sub-2", seq=3, parent=None, value="done", end="completed")):
             await session.event(event)
+        await session.live_history.flush()
         return [e["params"]["update"] for e in server.events if e.get("method") == "session/update"]
 
     async def load(self, capabilities):
         server = await self.server(capabilities)
 
         async def start(session, filename):
+            session.proc = SimpleNamespace(returncode=None)
+            session.lease = acquire(self.root, session.id)
+            self.addCleanup(session.lease.close)
+
             async def rpc(command, **kwargs):
                 return {}
             session.rpc = rpc
@@ -1238,6 +1244,7 @@ class FenceOrderTests(Base):
         async def nothing(*args, **kwargs):
             pass
         self.session._end_worker = end_worker
+        self.session.lease = SimpleNamespace(closed=False)
         self.session.start = self.session.commands = self.session.publish_context_usage = nothing
         restart = asyncio.create_task(self.session.restart())
         # Read by the reader after restart() raised the counter, before its close() runs.
@@ -1573,7 +1580,8 @@ class ShutdownTests(Base):
         for gone in ("closing", "replaced"):
             with self.subTest(gone):
                 self.events.clear()
-                self.server.db.execute("DELETE FROM events")
+                with self.server.db:
+                    self.server.db.execute("DELETE FROM events")
                 self.session = Session(self.server, "session", self.tmp.name)
                 await self.worker(None, "frames")
                 sent = len(self.events)

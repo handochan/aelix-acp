@@ -21,7 +21,7 @@ from . import __version__
 from .wire.errors import (ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH,
                           fork_head_changed, require_object, require_string)
 from .runtime.store import (open_store, load_preferences, history, legacy_permission_mode,
-                            save_preferences, cache_recovered_history)
+                            save_preferences, cache_recovered_history, write_store)
 from .runtime.controls import MODE_IDS
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
@@ -60,6 +60,7 @@ class Server:
         self.image_policies = ()
         self.active_request_ids = set()
         self.sessions = {}
+        self.pending_stop_sessions = {}
         self.starting_ids = set()
         self.pending = {}
         self.response_limits = {}
@@ -141,13 +142,15 @@ class Server:
         preferences.pop("forkProjection", None)
         preferences.pop("forkHead", None)
         preferences["backendMessageCount"] = 1
-        with self.db:
-            self.db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?)", (identifier, session.cwd, self.args.profile,
-                            filename, result.get("title") or "Aelix branch", int(time.time())))
-            save_preferences(self.db, identifier, preferences)
+        def save_branch(db):
+            db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?)", (identifier, session.cwd, self.args.profile,
+                       filename, result.get("title") or "Aelix branch", int(time.time())))
+            save_preferences(db, identifier, preferences)
+
+        await write_store(self.args.state_dir, save_branch)
         await session.controls.refresh()
         await session.restore_tools()
-        session.save()
+        await session.save()
         return {"sessionId": identifier, "parentSessionId": session.id}
 
     async def native_history(self, session):
@@ -221,9 +224,9 @@ class Server:
         filename = row[2]
         if not filename or not Path(filename).is_file():
             raise ProtocolError("No persisted Aelix session file is available to fork")
+        await write_store(self.args.state_dir, forks.recover, self.args.state_dir, parent)
         if len(self.sessions) + len(self.starting_ids) >= getattr(self.args, "max_sessions", 16):
             raise ProtocolError("Session limit reached; close a session first", -32000)
-        forks.recover(self.db, self.args.state_dir, parent)
 
         identifier = str(uuid.uuid4())
         session = Session(self, identifier, cwd)
@@ -248,15 +251,16 @@ class Server:
             self.starting_ids.add(identifier)
             try:
                 session.lease = acquire_lease(self.args.state_dir, identifier)
-                draft = forks.reserve(self.db, self.args.state_dir, identifier, parent, filename)
-                await session.start(fork_source={**draft, "file": filename, "peer": peer, "sessionId": parent,
-                                                 "expectedSha256": head["sha256"]},
-                                    fork_preferences=preferences)
-                await session.commands()
-                result = {"sessionId": identifier, **session.selectors()}
-                with self.db:
-                    session.save(session.fork_history())
-                self.sessions[identifier] = session
+                draft = await write_store(self.args.state_dir, forks.reserve, self.args.state_dir,
+                                          identifier, parent, filename)
+                async with session.publication_lock:
+                    await session.start(fork_source={**draft, "file": filename, "peer": peer, "sessionId": parent,
+                                                     "expectedSha256": head["sha256"]},
+                                        fork_preferences=preferences)
+                    await session.commands()
+                    result = {"sessionId": identifier, **session.selectors()}
+                    await session.save(session.fork_history(), live=True)
+                    self.sessions[identifier] = session
                 try:
                     forks.receipt_path(self.args.state_dir, identifier).unlink(missing_ok=True)
                 except OSError:
@@ -267,7 +271,7 @@ class Server:
                 try:
                     await session.close()
                     if lease is not None:
-                        forks.discard(self.db, self.args.state_dir, identifier)
+                        await write_store(self.args.state_dir, forks.discard, self.args.state_dir, identifier)
                 except (OSError, ValueError, sqlite3.Error, ProtocolError):
                     raise forks.cleanup_pending() from None
                 finally:
@@ -404,32 +408,40 @@ class Server:
                                   initial_mode=getattr(self.args, "permission_mode", "default") if method == "session/new" else None)
                 session.index_snapshot = index_snapshot
                 session.client_mcp = params.get("mcpServers", [])
-                await session.start(session_file)
-                self.sessions[session_id] = session
-                await session.commands()
-                if method == "session/load":
-                    recorded = history(self.db, session_id)
-                    if (first := next(recorded, None)) is not None:
-                        nesting = session.declares(NESTED_TOOL_CALLS)
-                        for update in chain((first,), recorded):
-                            if not nesting and nested_only(update):
-                                continue  # aelix-ai #612: the loading client's opt-in, as live.
-                            if session.private_host:
-                                update.pop("rawOutput", None)
-                            await self.send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
-                    elif not session.fork_projection:
-                        for update in await self.native_history(session):
-                            await session.notify("session/update", {"sessionId": session_id, "update": update})
-                            await asyncio.sleep(0)
-                    await session.publish_context_usage()
-                    session.save()
-                await session.publish_recovery_warnings()
+                async with session.publication_lock:
+                    await session.start(session_file)
+                    if method == "session/load":
+                        # Stop can address the worker while replay and publication are pending.
+                        self.pending_stop_sessions[session_id] = session
+                    await session.commands()
+                    if method == "session/load":
+                        await session.live_history.flush()
+                        recorded = history(self.db, session_id)
+                        if (first := next(recorded, None)) is not None:
+                            nesting = session.declares(NESTED_TOOL_CALLS)
+                            for update in chain((first,), recorded):
+                                if not nesting and nested_only(update):
+                                    continue  # aelix-ai #612: the loading client's opt-in, as live.
+                                if session.private_host:
+                                    update.pop("rawOutput", None)
+                                await self.send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
+                        elif not session.fork_projection:
+                            for update in await self.native_history(session):
+                                await session.notify("session/update", {"sessionId": session_id, "update": update})
+                                await asyncio.sleep(0)
+                        await session.publish_context_usage()
+                        await session.save(live=True)
+                    await session.publish_recovery_warnings()
+                    await session.live_history.flush()
+                    session.require_live_worker()
+                    self.sessions[session_id] = session
             except BaseException:
                 self.sessions.pop(session_id, None)
                 if session:
                     await session.close()
                 raise
             finally:
+                self.pending_stop_sessions.pop(session_id, None)
                 self.starting_ids.discard(session_id)
             result = {**session.selectors(), **({"sessionId": session_id} if method.endswith("new") else {})}
             return session_relay.bind_session(session, result, binding_id)
@@ -451,12 +463,14 @@ class Server:
                 async with (live.mutation_lock if live else asyncio.Lock()):
                     if live:
                         await live.close()
-                    with self.db:
-                        self.db.execute("DELETE FROM preferences WHERE session_id=?", (session_id,))
-                        self.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
-                        self.db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
-                        self.db.execute("DELETE FROM recovered_history WHERE session_id=?", (session_id,))
-                        self.db.execute("DELETE FROM turns WHERE session_id=?", (session_id,))
+                    def delete_records(db):
+                        db.execute("DELETE FROM preferences WHERE session_id=?", (session_id,))
+                        db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+                        db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
+                        db.execute("DELETE FROM recovered_history WHERE session_id=?", (session_id,))
+                        db.execute("DELETE FROM turns WHERE session_id=?", (session_id,))
+
+                    await write_store(self.args.state_dir, delete_records)
             except BaseException:
                 if live and self.sessions.get(session_id) is live:
                     live.lease, lease = lease, None
@@ -504,7 +518,9 @@ class Server:
                     raise ProtocolError("Invalid native fork reference")
                 return await session.prompt(params.get("prompt"), metadata.get("aelix/requestId"), anchor)
         if method == "session/cancel":
-            await self.session(params).cancel()
+            session_id = require_string(params.get("sessionId"), "sessionId")
+            session = self.pending_stop_sessions.get(session_id) or self.session(params)
+            await session.cancel()
             return {}
         if method in ("session/set_mode", "session/set_model", "session/set_config_option"):
             session = self.session(params)
@@ -571,7 +587,7 @@ class Server:
                         _timeout=(getattr(self.args, "command_timeout", 600) or None) if action in {"auth/login", "resources/reload", "agents/run"} else 60)
                 if action == "tools/set_active":
                     session.active_tools = result["activeTools"]
-                    session.save()
+                    await session.save()
                 if action == "resources/reload":
                     await session.restore_tools()
                     await session.commands()
@@ -581,7 +597,7 @@ class Server:
                     await session.controls.refresh()
                     if action == "agents/use":
                         await session.sync_profile_tools()
-                    session.save()
+                    await session.save()
                     await session.update({"sessionUpdate": "config_option_update", "configOptions": session.controls.options()})
                 return result
         if method == "authenticate":

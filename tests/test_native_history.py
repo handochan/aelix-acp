@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import struct
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
@@ -23,6 +25,7 @@ from aelix_acp.server import Server
 from aelix_acp.session import Session
 from aelix_acp.wire.errors import BackendError, ProtocolError
 from support import AcpClient
+from test_native_control_contention import ObservedClient, report
 
 MIB = 1024**2
 REQUEST_ID = "0" * 32
@@ -228,7 +231,9 @@ class HistoryReplayTests(unittest.IsolatedAsyncioTestCase):
             blocker.execute("BEGIN IMMEDIATE")
             with patch.object(store, "_recovery_transaction", observed):
                 recovery = asyncio.create_task(cache_recovered_history(directory, "fixture", [update]))
-                live = asyncio.create_task(store.append_live_event(db, "other", update))
+                recording = store.LiveHistory(directory, "other")
+                recording.append(update)
+                live = asyncio.create_task(recording.flush())
                 try:
                     await asyncio.wait_for(entered.wait(), 2)
                     self.assertFalse(recovery.done())
@@ -271,6 +276,71 @@ class HistoryReplayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(list(history(db, "fixture")), [update])
 
 
+def history_stop_adapter(mode):
+    from aelix_acp import server as server_module
+
+    released = Path("history-probe-release")
+    rpc, frames = Session.rpc, Session.rpc_frames
+    cache, write_busy = server_module.cache_recovered_history, store._write_busy
+    history_command = re.compile(rb'"command"\s*:\s*"get_messages"')
+
+    async def wait_for_release():
+        async with asyncio.timeout(12):
+            while not released.exists():
+                await asyncio.sleep(0.01)
+
+    async def observe_rpc(session, command, **kwargs):
+        if command == "abort" or (command == "aelix_control" and kwargs.get("method") == "commands/cancel"):
+            report("history_stop_submit")
+        answer = await rpc(session, command, **kwargs)
+        if command == "abort":
+            report("history_abort_ack")
+        return answer
+
+    async def pause_history_stream(session):
+        reader = session.proc.stdout
+        read = reader.read
+        prefix = b""
+
+        async def pause_after_prefix(size):
+            nonlocal prefix
+            chunk = await read(size)
+            if not released.exists():
+                pieces = chunk.split(b"\n")
+                for index, piece in enumerate(pieces):
+                    prefix += piece[:256 - len(prefix)]
+                    if index < len(pieces) - 1:
+                        prefix = b""
+                    elif history_command.search(prefix):
+                        report("history_partial_line")
+                        await wait_for_release()
+            return chunk
+
+        reader.read = pause_after_prefix
+        async for frame in frames(session):
+            yield frame
+
+    async def pause_before_cache(*args):
+        report("history_cache_ready")
+        await wait_for_release()
+        return await cache(*args)
+
+    def observe_busy(error):
+        busy = write_busy(error)
+        if busy:
+            report("history_cache_busy")
+        return busy
+
+    with contextlib.ExitStack() as patches:
+        patches.enter_context(patch.object(Session, "rpc", observe_rpc))
+        if mode == "stream":
+            patches.enter_context(patch.object(Session, "rpc_frames", pause_history_stream))
+        else:
+            patches.enter_context(patch.object(server_module, "cache_recovered_history", pause_before_cache))
+            patches.enter_context(patch.object(store, "_write_busy", observe_busy))
+        server_module.main()
+
+
 @unittest.skipUnless(EXECUTABLE, "Set AELIX_ACP_TEST_AELIX to the pinned native executable")
 class NativeHistoryIntegration(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -308,11 +378,15 @@ class NativeHistoryIntegration(unittest.IsolatedAsyncioTestCase):
                        (self.session, str(self.root), "coding", str(filename), "fixture", 1))
         return filename
 
-    async def start_client(self, private=False):
+    async def start_client(self, private=False, *, stop_probe=None):
         metadata = {
             session_relay.META_KEY: {"version": 1, "notifications": False}, host_bytes.META_KEY: {"version": 1}
         } if private else {}
-        client = await AcpClient.start(self.root, EXECUTABLE, capabilities={"_meta": metadata})
+        if stop_probe:
+            client = await ObservedClient.start(self.root, EXECUTABLE, capabilities={"_meta": metadata},
+                entry=(str(Path(__file__).resolve()), "--history-stop-probe", stop_probe))
+        else:
+            client = await AcpClient.start(self.root, EXECUTABLE, capabilities={"_meta": metadata})
         self.addAsyncCleanup(client.close)
         return client
 
@@ -344,6 +418,56 @@ class NativeHistoryIntegration(unittest.IsolatedAsyncioTestCase):
                 await client.close()
                 with contextlib.closing(open_store(str(self.root / "state"))) as db, db:
                     db.execute("DELETE FROM recovered_history WHERE session_id=?", (self.session,))
+
+    async def start_stop_reopen(self, text, mode):
+        self.seed([{"role": "user", "content": [{"type": "text", "text": text}]}])
+        client = await self.start_client(private=True, stop_probe=mode)
+        loading = asyncio.create_task(client.request("session/load", self.params))
+        release = self.root / "history-probe-release"
+
+        async def settle_load():
+            release.touch()
+            await asyncio.gather(loading, return_exceptions=True)
+
+        self.addAsyncCleanup(settle_load)
+        return client, loading, release
+
+    async def test_stop_reaches_native_while_its_history_line_is_streaming(self):
+        text = "streamed history " + "x" * MIB
+        client, loading, release = await self.start_stop_reopen(text, "stream")
+        await client.observe("history_partial_line")
+        with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+            await client.request("_aelix/capabilities", {"sessionId": self.session})
+        stopping = asyncio.create_task(client.request("session/cancel", {"sessionId": self.session}, timeout=8))
+        try:
+            await client.observe("history_stop_submit")
+            self.assertFalse(loading.done())
+            self.assertFalse(stopping.done())  # The ACK is behind the rest of the line on native stdout.
+        finally:
+            release.touch()
+            self.assertEqual(await stopping, {})
+        await client.observe("history_abort_ack")
+        await loading
+        self.assertEqual("".join(update["content"]["text"] for update in self.replay(client)), text)
+
+    async def test_stop_reaches_native_while_fallback_cache_waits_on_sqlite(self):
+        text = "history waiting for the cache"
+        client, loading, release = await self.start_stop_reopen(text, "cache")
+        await client.observe("history_cache_ready")
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3", timeout=0)) as blocker:
+            blocker.execute("BEGIN IMMEDIATE")
+            try:
+                release.touch()
+                await client.observe("history_cache_busy")
+                with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+                    await client.request("_aelix/capabilities", {"sessionId": self.session})
+                self.assertEqual(await client.request("session/cancel", {"sessionId": self.session}, timeout=8), {})
+                await client.observe("history_abort_ack")
+                self.assertFalse(loading.done())
+            finally:
+                blocker.rollback()
+        await loading
+        self.assertEqual([update["content"]["text"] for update in self.replay(client)], [text])
 
     async def test_native_tool_limits_keep_surrounding_history_and_tool_identity(self):
         self.seed([
@@ -472,3 +596,12 @@ class NativeHistoryIntegration(unittest.IsolatedAsyncioTestCase):
         self.seed([{"role": "user", "content": [{"type": "text", "text": "different native history"}]}])
         reopened = await self.open(private=True)
         self.assertEqual(list(self.replay(reopened)), rendered)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--history-stop-probe"]:
+        _, mode = sys.argv[1:3]
+        del sys.argv[1:3]
+        history_stop_adapter(mode)
+    else:
+        unittest.main()

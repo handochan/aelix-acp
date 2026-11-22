@@ -13,7 +13,6 @@ import secrets
 import os
 from pathlib import Path
 import shutil
-import sqlite3
 import sys
 import tempfile
 import time
@@ -27,8 +26,8 @@ from . import image_policy
 from .runtime import native_frames, native_history
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
-from .runtime.store import (save_preferences, load_preferences, legacy_permission_mode, append_event, append_live_event,
-                            insert_history, begin_turn, finish_turn, recorded_turn)
+from .runtime.store import (LiveHistory, begin_turn, finish_turn, legacy_permission_mode, load_preferences,
+                            recorded_turn, save_session, write_store)
 from .runtime.commands import (BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND,
                                compact_instructions, execute as execute_slash)
 from .runtime.extensions import extension_reference
@@ -178,6 +177,7 @@ class Session:
         self.last_abort = None
         self.aborts = 0  # Native aborts sent, by any path.
         self.management_task = None
+        self.extension_commit_started = False
         self._close_task = None
         self.lease = None
         self.fork_peer_lease = None
@@ -195,7 +195,8 @@ class Session:
         self.context = SessionContext(self)
         self.compaction_recovery_needed = False
         self.mutation_lock = asyncio.Lock()
-        self.history_lock = asyncio.Lock()
+        self.live_history = LiveHistory(server.args.state_dir, self.id)
+        self.publication_lock = asyncio.Lock()
         self._pending_extension_change = None
         self._verifying_extension_recovery = False
         self.restore_launch_preferences()
@@ -446,7 +447,9 @@ class Session:
                 self, require_complete=managed_change is not None or self._verifying_extension_recovery,
             )
         if fork_source is None and managed_change is None:
-            self.save()
+            await self.save(live=True)
+        else:
+            self.require_live_worker()
         return snapshot
 
     async def selector_startup(self, nonce, operation):
@@ -567,14 +570,30 @@ class Session:
         # A profile owns its live filter and must be re-evaluated after edits.
         self.active_tools = None
 
-    def save(self, inherited_history=None):
+    def require_live_worker(self, expected=None, *, committed=False):
+        proc, lease = self.proc, self.lease
+        if (proc is None or proc.returncode is not None or lease is None or lease.closed
+                or self.rpc_closed or self._close_task is not None
+                or (expected is not None and (proc is not expected[0] or lease is not expected[1]))):
+            kind = "session_worker_closed_after_commit" if committed else "session_worker_unavailable"
+            raise ProtocolError("Aelix process closed its RPC stream", -32603, {"kind": kind})
+        return proc, lease
+
+    async def save(self, inherited_history=None, *, live=False, managed_commit=False):
+        before_commit = None
+        if live:
+            worker = self.require_live_worker()
+
+            def before_commit():
+                self.require_live_worker(worker)
+                if managed_commit:
+                    self.extension_commit_started = True
+
         if inherited_history is not None:
             self.fork_projection = True
-        self.server.db.execute(
-            "INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?,?)",
-            (self.id, self.cwd, self.server.args.profile, self.state.get("sessionFile"),
-             self.state.get("sessionName") or f"Aelix {self.server.args.profile}", int(time.time())))
-        save_preferences(self.server.db, self.id, {"permission_mode": self.controls.permission_mode, "extensions": self.extra_extensions,
+        row = (self.id, self.cwd, self.server.args.profile, self.state.get("sessionFile"),
+               self.state.get("sessionName") or f"Aelix {self.server.args.profile}", int(time.time()))
+        preferences = {"permission_mode": self.controls.permission_mode, "extensions": self.extra_extensions,
             "config": {option["id"]: option["currentValue"] for option in self.controls.options()},
             **({"extensionOverrides": self.extension_overrides} if self.extension_overrides else {}),
             "lastContextMeasurement": self.context.last_measurement,
@@ -583,11 +602,11 @@ class Session:
             "forkProjection": self.fork_projection,
             "forkHead": self.fork_head,
             "trustProject": self.trust_project, "agentsEnabled": self.agents_enabled,
-            "backendMessageCount": self.state.get("messageCount", self.state.get("message_count", 0))})
-        if inherited_history is not None:
-            insert_history(self.server.db, self.id, inherited_history)
-            self.server.db.execute("DELETE FROM pending_forks WHERE session_id=?", (self.id,))
-        self.server.db.commit()
+            "backendMessageCount": self.state.get("messageCount", self.state.get("message_count", 0))}
+        await write_store(self.server.args.state_dir, save_session, row, preferences, inherited_history,
+                          before_commit=before_commit)
+        if live:
+            self.require_live_worker(worker, committed=True)
 
     def selectors(self):
         result = self.controls.selectors()
@@ -638,7 +657,10 @@ class Session:
             with contextlib.suppress(ProtocolError, ConnectionError):
                 self.state = await self.rpc("get_state", _timeout=5)
             if self.lease is not None:
-                self.record(self.save)
+                try:
+                    await self.save()
+                except ProtocolError as error:
+                    print(error.data["kind"], file=sys.stderr)
 
     async def rpc(self, command, *, _timeout=45, _image_write=None, _project_history=False, **kwargs):
         request_id = uuid.uuid4().hex
@@ -1025,8 +1047,7 @@ class Session:
         await self.update(update)
 
     async def update(self, update):
-        async with self.history_lock:
-            await append_live_event(self.server.db, self.id, update)
+        self.live_history.append(update)
         await self.notify("session/update", {"sessionId": self.id, "update": update})
 
     async def notify(self, method, params):
@@ -1048,7 +1069,7 @@ class Session:
         allowed = False
         try:
             # Loopback peers are unauthenticated until they present the token.
-            if len(self.permission_connections) >= (8 if self.permission_endpoint else 32):
+            if self.ending or len(self.permission_connections) >= (8 if self.permission_endpoint else 32):
                 return
             self.permission_connections.add(owner)
             if self.permission_endpoint or self.permission_token is not None:
@@ -1288,26 +1309,22 @@ class Session:
                 self.trust_project = trust_project
             if agents_enabled is not None:
                 self.agents_enabled = agents_enabled
-            if not preserve_history:
-                self.save()
-            if managed_change is not None:
-                # Keep session/cancel routed to the mutation while the candidate
-                # starts. Other requests still have the activity/mutation locks.
+            async with self.publication_lock:
+                if not preserve_history:
+                    await self.save()
+                if managed_change is not None:
+                    # Only Stop can address the candidate before publication.
+                    self.server.pending_stop_sessions[self.id] = self
+                snapshot = await self.start(filename, managed_change=managed_change)
+                await self.commands()
+                if preserve_history:
+                    await self.update({"sessionUpdate": "current_mode_update",
+                                       "currentModeId": self.controls.permission_mode})
+                    await self.update({"sessionUpdate": "config_option_update", "configOptions": self.controls.options()})
+                await self.publish_context_usage()
+                await self.publish_recovery_warnings()
+                await self.save(live=True, managed_commit=managed_change is not None)
                 self.server.sessions[self.id] = self
-            snapshot = await self.start(filename, managed_change=managed_change)
-            await self.commands()
-            if preserve_history:
-                await self.update({"sessionUpdate": "current_mode_update",
-                                   "currentModeId": self.controls.permission_mode})
-                await self.update({"sessionUpdate": "config_option_update", "configOptions": self.controls.options()})
-            await self.publish_context_usage()
-            if managed_change is None:
-                self.save()
-            await self.publish_recovery_warnings()
-            if managed_change is not None:
-                with self.server.db:
-                    self.save()
-            self.server.sessions[self.id] = self
             return snapshot
         except BaseException:
             if held_lease is not None:
@@ -1318,6 +1335,8 @@ class Session:
             await self.close()
             raise
         finally:
+            self.extension_commit_started = False
+            self.server.pending_stop_sessions.pop(self.id, None)
             self.server.starting_ids.discard(self.id)
             self.changing -= 1
 
@@ -1418,15 +1437,16 @@ class Session:
         if not isinstance(key, str) or not key or len(key) > 256:
             raise ProtocolError("Request id must be a non-empty string of at most 256 characters")
         fingerprint = hashlib.sha256(json.dumps(blocks, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+        # Replay receipt results without changing the worker's cancellation state.
+        prior = recorded_turn(self.server.db, self.id, key, fingerprint)
+        if prior is not None:
+            return prior
         if self.compaction_recovery_needed:
-            # Check old keys before recovery without claiming a new request.
-            prior = recorded_turn(self.server.db, self.id, key, fingerprint)
-            if prior is not None:
-                return prior
-            # A rejected reopen has not started this turn. Claim the key
-            # only after recovery holds the lease, with a fresh replay check.
+            # Claim the key only after recovery holds the lease.
             await self.recover_after_compaction()
-        prior = begin_turn(self.server.db, self.id, key, fingerprint)
+        self.cancelled = False
+        prior = await write_store(self.server.args.state_dir, begin_turn, self.id, key, fingerprint,
+                                  diagnostic="turn_receipt_write_failed")
         if prior is not None:
             return prior
         result, error = None, None
@@ -1441,8 +1461,8 @@ class Session:
             # Once native may have started work, a failure is final: an
             # automatic replay could repeat model calls and tool effects.
             error = after_dispatch(failure) if self.dispatched else failure
-            self.record(append_event, self.server.db, self.id, {"sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": "Request failed: " + str(error)}})
+            self.live_history.append({"sessionUpdate": "agent_message_chunk",
+                                      "content": {"type": "text", "text": "Request failed: " + str(error)}})
             if error is failure:
                 raise
             raise error from None
@@ -1450,7 +1470,12 @@ class Session:
             self.turn_active = False
             # Bookkeeping must not replace the turn's own outcome (a marked
             # -33002 would otherwise become a replayable internal error).
-            self.record(finish_turn, self.server.db, self.id, key, result, error)
+            await self.live_history.flush()
+            try:
+                await write_store(self.server.args.state_dir, finish_turn, self.id, key, result, error,
+                                  diagnostic="turn_receipt_write_failed")
+            except Exception:
+                print("turn_receipt_write_failed", file=sys.stderr)
 
     async def record_fork_head(self, anchor):
         def capture(filename):
@@ -1466,25 +1491,15 @@ class Session:
             if filename and not self.state.get("isStreaming", self.state.get("is_streaming", False)):
                 digest = await asyncio.to_thread(capture, filename)
                 self.fork_head = {"id": anchor, "sha256": digest}
-            with self.server.db:
-                self.save()
-        except (OSError, ProtocolError):
-            pass
-        except sqlite3.Error as failure:
+            await self.save()
+        except (OSError, ProtocolError) as error:
             self.fork_head = None
-            print(f"[aelix-acp] Could not record the fork head: {type(failure).__name__}", file=sys.stderr)
-
-    @staticmethod
-    def record(write, *args):
-        try:
-            write(*args)
-        except Exception as failure:
-            print(f"[aelix-acp] Could not record the turn outcome: {type(failure).__name__}", file=sys.stderr)
+            if isinstance(error, ProtocolError) and (error.data or {}).get("kind") == "session_store_write_failed":
+                print("session_store_write_failed", file=sys.stderr)
 
     async def _prompt(self, blocks):
         if self.done and not self.done.done():
             raise ProtocolError("A prompt is already running in this session")
-        self.cancelled = False
         if not isinstance(blocks, list) or not blocks:
             raise ProtocolError("prompt must be a non-empty content block list")
         parts = []
@@ -1527,8 +1542,14 @@ class Session:
                 not text_only or "[[AION_FILES]]" in map(str.strip, instructions.splitlines())):
             raise ProtocolError("/compact accepts text instructions only")
         for block in blocks:
-            append_event(self.server.db, self.id, {"sessionUpdate": "user_message_chunk", "content": block})
-        self.server.db.commit()
+            update = {"sessionUpdate": "user_message_chunk", "content": block}
+            while not self.live_history.append(update, retry_if_full=True):
+                await self.live_history.flush()
+        await self.live_history.flush()
+        if code := self.live_history.failure:
+            raise ProtocolError(code, -32603, {"kind": code})
+        if self.cancelled:
+            return {"stopReason": "cancelled"}
         if instructions is not None:
             await self.compact(instructions.removeprefix(" "))
             return {"stopReason": "end_turn"}
@@ -1580,6 +1601,8 @@ class Session:
             if not sent:
                 raise
             raise after_dispatch(failure) from None
+        finally:
+            await self.live_history.flush()
         return {**answer, **stop}
 
     async def drive_turn(self, send, *, input_relay=None):
@@ -1602,8 +1625,9 @@ class Session:
             await self.publish_context_usage()
             if self.failure and not self.cancelled:
                 raise ProtocolError(self.failure, -32603)
-            self.save()
-            return {"stopReason": "cancelled" if self.cancelled else "end_turn"}
+            stop_reason = "cancelled" if self.cancelled else "end_turn"
+            await self.save()
+            return {"stopReason": stop_reason}
         except TimeoutError:
             await self.cancel()
             raise ProtocolError("Aelix turn timed out", -32603)
@@ -1654,7 +1678,7 @@ class Session:
         self.invalidate_image_acceptance()
         self.image_epoch = None
         self.tool_arrived.set()
-        if self.management_task and not self.management_task.done():
+        if self.management_task and not self.management_task.done() and not self.extension_commit_started:
             self.management_task.cancel()
         for task in [*self.permission_connections, *self.permissions, *self.ui_tasks]:
             task.cancel()
@@ -1734,6 +1758,7 @@ class Session:
             await self.end_children()
         except Exception as failure:  # A card left open must not keep the worker's resources.
             print(f"[aelix-acp] Could not close the children's cards: {type(failure).__name__}", file=sys.stderr)
+        await self.live_history.flush()
         if self.worker_job:
             self.worker_job.close()
             self.worker_job = None
@@ -1741,14 +1766,16 @@ class Session:
             self.socket_server.close()
             await self.socket_server.wait_closed()
             self.socket_server = None
-        if self.fork_peer_lease:
-            self.fork_peer_lease.close()
-            self.fork_peer_lease = None
-        if self.lease:
-            self.lease.close()
-            self.lease = None
-        if self.socket_dir:
-            shutil.rmtree(self.socket_dir, ignore_errors=True)
-            self.socket_dir = None
-        if self.server.sessions.get(self.id) is self:
-            self.server.sessions.pop(self.id, None)
+        # Publication owns the lease and worker files until the save and registration settle.
+        async with self.publication_lock:
+            if self.fork_peer_lease:
+                self.fork_peer_lease.close()
+                self.fork_peer_lease = None
+            if self.lease:
+                self.lease.close()
+                self.lease = None
+            if self.socket_dir:
+                shutil.rmtree(self.socket_dir, ignore_errors=True)
+                self.socket_dir = None
+            if self.server.sessions.get(self.id) is self:
+                self.server.sessions.pop(self.id, None)

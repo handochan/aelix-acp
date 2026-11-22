@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import json
 import os
+import signal
 from pathlib import Path
 import sqlite3
 import sys
@@ -10,8 +11,9 @@ import tempfile
 import textwrap
 import unittest
 
-from support import AcpClient
-from aelix_acp.wire.errors import SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH
+from support import AcpClient, process_alive
+from aelix_acp.runtime.leases import acquire as acquire_lease
+from aelix_acp.wire.errors import ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH
 
 EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
 SELECTOR_PROFILE = (
@@ -24,6 +26,60 @@ def setup(api):
         if event.model.id == "one" and getattr(event.previous_model, "id", None) == "two":
             raise RuntimeError("fixture refused selector restoration")
     api.on("model_select", reject)
+"""
+
+
+PUBLICATION_PROBE = """import asyncio
+import json
+from pathlib import Path
+import sys
+from unittest.mock import patch
+
+from aelix_acp.server import main
+from aelix_acp.session import Session
+from aelix_acp.runtime import store
+
+root = Path.cwd()
+original_save = Session.save
+original_write = store._write_store
+
+
+async def save(session, *args, **kwargs):
+    armed = root / "publication-armed"
+    if kwargs.get("live") and armed.exists():
+        mode = armed.read_text(encoding="utf-8")
+        caller = sys._getframe(1).f_code.co_name
+        if caller == mode:
+            armed.unlink()
+            candidate = root / "publication-candidate.tmp"
+            candidate.write_text(json.dumps([session.id, session.proc.pid]), encoding="utf-8")
+            candidate.replace(root / "publication-candidate")
+            async with asyncio.timeout(15):
+                while not (root / "publication-enter").exists():
+                    await asyncio.sleep(0.01)
+            (root / "publication-writing").touch()
+    return await original_save(session, *args, **kwargs)
+
+
+def write(directory, operation, args, check_commit):
+    if (check_commit is not None and operation is store.save_session
+            and args[1].get("extensionOverrides") and (root / "publication-pause-commit").exists()):
+        import time
+        original_check = check_commit
+
+        def check_commit():
+            original_check()
+            (root / "publication-admitted").touch()
+            deadline = time.monotonic() + 15
+            while not (root / "publication-commit").exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Publication test did not release commit")
+                time.sleep(0.01)
+    return original_write(directory, operation, args, check_commit)
+
+
+with patch.object(Session, "save", save), patch.object(store, "_write_store", write):
+    main()
 """
 
 
@@ -140,6 +196,107 @@ def setup(api):
 
     async def manage(self, action, arguments=None):
         return await self.client.request("_aelix/manage", {"sessionId": self.session, "action": action, "arguments": arguments or {}})
+
+    def publication_probe(self):
+        script = self.root / "publication-probe.py"
+        script.write_text(PUBLICATION_PROBE, encoding="utf-8")
+        return (str(script),)
+
+    async def publication_marker(self, name):
+        path = self.root / f"publication-{name}"
+        async with asyncio.timeout(15):
+            while not path.exists():
+                await asyncio.sleep(0.01)
+        return path
+
+    @contextlib.asynccontextmanager
+    async def hold_final_save(self, caller, action):
+        (self.root / "publication-armed").write_text(caller, encoding="utf-8")
+        request = asyncio.create_task(action)
+
+        async def settle_request():
+            (self.root / "publication-enter").touch()
+            (self.root / "publication-commit").touch()
+            await asyncio.gather(request, return_exceptions=True)
+
+        self.addAsyncCleanup(settle_request)
+        path = await self.publication_marker("candidate")
+        session_id, pid = json.loads(path.read_text(encoding="utf-8"))
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3", timeout=0)) as db:
+            async with asyncio.timeout(8):
+                while True:
+                    try:
+                        db.execute("BEGIN IMMEDIATE")
+                        break
+                    except sqlite3.OperationalError as error:
+                        if error.sqlite_errorcode & 255 != sqlite3.SQLITE_BUSY:
+                            raise
+                        await asyncio.sleep(0.01)
+            (self.root / "publication-enter").touch()
+            try:
+                await self.publication_marker("writing")
+                yield request, db, session_id, pid
+            finally:
+                db.rollback()
+
+    async def terminate_publication_worker(self, pid):
+        if os.name == "nt":
+            # The PID is the adapter-owned launch gate. End its native child as well.
+            taskkill = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "taskkill.exe"
+            killer = await asyncio.create_subprocess_exec(str(taskkill), "/PID", str(pid), "/T", "/F",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            self.assertEqual(await asyncio.wait_for(killer.wait(), 5), 0)
+        else:
+            os.kill(pid, signal.SIGKILL)
+        async with asyncio.timeout(8):
+            while process_alive(pid):
+                await asyncio.sleep(0.01)
+
+    async def test_worker_exit_during_final_save_keeps_lease_and_refuses_registration(self):
+        for mode in ("restart", "load", "fork", "new"):
+            with self.subTest(mode=mode):
+                await self.client.close()
+                for marker in self.root.glob("publication-*"):
+                    marker.unlink()
+                self.client = await AcpClient.start(self.root, EXECUTABLE, entry=self.publication_probe())
+                if mode != "new":
+                    self.session = await self.open_managed(self.client)
+                if mode == "fork":
+                    await self.prompt("Fork parent", fork_head="publication")
+                    action = self.client.request("session/fork", self.fork_params("publication"))
+                    caller = "fork_head"
+                elif mode == "load":
+                    await self.client.request("session/close", {"sessionId": self.session})
+                    action = self.client.request("session/load", {"sessionId": self.session, "cwd": str(self.root), "mcpServers": []})
+                    caller = "dispatch_request"
+                elif mode == "new":
+                    action = self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []})
+                    caller = "start"
+                else:
+                    action = self.manage("workspace/trust", {"trusted": False})
+                    caller = "restart"
+                async with self.hold_final_save(caller, action) as (request, db, session_id, pid):
+                    target = None
+                    if mode == "fork":
+                        (target,) = db.execute("SELECT file FROM pending_forks WHERE session_id=?", (session_id,)).fetchone()
+                    await self.terminate_publication_worker(pid)
+                    await self.client.request("session/list", {}, timeout=8)
+                    with self.assertRaises(ProtocolError) as busy:
+                        with acquire_lease(str(self.root / "state"), session_id):
+                            pass
+                    self.assertEqual(busy.exception.code, SESSION_LOCKED)
+                    self.assertFalse(request.done())
+                with self.assertRaises(RuntimeError) as error:
+                    await request
+                self.assertEqual(json.loads(str(error.exception))["data"]["kind"], "session_worker_unavailable")
+                with acquire_lease(str(self.root / "state"), session_id):
+                    pass
+                if mode in {"fork", "new"}:
+                    with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+                        for table, key in [("sessions", "id"), ("pending_forks", "session_id")]:
+                            self.assertIsNone(db.execute(f"SELECT 1 FROM {table} WHERE {key}=?", (session_id,)).fetchone())
+                if target is not None:
+                    self.assertFalse(Path(target).exists())
 
     async def test_mcp_servers_are_forwarded_and_tools_can_be_selected(self):
         import sys
@@ -1420,7 +1577,7 @@ def setup(api):
         return {"id": name, "defaultEnabled": default_enabled, "reference": f"{name}:setup"}
 
     async def managed_adapter(self, generation, *entries, operator_extensions=(), studio_managed=False,
-                              trust_project=False, launch_setup=""):
+                              trust_project=False, launch_setup="", entry=("-m", "aelix_acp.server"), native_python=sys.executable):
         installed = self.root / "installed"
         installed.mkdir(exist_ok=True)
         snapshot = self.root / f"{generation}.json"
@@ -1432,7 +1589,8 @@ def setup(api):
             f"{launch_setup}\n"
             "from aelix_coding_agent.cli.entry import main_sync\nmain_sync()\n", encoding="utf-8"
         )
-        adapter = await AcpClient.start(self.root, sys.executable, prefix=(str(launcher),), extensions=operator_extensions,
+        adapter = await AcpClient.start(self.root, native_python, prefix=(str(launcher),), extensions=operator_extensions,
+                                        entry=entry,
                                         adapter_args=("--managed-extensions", str(snapshot),
                                                       *(["--trust-project"] if trust_project else [])),
                                         extra_env={"AELIX_ACP_STUDIO_MANAGED": "1"} if studio_managed else None)
@@ -1571,6 +1729,67 @@ def setup(api):
         await adapter.request("session/prompt", {"sessionId": session,
             "prompt": [{"type": "text", "text": "/extension disable lazy-pack"}]})
         self.assertEqual((await self.managed_states(adapter, session))["lazy-pack"], "disabled")
+
+    async def publication_managed_worker(self):
+        extension = self.managed_module("publication_change", "def setup(api): pass\n")
+        python = Path(EXECUTABLE).with_name("python.exe" if os.name == "nt" else "python")
+        client = await self.managed_adapter("publication", extension, entry=self.publication_probe(),
+                                            native_python=str(python) if python.is_file() else sys.executable)
+        return client, await self.open_managed(client), extension
+
+    async def test_stop_before_final_extension_commit_restores_the_saved_worker(self):
+        client, session_id, extension = await self.publication_managed_worker()
+        change = self.managed_request(client, session_id, "set", extensionId=extension["id"], value="on")
+        async with self.hold_final_save("restart", change) as (request, _, candidate, _):
+            self.assertEqual(candidate, session_id)
+            self.assertEqual(await client.request("session/cancel", {"sessionId": session_id}, timeout=8), {})
+            self.assertFalse(request.done())
+        with self.assertRaises(RuntimeError) as error:
+            await request
+        payload = json.loads(str(error.exception))
+        self.assertEqual((payload["code"], payload["data"]["reason"], payload["data"]["recovered"]),
+                         (-32003, "cancelled", True))
+        self.assertEqual(await self.managed_states(client, session_id), {extension["id"]: "disabled"})
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            (value,) = db.execute("SELECT value FROM preferences WHERE session_id=?", (session_id,)).fetchone()
+        self.assertNotIn("extensionOverrides", json.loads(value))
+
+    async def test_stop_after_extension_commit_admission_preserves_success(self):
+        client, session_id, extension = await self.publication_managed_worker()
+        (self.root / "publication-pause-commit").touch()
+        change = self.managed_request(client, session_id, "set", extensionId=extension["id"], value="on")
+        async with self.hold_final_save("restart", change) as (request, _, _, _):
+            self.assertFalse(request.done())
+        try:
+            await self.publication_marker("admitted")
+            self.assertEqual(await client.request("session/cancel", {"sessionId": session_id}, timeout=8), {})
+            self.assertFalse(request.done())
+        finally:
+            (self.root / "publication-commit").touch()
+        result = await request
+        self.assertEqual(result["extensions"][0]["state"], "active")
+        self.assertEqual(await self.managed_states(client, session_id), {extension["id"]: "active"})
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            (value,) = db.execute("SELECT value FROM preferences WHERE session_id=?", (session_id,)).fetchone()
+        self.assertEqual(json.loads(value)["extensionOverrides"], {extension["id"]: "on"})
+
+    async def test_worker_exit_after_commit_admission_refuses_registration(self):
+        client, session_id, extension = await self.publication_managed_worker()
+        (self.root / "publication-pause-commit").touch()
+        change = self.managed_request(client, session_id, "set", extensionId=extension["id"], value="on")
+        async with self.hold_final_save("restart", change) as (request, _, _, pid):
+            self.assertFalse(request.done())
+        try:
+            await self.publication_marker("admitted")
+            await self.terminate_publication_worker(pid)
+        finally:
+            (self.root / "publication-commit").touch()
+        with self.assertRaises(RuntimeError) as error:
+            await request
+        payload = json.loads(str(error.exception))
+        self.assertEqual((payload["code"], payload["data"]["reason"], payload["data"]["recovered"]),
+                         (-32004, "session_worker_closed_after_commit", True))
+        self.assertEqual(await self.managed_states(client, session_id), {extension["id"]: "active"})
 
     async def test_cancel_managed_module_replacement_restores_previous_worker(self):
         installed = self.root / "installed"

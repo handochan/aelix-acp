@@ -192,7 +192,7 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
     async def test_delete_reserves_the_actor_until_its_records_are_removed(self):
         self.server.sessions[self.session.id] = self.session
         self.session.cwd = str(self.root.resolve())
-        self.session.save()
+        await self.session.save()
         entered, release = asyncio.Event(), asyncio.Event()
         async def close():
             entered.set()
@@ -232,12 +232,13 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_starts_reserve_the_process_limit(self):
         self.server.args.max_sessions = 1
         entered, release = asyncio.Event(), asyncio.Event()
-        class Starting:
+        class Starting(Session):
             instances = 0
-            def __init__(self, server, identifier, cwd, **_options):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
                 Starting.instances += 1
-                self.id = identifier
-                self.mutation_lock = asyncio.Lock()
+            def require_live_worker(self):
+                pass
             async def start(self, filename):
                 entered.set()
                 await release.wait()

@@ -63,7 +63,11 @@ Changing extensions, trust or delegation restarts the child, preserving the
 transcript and ACP identity. Client MCP configuration and UI support rebind
 in memory. Supported session controls restore from saved preferences.
 Branching creates a new file and ACP identity, restores the parent and leaves
-navigation to Studio. Close preserves the index.
+navigation to Studio. Close preserves the index. A candidate worker keeps its
+lease through the final save and registration. ACP checks the worker and lease
+before commit and before publishing the live session. If the worker exits
+before commit admission, the save rolls back. An exit observed after commit
+rejects the live open and retains the committed session for `session/load`.
 
 ## Approval and trusted extensions
 
@@ -104,12 +108,25 @@ Reusing a key for different content is rejected. Running/interrupted outcomes
 are unresolved and never replayed blindly. Definitively invalid requests retain
 their structured error. Without a client key each prompt is new.
 
-Display history includes control replies, thoughts and tool updates. Stream
-events commit in short transactions per update; an open model stream does not
-retain SQLite's writer lock. A hard kill can still lose chunks not yet received.
-Native transcript and SQLite are not one transaction. This is not exactly-once
-external effects or automatic crash-safe task continuation. A timeout does
-not prove a tool did nothing. Protect history as sensitive user data.
+Display history includes control replies, thoughts and tool updates. Each
+live session queues updates in order and commits short SQLite batches off the
+RPC reader. Approval replies and Stop ACKs continue while SQLite waits for a
+writer. The queue includes the in-flight batch and has per-session limits
+of 1,024 updates and 32 MiB of UTF-8 JSON. Overflow emits
+`history_backlog_overflow`, flushes the accepted prefix, and stops recording
+later updates on that open session. A failed batch rolls back and emits
+`history_write_failed`. Live notifications and controls continue in either
+case. Reopening replays the durable prefix, and the new worker can record
+new updates.
+
+Prompt input history and the running receipt commit before dispatch. Turn
+completion waits for its queued history before writing the outcome receipt.
+If that write fails, `turn_receipt_write_failed` is reported and the original
+outcome is returned. The running receipt prevents automatic replay. A graceful
+close drains accepted updates before releasing the session lease. A hard kill
+can lose uncommitted history. Native transcript and SQLite use independent
+transactions. A timeout leaves external tool effects uncertain. Protect
+history as sensitive user data.
 
 The native `agent_end` closes a provider attempt. ACP prompt completion instead
 waits for native `get_state.isStreaming` to become false, including retries and

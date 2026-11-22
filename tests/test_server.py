@@ -1,4 +1,6 @@
 import asyncio
+from contextlib import redirect_stderr
+import io
 import sqlite3
 import json
 from pathlib import Path
@@ -29,6 +31,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.session = Session(self.server, "test-session", self.tmp.name)
 
     async def asyncTearDown(self):
+        await self.session.live_history.flush()
         self.server.db.close()
         self.tmp.cleanup()
 
@@ -114,6 +117,22 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         listener.close()
         await listener.wait_closed()
 
+    async def test_expired_consent_denies_without_a_client_reply(self):
+        await self.session.event({"type": "tool_execution_start", "toolCallId": "expiry", "toolName": "write", "args": {}})
+        listener = await asyncio.start_server(self.session.permission, "127.0.0.1", 0)
+        async with listener:
+            reader, writer = await asyncio.open_connection(*listener.sockets[0].getsockname())
+            try:
+                with patch("aelix_acp.server.CLIENT_REQUEST_SECONDS", 0.01):
+                    writer.write(b'{"toolCallId":"expiry","name":"write","args":{}}\n')
+                    await writer.drain()
+                    self.assertEqual(json.loads(await asyncio.wait_for(reader.readline(), 2)), {"allow": False})
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        self.assertEqual([event["method"] for event in self.events].count("session/request_permission"), 1)
+        self.assertFalse(self.server.pending)
+
     async def test_authenticated_bridge_may_arrive_before_the_stdout_tool_event(self):
         self.session.permission_token = "secret"
         self.session.controls.permission_mode = "yolo"
@@ -174,7 +193,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             return {"contextUsage": {"tokens": used, "contextWindow": 32768}, "cost": 2}
         self.session.rpc = rpc
         await self.session.publish_context_usage()
-        self.session.save()
+        await self.session.save()
         restored = Session(self.server, self.session.id, self.tmp.name)
         restored.context.restore(load_preferences(self.server.db, restored.id)["lastContextMeasurement"])
         restored.rpc = rpc
@@ -240,7 +259,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_compaction_recovery_cannot_rewrite_preferences_under_another_lease(self):
         from aelix_acp.runtime.store import save_preferences
         self.session.controls.permission_mode = "yolo"
-        self.session.save()
+        await self.session.save()
         await self.session.close()
         self.session.compaction_recovery_needed = True
         self.server.sessions[self.session.id] = self.session
@@ -376,15 +395,35 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bookkeeping_failure_keeps_the_not_retryable_marking(self):
         self.native(failure="provider rejected the request")
-        record = __import__("aelix_acp.session", fromlist=["append_event"]).append_event
-        def broken(*args):
-            if not self.session.dispatched:
-                return record(*args)
-            raise sqlite3.OperationalError("database is locked")
-        with patch("aelix_acp.session.append_event", broken), patch("aelix_acp.session.finish_turn", broken):
+        insert_batch = self.session.live_history.insert_batch
+
+        def broken_history(db, rows):
+            if any(json.loads(value)["sessionUpdate"] == "agent_message_chunk" for _, value in rows):
+                raise sqlite3.OperationalError("private SQLite detail")
+            return insert_batch(db, rows)
+
+        blocks = [{"type": "text", "text": "Respond"}]
+        with (patch.object(self.session.live_history, "insert_batch", broken_history),
+              patch("aelix_acp.session.finish_turn", side_effect=sqlite3.OperationalError("private receipt detail")),
+              redirect_stderr(io.StringIO()) as diagnostics):
             with self.assertRaises(ProtocolError) as caught:
-                await self.session.prompt([{"type": "text", "text": "Respond"}])
+                await self.session.prompt(blocks, "receipt")
         self.assertEqual(caught.exception.code, TURN_FAILED_AFTER_DISPATCH)
+        self.assertEqual(diagnostics.getvalue(), "history_write_failed\nturn_receipt_write_failed\n")
+        with self.assertRaises(ProtocolError) as duplicate:
+            await self.session.prompt(blocks, "receipt")
+        self.assertEqual(duplicate.exception.code, -32006)
+        self.assertEqual(duplicate.exception.data["state"], "running")
+
+    async def test_many_prompt_blocks_are_recorded_without_overflowing_the_live_backlog(self):
+        written = self.native()
+        self.session.live_history.max_events = 2
+        blocks = [{"type": "text", "text": str(i)} for i in range(5)]
+        self.assertEqual(await self.session.prompt(blocks), {"stopReason": "end_turn"})
+        self.assertEqual(written[0], "prompt")
+        self.assertIsNone(self.session.live_history.failure)
+        values = self.server.db.execute("SELECT value FROM events ORDER BY sequence").fetchall()
+        self.assertEqual([json.loads(value)["content"] for value, in values], blocks)
 
     async def test_failure_before_anything_reaches_native_keeps_its_code(self):
         self.native(running=False)

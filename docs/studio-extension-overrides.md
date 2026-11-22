@@ -182,9 +182,11 @@ requests use the existing ACP errors (`-32000` or `-32003`). `-32004` carries a 
 `managed_extension_change_failed`. When a change fails,
 `data` includes the requested `extensionId`, reason and `recovered` status.
 If verification fails in the change candidate, `failedExtensionId`
-identifies that entry. `recovered` reports the later rollback result.
-Cancellation during worker replacement uses the same recovery path and
-returns `-32003`.
+identifies that entry. `recovered` reports whether ACP restored a worker from durable preferences.
+Stop can cancel the replacement until ACP authorizes the final SQLite commit. If Stop
+wins, the write rolls back, ACP reopens the saved worker and the change returns
+`-32003`. After commit admission, Stop still reaches native and the change
+returns the commit outcome.
 
 ## Worker startup and recovery
 
@@ -200,10 +202,12 @@ selection before persisting the override in `sessions.sqlite3`. Selected
 extensions must be active or registered for on-demand activation. Unselected
 extensions must be absent. If any entry fails verification, ACP reopens with
 the previous preferences and verifies registration of every managed extension selected
-by that configuration. If startup or registration fails during recovery,
+by that configuration. If the candidate exits before commit admission, the
+write rolls back. If it exits after commit and before registration, ACP reports
+`session_worker_closed_after_commit` as the reason and recovers the committed
+selection. If startup or registration fails during recovery,
 ACP reports `recovered: false`, closes the worker, and the client can retry
-using `session/load`. The saved history and previous override are
-retained. A request that loses its response can read back the current
+using `session/load`. The saved history and last committed override are retained. A request that loses its response can read back the current
 override after reconnecting. Session changes do not write native
 `selections/set` global or project preferences.
 

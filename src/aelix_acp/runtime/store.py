@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from contextlib import closing
 import json
+from itertools import islice
 import os
 from pathlib import Path
 import sqlite3
+import sys
 from threading import Event
 from time import monotonic
+
+from ..wire.errors import ProtocolError
 
 WRITE_TIMEOUT = 10
 
@@ -36,6 +41,65 @@ def open_store(directory: str) -> sqlite3.Connection:
         PRIMARY KEY(session_id,position)) WITHOUT ROWID""")
     db.commit()
     return db
+
+
+async def write_store(directory, write, *args, diagnostic="session_store_write_failed", before_commit=None):
+    """Run a write on its own connection, keeping the caller's lease through commit."""
+    cancelled = False
+    if before_commit is not None:
+        loop = asyncio.get_running_loop()
+        owner = asyncio.current_task()
+        prior_cancels = owner.cancelling()
+
+        async def admit():
+            # Serialize admission with Stop and worker exit on the event loop.
+            if cancelled or owner.cancelling() > prior_cancels:
+                raise ProtocolError("session_publication_cancelled", -32003)
+            before_commit()
+
+        def check_commit():
+            asyncio.run_coroutine_threadsafe(admit(), loop).result()
+    else:
+        check_commit = None
+    task = asyncio.create_task(asyncio.to_thread(_write_store, directory, write, args, check_commit))
+    while True:
+        try:
+            result, failure = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    if isinstance(failure, (sqlite3.Error, OSError, ValueError, TypeError)):
+        raise ProtocolError(diagnostic, -32603, {"kind": diagnostic}) from None
+    if failure is not None:
+        raise failure
+    return result
+
+
+def _write_store(directory, write, args, check_commit):
+    try:
+        filename = Path(directory).expanduser() / "sessions.sqlite3"
+        if filename.is_symlink():
+            raise ValueError("Session database must not be a symbolic link")
+        with closing(sqlite3.connect(filename, timeout=WRITE_TIMEOUT)) as db, db:
+            db.execute("PRAGMA synchronous=FULL")
+            result = write(db, *args)
+            if check_commit is not None:
+                check_commit()
+            return result, None
+    except Exception as failure:
+        return None, failure
+
+
+def save_session(db, row, preferences, inherited_history=None):
+    db.execute("INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?,?)", row)
+    save_preferences(db, row[0], preferences)
+    if inherited_history is not None:
+        insert_history(db, row[0], inherited_history)
+        db.execute("DELETE FROM pending_forks WHERE session_id=?", (row[0],))
 
 
 def legacy_permission_mode(db: sqlite3.Connection, session_id: str):
@@ -80,22 +144,81 @@ def _write_busy(error):
     return (getattr(error, "sqlite_errorcode", 0) & 255) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
-async def append_live_event(db: sqlite3.Connection, session_id: str, update: dict) -> None:
-    """Keep live updates from busy-waiting behind a recovery or another writer."""
-    if update.get("sessionUpdate") not in HISTORY_UPDATES:
-        return
-    deadline = monotonic() + WRITE_TIMEOUT
-    while True:
-        db.execute("PRAGMA busy_timeout=0")
+class LiveHistory:
+    """One session's ordered recording, including the batch currently writing."""
+
+    def __init__(self, directory, session_id, *, max_events=1024, max_bytes=32 * 1024 * 1024):
+        self.directory = directory
+        self.session_id = session_id
+        self.max_events = max_events
+        self.max_bytes = max_bytes
+        self.pending = deque()
+        self.pending_bytes = 0
+        self.committed = 0
+        self.advanced = asyncio.Event()
+        self.worker = None
+        self.failure = None
+
+    def append(self, update, *, retry_if_full=False):
+        """Offer a record. A prompt producer can retry after a flush."""
+        if self.failure or update.get("sessionUpdate") not in HISTORY_UPDATES:
+            return True
         try:
-            append_event(db, session_id, update)
-            return
-        except sqlite3.OperationalError as exc:
-            if not _write_busy(exc) or monotonic() >= deadline:
-                raise
+            value = json.dumps(update, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (ValueError, TypeError, RecursionError):
+            self.fail("history_write_failed")
+            return True
+        if len(self.pending) >= self.max_events or self.pending_bytes + len(value) > self.max_bytes:
+            if retry_if_full and self.pending and len(value) <= self.max_bytes:
+                return False
+            self.fail("history_backlog_overflow")
+            return True
+        self.pending.append(value)
+        self.pending_bytes += len(value)
+        if self.worker is None:
+            self.advanced = asyncio.Event()
+            self.worker = asyncio.create_task(self.drain())
+        return True
+
+    def fail(self, code):
+        if self.failure != code:
+            print(code, file=sys.stderr)
+        self.failure = code
+
+    async def drain(self):
+        try:
+            while self.pending:
+                rows, size = [], 0
+                for value in islice(self.pending, 32):
+                    rows.append((self.session_id, value))
+                    size += len(value)
+                    if size >= 64 * 1024:
+                        break
+                await write_store(self.directory, self.insert_batch, rows)
+                for _ in rows:
+                    self.pending.popleft()
+                self.pending_bytes -= size
+                self.committed += len(rows)
+                self.advanced.set()
+                self.advanced = asyncio.Event()
+        except Exception:
+            self.fail("history_write_failed")
+            self.pending.clear()
+            self.pending_bytes = 0
         finally:
-            db.execute(f"PRAGMA busy_timeout={WRITE_TIMEOUT * 1000}")
-        await asyncio.sleep(0.01)
+            self.worker = None
+            self.advanced.set()
+
+    @staticmethod
+    def insert_batch(db, rows):
+        db.executemany("INSERT INTO events(session_id,value) VALUES(?,?)",
+                       ((session_id, value.decode("utf-8")) for session_id, value in rows))
+
+    async def flush(self):
+        # Only wait for the prefix accepted when the barrier was reached.
+        target = self.committed + len(self.pending)
+        while self.worker is not None and self.committed < target:
+            await self.advanced.wait()
 
 
 async def cache_recovered_history(directory: str, session_id: str, updates) -> None:
@@ -184,7 +307,6 @@ def history(db: sqlite3.Connection, session_id: str):
 
 def recorded_turn(db: sqlite3.Connection, session_id: str, request_key: str, fingerprint: str | None = None) -> dict | None:
     """Read an existing turn's outcome without claiming an unseen request."""
-    from ..wire.errors import ProtocolError
     row = db.execute("SELECT state,result,fingerprint FROM turns WHERE session_id=? AND request_key=?", (session_id, request_key)).fetchone()
     if row:
         if fingerprint is not None and row[2] is not None and row[2] != fingerprint:
