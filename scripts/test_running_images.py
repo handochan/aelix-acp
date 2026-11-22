@@ -11,30 +11,11 @@ from time import perf_counter
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from spike_image_window import EXTENSION, META, MIB, Probe, ProbeServer, digest
+from spike_image_window import EXTENSION, META, MIB, Probe, ProbeServer, digest, sse
+from spike_image_window_review import StderrCapture
 
-from aelix_acp import image_policy
+from aelix_acp import image_policy, session
 from aelix_acp.runtime import host_bytes
-
-QUEUED_HISTORY_FIXTURE = """
-from dataclasses import replace
-
-from aelix_agent_core.harness.hooks import MessageEndEventResult
-from aelix_ai.messages import ImageContent, TextContent
-
-def setup(api):
-    async def seed_history(event, ctx):
-        message = event.message
-        if message.role != "user" or not message.content or not isinstance(message.content[0], TextContent):
-            return None
-        if message.content[0].text.startswith(("history batch ", "count boundary ")):
-            content = [replace(block, source=ORIGIN) if isinstance(block, ImageContent) else block
-                       for block in message.content]
-            return MessageEndEventResult(message=replace(message, content=content))
-        return None
-
-    api.on("message_end", seed_history)
-"""
 
 
 def key(number):
@@ -108,10 +89,6 @@ class RunningImages(Probe):
                 }
             )
         )
-        queued_history = self.root / "queued-history.py"
-        queued_history.write_text(f"ORIGIN = {image_policy.RUNNING_IMAGE_SOURCE!r}\n" + QUEUED_HISTORY_FIXTURE)
-        self.provider_cap = 32
-        self.provider_raw_cap = 16 * MIB
         self.server = HostFixture(
             SimpleNamespace(
                 aelix=str(self.executable),
@@ -119,7 +96,7 @@ class RunningImages(Probe):
                 profile="coding",
                 provider=None,
                 model=None,
-                extension=[str(EXTENSION), str(queued_history)],
+                extension=[str(EXTENSION)],
                 permission_mode="yolo",
                 trust_project=False,
                 turn_timeout=60,
@@ -227,8 +204,8 @@ class RunningImages(Probe):
         return receipt
 
     async def exercise(self):
-        # Seed 32 MiB of marked history, then exercise the actual H-1 queue
-        # and ordinary provider tool results.
+        # The full window must count this ordinary history as well as the
+        # actual H-1 queue and ordinary provider tool results.
         for index in range(8):
             await self.prompt(f"history batch {index}", ["a.png", "b.png"])
         assert self.requests[-1]["rawBytes"] == 8 * MIB
@@ -331,8 +308,62 @@ class RunningImages(Probe):
         # Small images hit the count limit independently of the raw budget.
         for index in range(6):
             await self.prompt(f"count boundary {index}", ["f0.png", "f1.png", "f2.png", "f3.png"])
+        assert len(self.requests[-1]["images"]) == 20
         sample = await self.state()
         assert sample["keptCount"] == 20 and "image_count" in sample["reasons"]
+
+    async def request_boundaries(self):
+        async def fresh(binding):
+            await self.server.dispatch("session/close", {"sessionId": self.session_id})
+            self.binding = self.server.binding = binding
+            opened = await self.server.dispatch("session/new", self.open_params())
+            self.session_id = self.server.session_id = opened["sessionId"]
+
+        await fresh("twenty-plus-queue")
+        await self.prompt("twenty ordinary images", ["f0.png"] * 20)
+        assert len(self.requests[-1]["images"]) == 20 and self.requests[-1]["placeholders"] == 0
+        self.gate.clear()
+        self.server.grants["boundary"] = "f1.png"
+        # Hold a text-only provider response so the next native request adds
+        # exactly one queued image and no tool-result images.
+        with patch("spike_image_window.sse", side_effect=lambda model, **_: sse(model)):
+            turn = asyncio.create_task(self.prompt("run tool"))
+            try:
+                await asyncio.wait_for(self.arrivals.get(), 8)
+                receipt = await self.relay(
+                    "input/follow-up-images",
+                    {
+                        "turnId": await self.running_turn(),
+                        "requestId": key(31),
+                        "message": "queued boundary image",
+                        "grants": ["boundary"],
+                    },
+                )
+                assert receipt["accepted"]
+            finally:
+                self.gate.set()
+            await turn
+        assert self.requests[-1]["images"] == ["f0.png"] * 19 + ["f1.png"]
+        assert self.requests[-1]["placeholders"] == 1
+
+        await fresh("twenty-six")
+        await self.prompt("twenty-six ordinary images", ["f0.png"] * 26)
+        assert len(self.requests[-1]["images"]) == 20
+        assert self.requests[-1]["placeholders"] == 6
+
+        await fresh("raw-boundary")
+        large_labels = [f"boundary-{index}.png" for index in range(3)]
+        for label in large_labels:
+            self.add_image(label, 3_303_999)
+        await self.prompt("three ordinary large images", large_labels)
+        assert self.requests[-1]["images"] == large_labels[1:]
+        assert self.requests[-1]["rawBytes"] == 6_607_998
+        assert self.requests[-1]["placeholders"] == 1
+        self.results["fullRequestBoundaries"] = {
+            "twentyPlusQueued": 20,
+            "twentySix": 20,
+            "threeLargeRawBytes": 6_607_998,
+        }
 
     async def normal_image_comparison(self):
         # Compare the previous empty production route list with the candidate
@@ -379,26 +410,38 @@ class RunningImages(Probe):
         await self.server.dispatch("session/close", {"sessionId": self.session_id})
         self.server.host_bytes = None
         self.server.relay_enabled = False
-        await self.server.dispatch("session/load", {
-            "sessionId": self.session_id, "cwd": str(self.root), "mcpServers": [],
-        })
-        assert (Path(self.worker.socket_dir) / "image-ready").is_file()
-        await self.config("model", "fixture/two")
-        _, encoded = self.encoded(normal)
-        restored = (await self.worker.rpc("get_messages"))["messages"]
-        sources = [
-            block.get("source") or ""
-            for message in restored
-            if message["role"] == "user"
-            for block in message["content"]
-            if block.get("data") == encoded
-        ]
-        assert sources == ["", image_policy.RUNNING_IMAGE_SOURCE]
-        await self.prompt("model switch after reopen")
-        assert self.requests[-1]["images"].count(normal) == 1
-        assert self.requests[-1]["placeholders"] == 1
+        capture = StderrCapture(2)
+        debug_variables = {"OPENAI_LOG", "ANTHROPIC_LOG", "GEMINI_NEXT_GEN_API_LOG"}
+        quiet_env = {name: value for name, value in os.environ.items() if name not in debug_variables}
+        with (
+            patch.dict(os.environ, quiet_env, clear=True),
+            patch.object(session, "StdoutWriter", lambda fd: capture),
+        ):
+            await self.server.dispatch(
+                "session/load", {"sessionId": self.session_id, "cwd": str(self.root), "mcpServers": []}
+            )
+            assert (Path(self.worker.socket_dir) / "image-ready").is_file()
+            await self.config("model", "fixture/two")
+            _, encoded = self.encoded(normal)
+            restored = (await self.worker.rpc("get_messages"))["messages"]
+            sources = [
+                block.get("source") or ""
+                for message in restored
+                if message["role"] == "user"
+                for block in message["content"]
+                if block.get("data") == encoded
+            ]
+            assert sources == ["", image_policy.RUNNING_IMAGE_SOURCE]
+            await self.prompt("model switch after reopen")
+            assert self.requests[-1]["images"].count(normal) == 1
+            assert self.requests[-1]["placeholders"] == 1
+            await self.server.dispatch("session/close", {"sessionId": self.session_id})
+        assert b"data:image/" not in capture.data and b"HTTP Request:" not in capture.data
         self.results["unverifiedHistoryAfterLoad"] = {
-            "hostNegotiated": False, "ordinaryImage": 1, "queuedImageOmitted": 1,
+            "hostNegotiated": False,
+            "ordinaryImage": 1,
+            "queuedImageOmitted": 1,
+            "debugImageMarkers": 0,
         }
 
     async def run_live(self, stop_trials):
@@ -423,6 +466,12 @@ class RunningImages(Probe):
             try:
                 await self.startup()
                 await self.exercise()
+                await self.request_boundaries()
+                # All requests so far are for the negotiated, verified route.
+                assert all(
+                    row["rawBytes"] <= 8 * MIB and len(row["images"]) <= 20 and row["httpBytes"] <= 12 * MIB
+                    for row in self.requests
+                )
                 await self.normal_image_comparison()
             finally:
                 self.gate.set()

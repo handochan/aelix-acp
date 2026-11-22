@@ -290,11 +290,11 @@ class Session:
             args += ["-e", extension]
         # Consent sees arguments after other trusted extension hooks.
         args += ["-e", str(PACKAGE / "bridge.py")]
-        # A generic reopen or fork only needs the hook if the native history
-        # can carry queued input. Scan off the loop under the session lease.
-        policies = getattr(self.server, "image_policies", ())
+        # Only a Host-negotiated worker gets route budgets. A generic reopen
+        # or fork needs the hook solely to suppress marked queued history.
+        policies = getattr(self.server, "image_policies", ()) if self.private_host else ()
         history_file = fork_source["file"] if fork_source is not None else session_file
-        image_hook = bool(policies and self.private_host)
+        image_hook = bool(policies)
         if not image_hook and history_file and Path(history_file).is_file():
             image_hook = await asyncio.to_thread(image_policy.has_running_image, history_file)
         if image_hook:

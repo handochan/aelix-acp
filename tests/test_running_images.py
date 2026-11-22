@@ -125,8 +125,9 @@ class ImagePolicyTests(unittest.TestCase):
         encoded = base64.b64encode(raw).decode()
         url = "data:image/png;base64," + encoded
         messages = [
-            Message("user", [Text("retain text"), Image(data=image_policy.RUNNING_IMAGE_WIRE_PREFIX + encoded)]),
-            Message("user", [Image(data=encoded, source=image_policy.RUNNING_IMAGE_SOURCE) for _ in range(20)]),
+            Message("user", [Text("retain text"), Image(data=encoded)]),
+            Message("toolResult", [Image(source=url) for _ in range(19)]),
+            Message("user", [Image(data=image_policy.RUNNING_IMAGE_WIRE_PREFIX + encoded)]),
         ]
         projected, expected, stats = image_policy.project_images(
             messages, image_policy.limits(policy), Image, Text
@@ -147,8 +148,9 @@ class ImagePolicyTests(unittest.TestCase):
                 {
                     "type": "function_call_output",
                     "call_id": "call_fixture",
-                    "output": [{"type": "input_text", "text": "mixed"}, *([image] * 20)],
+                    "output": [{"type": "input_text", "text": "mixed"}, *([image] * 19)],
                 },
+                {"role": "user", "content": [image]},
             ]
         }
         image_policy.validate_payload(request, policy, expected)
@@ -307,21 +309,19 @@ class ImagePolicyTests(unittest.TestCase):
         budget = image_policy.limits(image_policy.VERIFIED_IMAGE_POLICIES[0])
         projection, images, _ = image_policy.project_images([message], budget, Image, Text)
         self.assertEqual(projection[0].content, replaced.content)
-        self.assertEqual(images.total(), 1)
+        self.assertEqual(images.total(), 2)
 
-    def test_queued_payload_does_not_charge_or_validate_ordinary_image_bytes(self):
-        policy = {**image_policy.VERIFIED_IMAGE_POLICIES[0], "bodyBytes": 1024, "count": 1}
+    def test_full_request_validator_counts_ordinary_images_and_rejects_remote(self):
+        policy = image_policy.VERIFIED_IMAGE_POLICIES[0]
         raw = png()
-        queued = {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(raw).decode()}
-        gif = "data:image/gif;base64," + base64.b64encode(b"fixture image" * 100).decode()
-        ordinary = {"type": "input_image", "image_url": gif}
-        payload = {"input": [{"role": "user", "content": [ordinary, queued]}]}
-        expected = Counter({("image/png", hashlib.sha256(raw).digest(), len(raw)): 1})
-        allowance = Counter({image_policy.url_key(gif): 1})
-        self.assertEqual(image_policy.validate_payload(payload, policy, expected, ordinary=allowance), payload)
-        payload["input"][0]["content"].append(queued)
+        part = {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(raw).decode()}
+        payload = {"input": [{"role": "user", "content": [part] * 26}]}
+        expected = Counter({("image/png", hashlib.sha256(raw).digest(), len(raw)): 20})
         with self.assertRaisesRegex(image_policy.ImageRejected, "^provider-image-limit$"):
-            image_policy.validate_payload(payload, policy, expected, ordinary=allowance)
+            image_policy.validate_payload(payload, policy, expected)
+        payload["input"][0]["content"] = [part, {**part, "image_url": "https://example.invalid/image.png"}]
+        with self.assertRaisesRegex(image_policy.ImageRejected, "^unmeasurable-provider-payload$"):
+            image_policy.validate_payload(payload, policy, expected)
 
     def test_running_history_marker_crosses_read_boundary(self):
         with TemporaryDirectory() as directory:

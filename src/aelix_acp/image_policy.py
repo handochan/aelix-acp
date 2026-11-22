@@ -211,30 +211,6 @@ def is_running_image(block):
     return block.source == RUNNING_IMAGE_SOURCE or block.data.startswith(RUNNING_IMAGE_WIRE_PREFIX)
 
 
-def url_key(url):
-    header, separator, data = url.partition(",") if url.startswith("data:") else ("", "", "")
-    return (header, data) if separator else ("", url)
-
-
-def ordinary_images(messages, image_type):
-    """Match normal image occurrences using the pinned OpenAI encoders' URL shape."""
-    images = Counter()
-    for message in messages:
-        if message.role not in ("user", "toolResult"):
-            continue
-        for block in message.content:
-            if not isinstance(block, image_type) or is_running_image(block):
-                continue
-            if block.data:
-                key = (f"data:{block.mime_type or 'image/png'};base64", block.data)
-            elif block.source.startswith(("data:", "http")):
-                key = url_key(block.source)
-            else:
-                key = ("data:image/png;base64", block.source)
-            images[key] += 1
-    return images
-
-
 def preserve_image_origin(message, image_type):
     if message.role != "user":
         return None
@@ -261,7 +237,7 @@ def project_images(original, budget, image_type, text_type):
             block = message.content[ci]
             if not isinstance(block, image_type):
                 continue
-            if not is_running_image(block):
+            if budget is None and not is_running_image(block):
                 continue
             tagged = block.data.startswith(RUNNING_IMAGE_WIRE_PREFIX)
             if cutoff is None:
@@ -389,11 +365,11 @@ def completions_images(payload):
             pending.extend(value)
 
 
-def validate_payload(payload, policy, expected, *, ordinary=None):
+def validate_payload(payload, policy, expected):
     """Validate the serialized image parts against the context window before HTTP."""
     try:
         wire = json.dumps(payload, allow_nan=False, ensure_ascii=True).encode("ascii")
-        if not ordinary and len(wire) > policy["bodyBytes"]:
+        if len(wire) > policy["bodyBytes"]:
             raise ImageRejected("provider-body-limit")
         body = json.loads(wire)
     except ImageRejected:
@@ -405,20 +381,9 @@ def validate_payload(payload, policy, expected, *, ordinary=None):
     urls = responses_images(body) if policy["route"][2] in RESPONSES_APIS else completions_images(body)
     images = Counter()
     image_count = raw_bytes = encoded_bytes = 0
-    checked_bytes = len(wire)
     budget = limits(policy)
-    ordinary = Counter(ordinary)
     for url in urls:
-        if not isinstance(url, str):
-            raise ImageRejected("unmeasurable-provider-payload")
-        key = url_key(url)
-        if ordinary[key]:
-            ordinary[key] -= 1
-            # Preserve the base route's capacity for ordinary images. Only
-            # their URL bytes are exempt, and only for matching occurrences.
-            checked_bytes -= len(json.dumps(url, ensure_ascii=True)) - 2
-            continue
-        if not url.startswith("data:"):
+        if not isinstance(url, str) or not url.startswith("data:"):
             raise ImageRejected("unmeasurable-provider-payload")
         image_count += 1
         if image_count > budget["count"]:
@@ -429,8 +394,6 @@ def validate_payload(payload, policy, expected, *, ordinary=None):
             raise ImageRejected("provider-image-limit")
         images[image] += 1
         encoded_bytes += len(url.partition(",")[2])
-    if checked_bytes > policy["bodyBytes"]:
-        raise ImageRejected("provider-body-limit")
     if images != expected:
         raise ImageRejected("provider-image-mismatch")
     # Verified routes declare a conservative visual token allowance. Count
@@ -440,7 +403,7 @@ def validate_payload(payload, policy, expected, *, ordinary=None):
         raise ImageRejected("unmeasurable-provider-payload")
     reserved_output = max(policy["outputTokens"], *(limit or 0 for limit in output_limits))
     if (
-        checked_bytes - encoded_bytes + image_count * policy["imageTokens"] + reserved_output
+        len(wire) - encoded_bytes + image_count * policy["imageTokens"] + reserved_output
         > policy["contextTokens"]
     ):
         raise ImageRejected("provider-context-limit")
@@ -480,37 +443,33 @@ def setup(api):
             event.messages, limits(policy) if policy else None, ImageContent, TextContent
         )
         epoch = epoch_path.read_text(encoding="ascii") if epoch_path.is_file() else None
-        ordinary = (
-            ordinary_images(messages, ImageContent) if policy and (images or stats["omittedCount"]) else None
-        )
-        projected = (model_fields(ctx.model) if ctx.model else None, images, stats, epoch, ordinary)
-        if images or stats["omittedCount"]:
+        projected = (model_fields(ctx.model) if ctx.model else None, images, stats, epoch)
+        if stats["omittedCount"] or images:
             return ContextResult(messages=messages)
 
     async def before_payload(event, ctx):
         nonlocal sending, sequence
         sending = None
         state_path.unlink(missing_ok=True)
-        if projected is None:
-            return
-        projected_route, expected, stats, epoch, ordinary = projected
         policy = policy_for(event.model, policies)
         route = model_fields(event.model) if event.model else None
-        if not policy or route != projected_route:
-            if expected:
-                raise ImageRejected("provider-route-changed")
+        if projected and projected[1] and (not policy or route != projected[0]):
+            raise ImageRejected("provider-route-changed")
+        if not policy:
             return
         if not isinstance(event.payload, dict) or event.payload.get("model") != route[1]:
-            if ordinary is not None:
-                raise ImageRejected("provider-route-changed")
-            return
-        if ordinary is not None:
-            payload = validate_payload(event.payload, policy, expected, ordinary=ordinary)
-        if epoch:
+            raise ImageRejected("provider-route-changed")
+        expected = projected[1] if projected and route == projected[0] else Counter()
+        payload = validate_payload(event.payload, policy, expected)
+        if projected and route == projected[0] and projected[3]:
             sequence += 1
-            sending = {"epoch": epoch, "requestSequence": sequence, "model": "/".join(route[:2]), **stats}
-        if ordinary is not None:
-            return BeforeProviderPayloadResult(payload=payload)
+            sending = {
+                "epoch": projected[3],
+                "requestSequence": sequence,
+                "model": "/".join(route[:2]),
+                **projected[2],
+            }
+        return BeforeProviderPayloadResult(payload=payload)
 
     async def after_response(event, ctx):
         nonlocal sending
