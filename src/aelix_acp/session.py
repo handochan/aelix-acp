@@ -290,7 +290,9 @@ class Session:
             args += ["-e", extension]
         # Consent sees arguments after other trusted extension hooks.
         args += ["-e", str(PACKAGE / "bridge.py")]
-        policies = self.server.image_policies if self.private_host else ()
+        # Apply the provenance projection even when a client reopens this
+        # worker without negotiating the Host byte-source capability.
+        policies = getattr(self.server, "image_policies", ())
         if policies:
             args += ["-e", str(PACKAGE / "image_policy.py")]
         self.image_generation = uuid.uuid4().hex
@@ -319,8 +321,8 @@ class Session:
         if self.private_host:
             for name in ("ANTHROPIC_LOG", "OPENAI_LOG", "GEMINI_NEXT_GEN_API_LOG"):
                 env.pop(name, None)
-            if policies:
-                env["AELIX_ACP_IMAGE_POLICIES"] = json.dumps(policies)
+        if policies:
+            env["AELIX_ACP_IMAGE_POLICIES"] = json.dumps(policies)
         guard_selectors = bool(saved_agent and resume_file)
         if guard_selectors:
             env["AELIX_ACP_SELECTOR_STARTUP_FILE"] = str(Path(resume_file).resolve())

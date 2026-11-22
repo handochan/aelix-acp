@@ -279,8 +279,6 @@ class RunningImages(Probe):
         assert self.requests[-1]["placeholders"] and not self.worker.rpc_closed
         await self.config("model", "fixture/two")
         assert (await self.state())["reason"] == "model-unverified"
-        await self.prompt("unverified model")
-        assert self.requests[-1]["images"] == []
         await self.config("model", "fixture/one")
 
         self.gate.clear()
@@ -309,6 +307,67 @@ class RunningImages(Probe):
         sample = await self.state()
         assert sample["keptCount"] == 20 and "image_count" in sample["reasons"]
 
+    async def normal_image_comparison(self):
+        # Compare the previous empty production route list with the candidate
+        # hook enabled on the same unqualified model and native HTTP sink.
+        await self.server.dispatch("session/close", {"sessionId": self.session_id})
+        policies = self.server.image_policies
+        observations = {}
+        normal = "steer-before.png"
+        for label, enabled_policies in (("base", ()), ("candidate", policies)):
+            self.server.image_policies = enabled_policies
+            self.binding = self.server.binding = "normal-" + label
+            opened = await self.server.dispatch("session/new", self.open_params())
+            self.session_id = self.server.session_id = opened["sessionId"]
+            await self.config("model", "fixture/two")
+            await self.prompt("normal image", [normal])
+            row = self.requests[-1]
+            observations[label] = {key: row[key] for key in ("status", "images", "placeholders", "rawBytes")}
+            if label == "base":
+                await self.server.dispatch("session/close", {"sessionId": self.session_id})
+        assert observations["base"] == observations["candidate"]
+        assert observations["candidate"]["images"] == [normal] and observations["candidate"]["status"] == 200
+        self.results["unverifiedNormalPrompt"] = {"identicalToBase": True, "images": 1, "placeholders": 0}
+
+        # Repeat the exact bytes via a running-input grant. Reopening with an
+        # unqualified model must remove only the queued occurrence.
+        await self.config("model", "fixture/one")
+        self.server.grants["same-bytes"] = normal
+        self.gate.clear()
+        prompt = asyncio.create_task(self.prompt("run tool"))
+        await asyncio.wait_for(self.arrivals.get(), 8)
+        receipt = await self.relay(
+            "input/steer-images",
+            {
+                "turnId": await self.running_turn(),
+                "requestId": key(40),
+                "message": "add the same image through running input",
+                "grants": ["same-bytes"],
+            },
+        )
+        assert receipt["accepted"]
+        self.gate.set()
+        await prompt
+        assert self.requests[-1]["images"].count(normal) == 2
+        await self.server.dispatch("session/close", {"sessionId": self.session_id})
+        self.binding = self.server.binding = "normal-restored"
+        await self.server.dispatch("session/load", {"sessionId": self.session_id, **self.open_params()})
+        await self.config("model", "fixture/two")
+        _, encoded = self.encoded(normal)
+        restored = (await self.worker.rpc("get_messages"))["messages"]
+        sources = [
+            block.get("source") or ""
+            for message in restored
+            if message["role"] == "user"
+            for block in message["content"]
+            if block.get("data") == encoded
+        ]
+        assert sources == ["", image_policy.RUNNING_IMAGE_SOURCE]
+        await self.prompt("model switch after reopen")
+        assert self.requests[-1]["images"].count(normal) == 1
+        assert self.requests[-1]["placeholders"] == 1
+        self.results["unverifiedHistoryAfterLoad"] = {"ordinaryImage": 1, "queuedImageOmitted": 1}
+
     async def run_live(self, stop_trials):
         self.fixtures(overflow=True)
         # Use the large tool case once at a time so the pinned window is
@@ -331,6 +390,7 @@ class RunningImages(Probe):
             try:
                 await self.startup()
                 await self.exercise()
+                await self.normal_image_comparison()
             finally:
                 self.gate.set()
                 if hasattr(self, "server"):

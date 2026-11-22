@@ -146,6 +146,7 @@ class ImagePolicyTests(unittest.TestCase):
                 {"role": "user", "content": [{"type": "input_text", "text": image_policy.PLACEHOLDER}]},
                 {
                     "type": "function_call_output",
+                    "call_id": "call_fixture",
                     "output": [{"type": "input_text", "text": "mixed"}, *([image] * 20)],
                 },
             ]
@@ -157,10 +158,23 @@ class ImagePolicyTests(unittest.TestCase):
 
     def test_responses_checks_raw_budget_after_decode(self):
         policy = image_policy.VERIFIED_IMAGE_POLICIES[0]
-        raw = png() + bytes(2_900_000)
-        part = {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(raw).decode()}
+        expected = Counter()
+        parts = []
+        for length in (
+            image_policy.MAX_FILE,
+            image_policy.MAX_FILE,
+            image_policy.MAX_REQUEST_BYTES - 2 * image_policy.MAX_FILE,
+        ):
+            header = png()
+            raw = header + bytes(length - len(header))
+            expected["image/png", hashlib.sha256(raw).digest(), length] += 1
+            parts.append(
+                {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(raw).decode()}
+            )
+        image_policy.validate_payload({"input": [{"role": "user", "content": tuple(parts)}]}, policy, expected)
+        parts[-1]["image_url"] = "data:image/png;base64," + base64.b64encode(raw + b"\0").decode()
         with self.assertRaisesRegex(image_policy.ImageRejected, "^provider-image-limit$"):
-            image_policy.validate_payload({"input": [{"role": "user", "content": [part] * 3}]}, policy, Counter())
+            image_policy.validate_payload({"input": [{"role": "user", "content": tuple(parts)}]}, policy, expected)
 
     def test_responses_rejects_malformed_parts_with_fixed_diagnostics(self):
         policy = image_policy.VERIFIED_IMAGE_POLICIES[0]
@@ -207,6 +221,93 @@ class ImagePolicyTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(image_policy.ImageRejected, "^unmeasurable-provider-payload$"):
             image_policy.validate_payload({"input": "malformed"}, policy, Counter())
+
+    def test_responses_materializes_sequences_and_ignores_tool_schema(self):
+        from collections import namedtuple
+
+        policy = image_policy.VERIFIED_IMAGE_POLICIES[0]
+        raw = png()
+        part = {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(raw).decode()}
+        expected = Counter({("image/png", hashlib.sha256(raw).digest(), len(raw)): 20})
+        pair = namedtuple("Parts", "text image")({"type": "input_text", "text": "mixed"}, part)
+        request = {
+            "input": (
+                {"role": "user", "content": pair},
+                {"type": "function_call_output", "call_id": "call_fixture", "output": (part,) * 19},
+            ),
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "example",
+                    "parameters": {"type": "object", "properties": {"example": {"enum": [part]}}},
+                }
+            ],
+        }
+        normalized = image_policy.validate_payload(request, policy, expected)
+        self.assertEqual(len(normalized["input"]), 2)
+        self.assertIsInstance(normalized["input"][0]["content"], list)
+        self.assertIsInstance(normalized["input"][1]["output"], list)
+        request["input"][1]["output"] += (part,)
+        with self.assertRaisesRegex(image_policy.ImageRejected, "^provider-image-limit$"):
+            image_policy.validate_payload(request, policy, expected)
+
+    def test_responses_rejects_unknown_null_and_file_inputs(self):
+        policy = image_policy.VERIFIED_IMAGE_POLICIES[0]
+        for entries in (
+            [None],
+            [{"type": "made_up", "role": "user", "content": "x"}],
+            [{"type": "input_file", "file_id": "private"}],
+            [{"role": "assistant", "content": [None]}],
+            [{"role": "user", "content": [{"type": "made_up"}]}],
+            [{"role": "user", "content": [{"type": "input_file", "file_id": "private"}]}],
+            [{"type": "function_call_output", "call_id": "call_fixture", "output": [None]}],
+            [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_fixture",
+                    "output": [{"type": "input_file", "file_id": "private"}],
+                }
+            ],
+            [{"type": "function_call_output", "call_id": "call_fixture", "output": range(1)}],
+            [{"type": "reasoning", "summary": [None]}],
+        ):
+            with (
+                self.subTest(entries=entries),
+                self.assertRaisesRegex(image_policy.ImageRejected, "^unmeasurable-provider-payload$"),
+            ):
+                image_policy.validate_payload({"input": entries}, policy, Counter())
+
+    def test_only_running_image_occurrences_are_placeholdered_for_unverified_route(self):
+        @dataclass
+        class Image:
+            data: str
+            source: str = ""
+            mime_type: str = "image/png"
+
+        @dataclass
+        class Text:
+            text: str
+
+        @dataclass
+        class Message:
+            role: str
+            content: list
+
+        encoded = base64.b64encode(png()).decode()
+        regular = Image(encoded)
+        queued = Image(image_policy.RUNNING_IMAGE_WIRE_PREFIX + encoded)
+        message = Message("user", [regular, queued])
+        replaced = image_policy.preserve_image_origin(message, Image)
+        self.assertEqual(replaced.content, [regular, Image(encoded, image_policy.RUNNING_IMAGE_SOURCE)])
+        for original in (message, replaced):
+            projection, images, stats = image_policy.project_images([original], None, Image, Text)
+            self.assertEqual(projection[0].content, [regular, Text(image_policy.PLACEHOLDER)])
+            self.assertFalse(images)
+            self.assertEqual(stats["reasons"], {"model-unverified": 1})
+        budget = image_policy.limits(image_policy.VERIFIED_IMAGE_POLICIES[0])
+        projection, images, _ = image_policy.project_images([message], budget, Image, Text)
+        self.assertEqual(projection[0].content, replaced.content)
+        self.assertEqual(images.total(), 2)
 
 
 class HostBytesTests(unittest.IsolatedAsyncioTestCase):
@@ -620,6 +721,22 @@ class HostFixtureTests(unittest.TestCase):
             escaped = json.dumps(marker, ensure_ascii=False)[1:-1].encode()
             self.assertIn(escaped, marker_variants(marker))
             self.assertNotEqual(escaped, marker.encode())
+
+    def test_codex_smoke_counts_unmatched_images_and_duplicate_digests(self):
+        script = Path(__file__).resolve().parents[1] / "scripts" / "test_running_images_codex.py"
+        smoke = runpy.run_path(str(script))
+        verify = smoke["verify_image_requests"]
+        error = smoke["ProbeFailed"]
+        text = {"stage": "wire", "inputImageCount": 0, "images": []}
+        known = {"stage": "wire", "inputImageCount": 1, "images": ["steer"]}
+        unknown = {"stage": "wire", "inputImageCount": 1, "images": []}
+        self.assertEqual(verify([text]), [])
+        self.assertEqual(verify([text, known], "steer"), [known])
+        with self.assertRaises(error):
+            verify([text, unknown])
+        for unexpected in (unknown, {**known, "inputImageCount": 2}, {**known, "images": ["follow"]}):
+            with self.subTest(unexpected=unexpected), self.assertRaises(error):
+                verify([known, unexpected], "steer")
 
 
 class NativeFrameTests(unittest.IsolatedAsyncioTestCase):

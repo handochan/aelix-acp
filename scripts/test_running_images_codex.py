@@ -8,6 +8,7 @@ import io
 import json
 import os
 import secrets
+import socket
 import sys
 import tempfile
 import time
@@ -18,6 +19,8 @@ PROVIDER = "openai-codex"
 MODEL = "gpt-6-luna"
 ORIGIN = "https://chatgpt.com/backend-api/codex/responses"
 H1 = "aelix/sessionRelay"
+TOOL = "a1b_probe"
+SANDBOX = "/usr/bin/sandbox-exec"
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -39,12 +42,56 @@ def credential(path):
         raise ProbeFailed("Fresh Codex OAuth credential unavailable") from None
 
 
+async def auth_sandbox(auth):
+    """Fail closed before launching ACP if the original auth dir is reachable."""
+    if sys.platform != "darwin" or not Path(SANDBOX).is_file():
+        raise ProbeFailed("The credential sandbox is unavailable")
+    parent = json.dumps(str(auth.parent), ensure_ascii=False)
+    profile = f"(version 1)(allow default)(deny file-read* file-write* (subpath {parent}))"
+    command = [SANDBOX, "-p", profile]
+    check = """import os, sys
+for flags in (os.O_RDONLY, os.O_WRONLY):
+    try:
+        fd = os.open(sys.argv[1], flags)
+    except PermissionError:
+        continue
+    os.close(fd)
+    raise SystemExit(1)
+"""
+    probe = await asyncio.create_subprocess_exec(
+        *command,
+        sys.executable,
+        "-c",
+        check,
+        str(auth),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    if await probe.wait() != 0:
+        raise ProbeFailed("Original auth store sandbox check failed")
+    return command
+
+
+def broker_credential():
+    # Only the parent has the auth path. The socket is inside its private
+    # temporary directory and is inherited as a path, never as a credential.
+    endpoint = os.environ.pop("ACP52_AUTH_SOCKET")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(5)
+        connection.connect(endpoint)
+        with connection.makefile("rb") as stream:
+            token, expires = json.loads(stream.readline(16_384))
+    if time.time() * 1000 >= expires:
+        raise ProbeFailed("Credential refresh needed")
+    return token, expires
+
+
 def native():
     import httpx
     from aelix_ai.oauth.auth_storage import AuthStorage
 
     root = Path(os.environ["ACP52_PROBE"])
-    access, expires = credential(Path(os.environ["ACP52_READ_ONLY_AUTH"]))
+    access, expires = broker_credential()
     audit = root / "http.jsonl"
     init = AuthStorage.__init__
     send = httpx.AsyncClient.send
@@ -85,7 +132,11 @@ def native():
         if body.get("model") != MODEL or body.get("store") is not False:
             report({"guard": "unexpected-route"})
             raise ProbeFailed("Unexpected Codex route")
-        images = set()
+        tools = body.get("tools")
+        if not isinstance(tools, list) or [item.get("name") for item in tools] != [TOOL]:
+            report({"guard": "unexpected-tools"})
+            raise ProbeFailed("The Codex request must have only the synthetic tool")
+        images = []
         for item in body.get("input", []):
             content = item.get("content", item.get("output", []))
             if isinstance(content, list):
@@ -93,7 +144,7 @@ def native():
                     if isinstance(part, dict) and part.get("type") == "input_image":
                         url = part["image_url"]
                         raw = base64.b64decode(url.partition(",")[2], validate=True)
-                        images.add(hashlib.sha256(raw).hexdigest())
+                        images.append(hashlib.sha256(raw).hexdigest())
         serial += 1
         number = serial
         label = (root / "active-case").read_text(encoding="ascii")
@@ -103,7 +154,8 @@ def native():
                 "stage": "wire",
                 "case": label,
                 "n": number,
-                "images": sorted(tag for tag, digest in tags.items() if digest in images),
+                "inputImageCount": len(images),
+                "images": sorted(tag for tag, digest in tags.items() for image in images if digest == image),
             }
         )
         # Hold only the initial transport of each synthetic turn. Let the
@@ -132,6 +184,19 @@ def native():
     from aelix_coding_agent.cli.entry import main_sync
 
     raise SystemExit(main_sync())
+
+
+def verify_image_requests(rows, expected=None):
+    wire = [row for row in rows if row["stage"] == "wire"]
+    if not wire:
+        raise ProbeFailed("No outgoing Codex request observed")
+    images = [row for row in wire if row["inputImageCount"]]
+    if expected is None:
+        if images:
+            raise ProbeFailed("Unexpected image during Stop")
+    elif not images or any(row["inputImageCount"] != 1 or row["images"] != [expected] for row in images):
+        raise ProbeFailed("Unexpected image count or digest")
+    return images
 
 
 class Peer:
@@ -216,7 +281,8 @@ class Peer:
 async def probe(root, auth, models):
     from PIL import Image, ImageDraw, ImageFont
 
-    token, _ = credential(auth)
+    token, expires = credential(auth)
+    command = await auth_sandbox(auth)
     before = hashlib.sha256(auth.read_bytes()).digest()
     home, workspace, agent = root / "home", root / "work", root / "agent"
     for path in (home, workspace, agent):
@@ -268,6 +334,19 @@ def setup(api):
         json.dumps({label: hashlib.sha256(raw).hexdigest() for label, raw in images.items()})
     )
 
+    auth_socket = root / "auth.sock"
+    credential_wire = (json.dumps([token, expires]) + "\n").encode()
+
+    async def handoff(_reader, writer):
+        try:
+            writer.write(credential_wire)
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    broker = await asyncio.start_unix_server(handoff, path=str(auth_socket))
+    auth_socket.chmod(0o600)
     env = {key: os.environ[key] for key in ("PATH", "TMPDIR") if key in os.environ}
     env.update(
         HOME=str(home),
@@ -276,37 +355,46 @@ def setup(api):
         AELIX_CODING_AGENT_DIR=str(agent),
         AELIX_AUTH_PATH=str(agent / "auth.json"),
         ACP52_PROBE=str(root),
-        ACP52_READ_ONLY_AUTH=str(auth),
+        ACP52_AUTH_SOCKET=str(auth_socket),
     )
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "aelix_acp.server",
-        "--state-dir",
-        str(root / "acp"),
-        "--aelix",
-        sys.executable,
-        "--aelix-arg",
-        str(Path(__file__).resolve()),
-        "--aelix-arg=--native",
-        "--permission-mode",
-        "yolo",
-        "--no-trust-project",
-        "--provider",
-        PROVIDER,
-        "--model",
-        MODEL,
-        "--extension",
-        str(tool),
-        "--turn-timeout",
-        "55",
-        cwd=workspace,
-        env=env,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=1024 * 1024,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            sys.executable,
+            "-m",
+            "aelix_acp.server",
+            "--state-dir",
+            str(root / "acp"),
+            "--aelix",
+            sys.executable,
+            "--aelix-arg",
+            str(Path(__file__).resolve()),
+            "--aelix-arg=--native",
+            "--aelix-arg=--no-builtin-tools",
+            "--aelix-arg=--tools",
+            f"--aelix-arg={TOOL}",
+            "--permission-mode",
+            "yolo",
+            "--no-trust-project",
+            "--provider",
+            PROVIDER,
+            "--model",
+            MODEL,
+            "--extension",
+            str(tool),
+            "--turn-timeout",
+            "55",
+            cwd=workspace,
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=1024 * 1024,
+        )
+    except BaseException:
+        broker.close()
+        await broker.wait_closed()
+        raise
     peer = Peer(proc, images)
     audit = root / "http.jsonl"
 
@@ -356,6 +444,12 @@ def setup(api):
             if state.get("budget") is None:
                 raise ProbeFailed("Selected native route is not allowlisted")
 
+            resources = await peer.call(
+                "_aelix/manage", {"sessionId": sid, "action": "resources/list", "arguments": {}}
+            )
+            if resources.get("activeTools") != [TOOL]:
+                raise ProbeFailed("The native worker must have only the synthetic tool active")
+
             prompt = (
                 "Call the a1b_probe tool once before answering. Then, if an image appears, reply with only "
                 "the five digits visible in the latest image. Do not guess and do not read any files."
@@ -395,7 +489,6 @@ def setup(api):
                 assert rejection == {"accepted": False, "reason": "stale-turn"}
                 assert end == {"stopReason": "cancelled"}
                 assert peer.grant_requests[label] == 1
-                assert all(label not in row.get("images", []) for row in events())
                 report[label] = {"pending": True, "cancelled": True, "pixelRequests": 0}
             else:
                 receipt = await asyncio.wait_for(relay("input/" + method, payload), 8)
@@ -407,8 +500,10 @@ def setup(api):
                 assert end == {"stopReason": "end_turn"}
                 assert marks[label] in "".join(peer.text[sid])
                 rows = [row for row in events() if row.get("case") == label]
-                outbound = next(row for row in rows if label in row.get("images", []))
-                assert any(row.get("n") == outbound["n"] and row.get("status") == 200 for row in rows)
+                outbound = verify_image_requests(rows, label)
+                assert any(
+                    row.get("n") == image["n"] and row.get("status") == 200 for row in rows for image in outbound
+                )
                 report[label] = {
                     "accepted": True,
                     "captionAdded": receipt["captionAdded"],
@@ -417,9 +512,15 @@ def setup(api):
                     "status": 200,
                 }
             await peer.call("session/close", {"sessionId": sid})
+            if label == "stop":
+                rows = [row for row in events() if row.get("case") == label]
+                verify_image_requests(rows)
+                assert any(row.get("status") == 200 for row in rows)
             print(json.dumps({label: report[label]}), flush=True)
         assert not any("guard" in row for row in events())
     finally:
+        broker.close()
+        await broker.wait_closed()
         diagnostic = await peer.finish()
         markers = [
             token.encode(),

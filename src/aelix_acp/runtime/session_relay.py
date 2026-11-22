@@ -331,7 +331,8 @@ class SessionRelay:
                 body, digest = await server.host_bytes.acquire(session.id, self.binding_id, ref,
                                                                min(budget["imageBytes"], left), current=current)
                 mime = image_policy.inspect_image(body, max_side=budget["sidePixels"])
-                images.append({"type": "image", "mimeType": mime, "data": base64.b64encode(body).decode("ascii")})
+                images.append({"type": "image", "mimeType": mime,
+                               "data": image_policy.RUNNING_IMAGE_WIRE_PREFIX + base64.b64encode(body).decode("ascii")})
                 digests.append(digest)
                 left -= len(body)
             del body
