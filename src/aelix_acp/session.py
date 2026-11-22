@@ -63,6 +63,10 @@ READ_ONLY_CONTROLS = frozenset({"capabilities", "resources/list", "settings/get"
 # child, not on the turn, so they never mark a running turn dispatched.
 CONCURRENT_CONTROLS = frozenset({"children/list", "children/events", "children/steer",
                                  "children/wrap_up", "children/stop"})
+# Native controls that run as long as their work does: the command deadline, and
+# commands/cancel when it passes. children/resume (aelix-ai #836) runs a resumed agent
+# in the foreground, as agents/run runs a new one.
+LONG_CONTROLS = frozenset({"commands/run", "auth/login", "resources/reload", "agents/run", "children/resume"})
 # A cancelled turn that still streams is aborted again at native's own grace
 # (aelix-ai harness/core.py _REABORT_GRACE_SECONDS), not at every 50 ms poll.
 REABORT_SECONDS = 2.0
@@ -702,7 +706,7 @@ class Session:
             try:
                 return await asyncio.wait_for(future, _timeout)
             except TimeoutError:
-                if command == "aelix_control" and kwargs.get("method") in {"commands/run", "auth/login", "resources/reload", "agents/run"}:
+                if command == "aelix_control" and kwargs.get("method") in LONG_CONTROLS:
                     with contextlib.suppress(ProtocolError, TimeoutError):
                         await self.rpc("aelix_control", method="commands/cancel", params={}, _timeout=5)
                 elif command == "compact":

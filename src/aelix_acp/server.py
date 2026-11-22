@@ -34,17 +34,20 @@ from .runtime.leases import lease_path
 from .runtime import forks, host_bytes, native_history, session_relay
 from .runtime.children import NESTED_TOOL_CALLS, nested_only
 
-from .session import CONCURRENT_CONTROLS, Session, text_content, tool_call
+from .session import CONCURRENT_CONTROLS, LONG_CONTROLS, Session, text_content, tool_call
 from .wire.errors import session_changing
 
 __all__ = ["Server", "Session", "ProtocolError", "main", "tool_call", "text_content"]
 SESSION_MUTATIONS = {"session/load", "session/fork", "session/delete", "session/close", "session/prompt",
                      "session/set_mode", "session/set_model", "session/set_config_option", "_aelix/manage"}
 # `_aelix/manage` actions forwarded to native control when native lists them.
+# children/resume (aelix-ai #836): native resumes a stopped delegated agent in the
+# foreground, as agents/run runs one, so it shares agents/run's deadline and cancel.
 MANAGE_ACTIONS = frozenset({"resources/list", "resources/reload", "settings/get", "settings/set", "tools/set_active",
                             "mcp/status", "mcp/configure", "auth/status", "auth/set_api_key", "auth/login",
                             "auth/logout", "extensions/list", "agents/list", "agents/show", "agents/use",
-                            "agents/run", "permissions/get", "children/notices", *CONCURRENT_CONTROLS})
+                            "agents/run", "permissions/get", "children/notices", "children/resume",
+                            *CONCURRENT_CONTROLS})
 # How long the adapter waits for the client's answer to a request it sent, unless the caller says.
 CLIENT_REQUEST_SECONDS = 290
 
@@ -585,7 +588,7 @@ class Server:
                     result = await session.configure_mcp(arguments.get("servers"))
                 else:
                     result = await session.rpc("aelix_control", method=action, params=arguments,
-                        _timeout=(getattr(self.args, "command_timeout", 600) or None) if action in {"auth/login", "resources/reload", "agents/run"} else 60)
+                        _timeout=(getattr(self.args, "command_timeout", 600) or None) if action in LONG_CONTROLS else 60)
                 if action == "tools/set_active":
                     session.active_tools = result["activeTools"]
                     await session.save()

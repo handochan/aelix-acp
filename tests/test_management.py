@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from pathlib import Path
 import sys
@@ -279,3 +280,74 @@ class ExtensionReferenceTests(unittest.TestCase):
         for value in ["/", "/ ", "/model\nother"]:
             with self.subTest(value=value), self.assertRaises(ProtocolError):
                 split_command(value)
+
+
+class ChildrenResumeTests(unittest.IsolatedAsyncioTestCase):
+    """aelix-ai #836: `_aelix/manage children/resume` reaches native as agents/run does."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.server = Server(SimpleNamespace(state_dir=self.temp.name, profile="coding", aelix="/fake/aelix",
+                                             command_timeout=600))
+        self.session = Session(self.server, "session", self.temp.name)
+        self.server.sessions[self.session.id] = self.session
+        self.sent = []
+
+        async def rpc(command, **kwargs):
+            self.sent.append((command, kwargs))
+            self.assertTrue(self.session.mutation_lock.locked(), "under the session lock, as agents/run")
+            return {"result": {"ok": True, "status": "ok", "session_id": kwargs["params"]["id"]}}
+        self.session.rpc = rpc
+
+    async def asyncTearDown(self):
+        await asyncio.gather(*list(self.server.cleanup_tasks), return_exceptions=True)
+        self.server.db.close()
+        self.temp.cleanup()
+
+    async def manage(self, arguments):
+        return await asyncio.wait_for(self.server.dispatch(
+            "_aelix/manage", {"sessionId": "session", "action": "children/resume", "arguments": arguments}), 5)
+
+    async def test_children_resume_is_forwarded_with_agents_runs_deadline(self):
+        self.session.controls.capabilities = {"methods": ["children/resume"]}
+        result = await self.manage({"id": "s-1", "task": "go on"})
+        self.assertEqual(result, {"result": {"ok": True, "status": "ok", "session_id": "s-1"}})
+        ((command, kwargs),) = self.sent
+        self.assertEqual((command, kwargs["method"], kwargs["params"]), ("aelix_control", "children/resume",
+                                                                         {"id": "s-1", "task": "go on"}))
+        self.assertEqual(kwargs["_timeout"], 600, "the command deadline, as agents/run")
+
+    async def test_a_native_that_does_not_list_it_is_refused(self):
+        self.session.controls.capabilities = {"methods": ["agents/run"]}
+        with self.assertRaisesRegex(ProtocolError, "Unsupported management action"):
+            await self.manage({"id": "s-1", "task": "go on"})
+        self.assertEqual(self.sent, [])
+
+    async def test_a_timed_out_resume_is_cancelled_like_agents_run(self):
+        """A resume native does not answer in time is followed by `commands/cancel`, as agents/run's is."""
+
+        session = Session(self.server, "s2", self.temp.name)
+        written = []
+
+        class Stdin:
+            def write(self, data):
+                written.extend(json.loads(line) for line in data.decode().splitlines())
+
+            async def drain(self):
+                pass
+
+        session.proc = SimpleNamespace(stdin=Stdin(), returncode=None)
+
+        async def answer_the_cancel():
+            while not any(line.get("method") == "commands/cancel" for line in written):
+                await asyncio.sleep(0.005)
+            cancel = next(line for line in written if line.get("method") == "commands/cancel")
+            session.pending[cancel["id"]].set_result({"cancelled": True, "method": "children/resume"})
+
+        answering = asyncio.create_task(answer_the_cancel())
+        with self.assertRaises(ProtocolError) as timed_out:
+            await session.rpc("aelix_control", method="children/resume", params={"id": "s-1", "task": "t"},
+                              _timeout=0.01)
+        await asyncio.wait_for(answering, 5)
+        self.assertEqual(timed_out.exception.data["kind"], "timeout")
+        self.assertEqual([line.get("method") for line in written], ["children/resume", "commands/cancel"])

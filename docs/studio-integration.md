@@ -150,7 +150,8 @@ defines both the launcher snapshot and the versioned ACP management actions.
 | `children/steer` | `{id, text, mode?:"steer"\|"follow_up"}` | A message to a running child; `{outcome, phase, verb, ended, reason}` |
 | `children/wrap_up` | `{id}` | Ask a running child to finish; same answer shape |
 | `children/stop` | `{id}` | Stop a child; `{state}` |
-| `children/notices` | `{}` | One native notice turn; `{started, placed, reason, remaining, stopReason}` |
+| `children/notices` | `{}` | One native notice turn; `{started, placed, placedInTurn, reason, remaining, stopReason}`. `placedInTurn` counts every notice the turn placed, its boundaries' included, and comes only from a native with aelix-ai #857; `placed` counts those placed before its first model call |
+| `children/resume` | `{id, task}` | Resume a stopped child the model delegated (native aelix-ai #836): `id` is its session id, `task` the next instruction (at most 64,512 UTF-8 bytes); `{result}` as `agents/run`'s, with its deadline and cancel. A consent dialog the native asks reaches a client-action client as a `dialog` client action, also on a session just opened with `session/load` |
 
 Mutations require idle sessions. Cancel first or disable controls during a turn.
 The five `children/` actions other than `children/notices` are the exception:
