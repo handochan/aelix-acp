@@ -11,6 +11,8 @@ import sys
 import unittest
 import weakref
 import zlib
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory, TemporaryFile
 from types import SimpleNamespace
@@ -80,6 +82,7 @@ class ImagePolicyTests(unittest.TestCase):
         payload = {"messages": [{"role": "user", "content": [image]}], "tools": [{"name": "lookup"}]}
         expected = {("image/png", hashlib.sha256(raw).digest(), len(raw)): 1}
         policy = {
+            "route": ("fixture", "one", "openai-completions", "https://fixture.invalid"),
             "imageBytes": 1024,
             "sidePixels": 4,
             "rawBytes": 2048,
@@ -100,6 +103,110 @@ class ImagePolicyTests(unittest.TestCase):
                 image_policy.validate_payload(payload, {**policy, **limits}, expected)
         with self.assertRaisesRegex(image_policy.ImageRejected, "provider-image-mismatch"):
             image_policy.validate_payload(payload, policy, {})
+
+    def test_responses_projects_base64_and_data_url_with_text_and_tool_output(self):
+        @dataclass
+        class Image:
+            data: str = ""
+            source: str = ""
+            mime_type: str = "image/png"
+
+        @dataclass
+        class Text:
+            text: str
+
+        @dataclass
+        class Message:
+            role: str
+            content: list
+
+        policy = image_policy.VERIFIED_IMAGE_POLICIES[0]
+        raw = png()
+        encoded = base64.b64encode(raw).decode()
+        url = "data:image/png;base64," + encoded
+        messages = [
+            Message("user", [Text("retain text"), Image(data=encoded)]),
+            Message("toolResult", [Image(source=url) for _ in range(20)]),
+        ]
+        projected, expected, stats = image_policy.project_images(
+            messages, image_policy.limits(policy), Image, Text
+        )
+        self.assertEqual(
+            stats,
+            {"keptCount": 20, "keptRawBytes": 20 * len(raw), "omittedCount": 1, "reasons": {"image_count": 1}},
+        )
+        self.assertEqual(projected[0].content, [Text("retain text"), Text(image_policy.PLACEHOLDER)])
+        self.assertIsInstance(messages[0].content[1], Image)
+        self.assertEqual(
+            image_policy.decode_image(encoded, "image/png", limit=1024, max_side=8000), next(iter(expected))
+        )
+        image = {"type": "input_image", "image_url": url, "detail": "auto"}
+        request = {
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": image_policy.PLACEHOLDER}]},
+                {
+                    "type": "function_call_output",
+                    "output": [{"type": "input_text", "text": "mixed"}, *([image] * 20)],
+                },
+            ]
+        }
+        image_policy.validate_payload(request, policy, expected)
+        request["input"][0]["content"].append(image)
+        with self.assertRaisesRegex(image_policy.ImageRejected, "^provider-image-limit$"):
+            image_policy.validate_payload(request, policy, expected)
+
+    def test_responses_checks_raw_budget_after_decode(self):
+        policy = image_policy.VERIFIED_IMAGE_POLICIES[0]
+        raw = png() + bytes(2_900_000)
+        part = {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(raw).decode()}
+        with self.assertRaisesRegex(image_policy.ImageRejected, "^provider-image-limit$"):
+            image_policy.validate_payload({"input": [{"role": "user", "content": [part] * 3}]}, policy, Counter())
+
+    def test_responses_rejects_malformed_parts_with_fixed_diagnostics(self):
+        policy = image_policy.VERIFIED_IMAGE_POLICIES[0]
+        b64 = base64.b64encode(png()).decode()
+        good = {"type": "input_image", "image_url": "data:image/png;base64," + b64}
+        for part, reason in (
+            ({**good, "image_url": b64}, "unmeasurable-provider-payload"),
+            ({**good, "image_url": {"url": good["image_url"]}}, "unmeasurable-provider-payload"),
+            ({**good, "image_url": "https://example.invalid/private.png"}, "unmeasurable-provider-payload"),
+            ({**good, "image_url": "data:image/png;base64,!private!"}, "unmeasurable-image"),
+            ({**good, "image_url": "data:image/jpeg;base64," + b64}, "image-mime"),
+            ({**good, "file_id": "file-private"}, "unmeasurable-provider-payload"),
+            ({**good, "detail": "original"}, "unmeasurable-provider-payload"),
+            ({"type": "input_text", "text": ["private"]}, "unmeasurable-provider-payload"),
+            ({"type": "image_url", "image_url": {"url": good["image_url"]}}, "unmeasurable-provider-payload"),
+            (good, "provider-image-mismatch"),
+        ):
+            with self.subTest(reason=reason), self.assertRaisesRegex(image_policy.ImageRejected, f"^{reason}$"):
+                image_policy.validate_payload({"input": [{"role": "user", "content": [part]}]}, policy, Counter())
+
+    def test_openai_responses_shape_counts_its_output_budget(self):
+        policy = {
+            **image_policy.VERIFIED_IMAGE_POLICIES[0],
+            "route": ("openai", "example", "openai-responses", "https://example.invalid"),
+        }
+        raw = png()
+        encoded = "data:image/png;base64," + base64.b64encode(raw).decode()
+        expected = Counter({("image/png", hashlib.sha256(raw).digest(), len(raw)): 1})
+        request = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "mixed"},
+                        {"type": "input_image", "image_url": encoded},
+                    ],
+                }
+            ]
+        }
+        image_policy.validate_payload(request, policy, expected)
+        with self.assertRaisesRegex(image_policy.ImageRejected, "^provider-context-limit$"):
+            image_policy.validate_payload(
+                {**request, "max_output_tokens": policy["contextTokens"]}, policy, expected
+            )
+        with self.assertRaisesRegex(image_policy.ImageRejected, "^unmeasurable-provider-payload$"):
+            image_policy.validate_payload({"input": "malformed"}, policy, Counter())
 
 
 class HostBytesTests(unittest.IsolatedAsyncioTestCase):
@@ -463,15 +570,30 @@ class ImageRelayTests(unittest.IsolatedAsyncioTestCase):
         )
         self.session.rpc.assert_not_awaited()
 
-    async def test_default_policy_advertises_state_with_pixels_disabled(self):
+    async def test_default_policy_allows_only_the_verified_codex_route(self):
         from aelix_acp.server import Server
 
         default = Server(SimpleNamespace(state_dir=self.session.socket_dir))
         self.addCleanup(default.db.close)
         self.server.image_policies = default.image_policies
-        self.assertEqual(await self.submit(), {"accepted": False, "reason": "model-unverified"})
+        route = dict(zip(("provider", "id", "api", "baseUrl"), image_policy.VERIFIED_IMAGE_POLICIES[0]["route"]))
+        model = {**route, "input": ["text", "image"]}
+        for index, (field, value) in enumerate(
+            (
+                ("provider", "openai"),
+                ("id", "gpt-6-terra"),
+                ("api", "openai-responses"),
+                ("baseUrl", "https://example.invalid/backend-api"),
+                ("baseUrl", route["baseUrl"] + "/codex"),
+            ),
+            1,
+        ):
+            self.session.state["model"] = {**model, field: value}
+            self.assertEqual(await self.submit(index), {"accepted": False, "reason": "model-unverified"})
         self.server.host_bytes.acquire.assert_not_awaited()
         self.session.rpc.assert_not_awaited()
+        self.session.state["model"] = model
+        self.assertTrue((await self.submit(6))["accepted"])
 
     async def test_image_methods_require_a_host_offer_even_with_a_binding(self):
         self.server.host_bytes = None

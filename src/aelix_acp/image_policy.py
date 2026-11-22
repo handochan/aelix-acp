@@ -25,6 +25,22 @@ JPEG_SOF = {0xC0, 0xC1, 0xC2}
 MAX_HEADER = 256 * 1024
 
 
+RESPONSES_APIS = frozenset({"openai-responses", "openai-codex-responses"})
+VERIFIED_IMAGE_POLICIES = (
+    {
+        "route": ("openai-codex", "gpt-6-luna", "openai-codex-responses", "https://chatgpt.com/backend-api"),
+        "imageBytes": MAX_FILE,
+        "sidePixels": MAX_SIDE,
+        "rawBytes": MAX_REQUEST_BYTES,
+        "count": MAX_REQUEST_COUNT,
+        "bodyBytes": 12 * 1024**2,
+        "contextTokens": 1_050_000,
+        "imageTokens": 8192,
+        "outputTokens": 128_000,
+    },
+)
+
+
 class ImageRejected(ValueError):
     pass
 
@@ -223,29 +239,53 @@ def project_images(original, budget, image_type, text_type):
 
 
 def validate_payload(payload, policy, expected):
-    """Pinned Chat Completions payload before the SDK. Include tools and system text."""
-    wire = json.dumps(payload, allow_nan=False, ensure_ascii=True).encode("ascii")
+    """Validate the actual image parts against the context window before HTTP."""
+    try:
+        wire = json.dumps(payload, allow_nan=False, ensure_ascii=True).encode("ascii")
+    except (TypeError, ValueError, RecursionError):
+        raise ImageRejected("unmeasurable-provider-payload") from None
     if len(wire) > policy["bodyBytes"]:
         raise ImageRejected("provider-body-limit")
+    api = policy["route"][2]
+    responses = api in RESPONSES_APIS
+    if responses and not isinstance(payload.get("input"), list):
+        raise ImageRejected("unmeasurable-provider-payload")
+    image_type = "input_image" if responses else "image_url"
     pending = [payload]
     images = Counter()
-    encoded_bytes = 0
+    image_count = raw_bytes = encoded_bytes = 0
     budget = limits(policy)
     while pending:
         value = pending.pop()
         if isinstance(value, dict):
-            if "extra_body" in value or value.get("type") in ("input_image", "image"):
+            kind = value.get("type")
+            if "extra_body" in value or kind == "image":
                 raise ImageRejected("unmeasurable-provider-payload")
-            if value.get("type") == "image_url":
-                image_url = value.get("image_url")
-                url = image_url.get("url") if isinstance(image_url, dict) else None
+            if kind in ("image_url", "input_image"):
+                if kind != image_type:
+                    raise ImageRejected("unmeasurable-provider-payload")
+                url = value.get("image_url")
+                if responses:
+                    # The pinned encoder uses auto detail and emits a data URL
+                    # even when the context stored only raw base64.
+                    if set(value) - {"type", "image_url", "detail"} or value.get("detail", "auto") != "auto":
+                        raise ImageRejected("unmeasurable-provider-payload")
+                else:
+                    url = url.get("url") if isinstance(url, dict) else None
                 if not isinstance(url, str) or not url.startswith("data:"):
                     raise ImageRejected("unmeasurable-provider-payload")
-                if images.total() >= budget["count"]:
+                image_count += 1
+                if image_count > budget["count"]:
                     raise ImageRejected("provider-image-limit")
-                images[decode_image(url, None, limit=budget["imageBytes"], max_side=budget["sidePixels"])] += 1
+                image = decode_image(url, None, limit=budget["imageBytes"], max_side=budget["sidePixels"])
+                raw_bytes += image[2]
+                if raw_bytes > budget["rawBytes"]:
+                    raise ImageRejected("provider-image-limit")
+                images[image] += 1
                 encoded_bytes += len(url.partition(",")[2])
                 continue
+            if responses and kind == "input_text" and not isinstance(value.get("text"), str):
+                raise ImageRejected("unmeasurable-provider-payload")
             pending.extend(value.values())
         elif isinstance(value, list):
             pending.extend(value)
@@ -253,13 +293,11 @@ def validate_payload(payload, policy, expected):
         raise ImageRejected("provider-image-mismatch")
     # Verified routes declare a conservative visual token allowance. Count
     # every remaining serialized byte against the textual context budget.
-    reserved_output = max(
-        payload.get("max_completion_tokens") or 0, payload.get("max_tokens") or 0, policy["outputTokens"]
-    )
-    if (
-        len(wire) - encoded_bytes + images.total() * policy["imageTokens"] + reserved_output
-        > policy["contextTokens"]
-    ):
+    output_limits = [payload.get(key) for key in ("max_completion_tokens", "max_tokens", "max_output_tokens")]
+    if any(limit is not None and (type(limit) is not int or limit < 0) for limit in output_limits):
+        raise ImageRejected("unmeasurable-provider-payload")
+    reserved_output = max(policy["outputTokens"], *(limit or 0 for limit in output_limits))
+    if len(wire) - encoded_bytes + image_count * policy["imageTokens"] + reserved_output > policy["contextTokens"]:
         raise ImageRejected("provider-context-limit")
 
 
