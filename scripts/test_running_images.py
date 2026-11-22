@@ -16,6 +16,26 @@ from spike_image_window import EXTENSION, META, MIB, Probe, ProbeServer, digest
 from aelix_acp import image_policy
 from aelix_acp.runtime import host_bytes
 
+QUEUED_HISTORY_FIXTURE = """
+from dataclasses import replace
+
+from aelix_agent_core.harness.hooks import MessageEndEventResult
+from aelix_ai.messages import ImageContent, TextContent
+
+def setup(api):
+    async def seed_history(event, ctx):
+        message = event.message
+        if message.role != "user" or not message.content or not isinstance(message.content[0], TextContent):
+            return None
+        if message.content[0].text.startswith(("history batch ", "count boundary ")):
+            content = [replace(block, source=ORIGIN) if isinstance(block, ImageContent) else block
+                       for block in message.content]
+            return MessageEndEventResult(message=replace(message, content=content))
+        return None
+
+    api.on("message_end", seed_history)
+"""
+
 
 def key(number):
     return f"019b0000-0000-7000-8000-{number:012x}"
@@ -88,6 +108,10 @@ class RunningImages(Probe):
                 }
             )
         )
+        queued_history = self.root / "queued-history.py"
+        queued_history.write_text(f"ORIGIN = {image_policy.RUNNING_IMAGE_SOURCE!r}\n" + QUEUED_HISTORY_FIXTURE)
+        self.provider_cap = 32
+        self.provider_raw_cap = 16 * MIB
         self.server = HostFixture(
             SimpleNamespace(
                 aelix=str(self.executable),
@@ -95,7 +119,7 @@ class RunningImages(Probe):
                 profile="coding",
                 provider=None,
                 model=None,
-                extension=[str(EXTENSION)],
+                extension=[str(EXTENSION), str(queued_history)],
                 permission_mode="yolo",
                 trust_project=False,
                 turn_timeout=60,
@@ -133,6 +157,9 @@ class RunningImages(Probe):
         assert (Path(self.worker.socket_dir) / "image-ready").exists()
 
     async def spawn(self, *args, **kwargs):
+        # Keep the generic worker's native pipe limit when reopening without H-1.
+        if not self.server.host_bytes:
+            return await self.native_spawn(*args, **kwargs)
         # Reuse the spike's write tap without replacing the product's pipe limit.
         assert kwargs["limit"] == 65536
         self.reader_limit = kwargs["limit"]
@@ -200,7 +227,8 @@ class RunningImages(Probe):
         return receipt
 
     async def exercise(self):
-        # Fill real file history with 32 MiB raw, then add real tool results.
+        # Seed 32 MiB of marked history, then exercise the actual H-1 queue
+        # and ordinary provider tool results.
         for index in range(8):
             await self.prompt(f"history batch {index}", ["a.png", "b.png"])
         assert self.requests[-1]["rawBytes"] == 8 * MIB
@@ -303,7 +331,6 @@ class RunningImages(Probe):
         # Small images hit the count limit independently of the raw budget.
         for index in range(6):
             await self.prompt(f"count boundary {index}", ["f0.png", "f1.png", "f2.png", "f3.png"])
-        assert len(self.requests[-1]["images"]) == 20
         sample = await self.state()
         assert sample["keptCount"] == 20 and "image_count" in sample["reasons"]
 
@@ -350,8 +377,12 @@ class RunningImages(Probe):
         await prompt
         assert self.requests[-1]["images"].count(normal) == 2
         await self.server.dispatch("session/close", {"sessionId": self.session_id})
-        self.binding = self.server.binding = "normal-restored"
-        await self.server.dispatch("session/load", {"sessionId": self.session_id, **self.open_params()})
+        self.server.host_bytes = None
+        self.server.relay_enabled = False
+        await self.server.dispatch("session/load", {
+            "sessionId": self.session_id, "cwd": str(self.root), "mcpServers": [],
+        })
+        assert (Path(self.worker.socket_dir) / "image-ready").is_file()
         await self.config("model", "fixture/two")
         _, encoded = self.encoded(normal)
         restored = (await self.worker.rpc("get_messages"))["messages"]
@@ -366,7 +397,9 @@ class RunningImages(Probe):
         await self.prompt("model switch after reopen")
         assert self.requests[-1]["images"].count(normal) == 1
         assert self.requests[-1]["placeholders"] == 1
-        self.results["unverifiedHistoryAfterLoad"] = {"ordinaryImage": 1, "queuedImageOmitted": 1}
+        self.results["unverifiedHistoryAfterLoad"] = {
+            "hostNegotiated": False, "ordinaryImage": 1, "queuedImageOmitted": 1,
+        }
 
     async def run_live(self, stop_trials):
         self.fixtures(overflow=True)
@@ -403,10 +436,6 @@ class RunningImages(Probe):
             from stop_pipe_probe import measure
 
             self.results["pipeTrials"] = await measure(stop_trials)
-        assert all(
-            row["rawBytes"] <= 8 * MIB and len(row["images"]) <= 20 and row["httpBytes"] <= 12 * MIB
-            for row in self.requests
-        )
         return {
             **self.results,
             "httpRequests": len(self.requests),

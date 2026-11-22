@@ -290,10 +290,14 @@ class Session:
             args += ["-e", extension]
         # Consent sees arguments after other trusted extension hooks.
         args += ["-e", str(PACKAGE / "bridge.py")]
-        # Apply the provenance projection even when a client reopens this
-        # worker without negotiating the Host byte-source capability.
+        # A generic reopen or fork only needs the hook if the native history
+        # can carry queued input. Scan off the loop under the session lease.
         policies = getattr(self.server, "image_policies", ())
-        if policies:
+        history_file = fork_source["file"] if fork_source is not None else session_file
+        image_hook = bool(policies and self.private_host)
+        if not image_hook and history_file and Path(history_file).is_file():
+            image_hook = await asyncio.to_thread(image_policy.has_running_image, history_file)
+        if image_hook:
             args += ["-e", str(PACKAGE / "image_policy.py")]
         self.image_generation = uuid.uuid4().hex
         self.image_epoch = self.image_turn_id = None
@@ -321,7 +325,7 @@ class Session:
         if self.private_host:
             for name in ("ANTHROPIC_LOG", "OPENAI_LOG", "GEMINI_NEXT_GEN_API_LOG"):
                 env.pop(name, None)
-        if policies:
+        if image_hook:
             env["AELIX_ACP_IMAGE_POLICIES"] = json.dumps(policies)
         guard_selectors = bool(saved_agent and resume_file)
         if guard_selectors:
