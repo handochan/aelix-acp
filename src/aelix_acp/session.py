@@ -177,6 +177,7 @@ class Session:
         self.last_abort = None
         self.aborts = 0  # Native aborts sent, by any path.
         self.management_task = None
+        self.extension_commit_started = False
         self._close_task = None
         self.lease = None
         self.fork_peer_lease = None
@@ -195,7 +196,7 @@ class Session:
         self.compaction_recovery_needed = False
         self.mutation_lock = asyncio.Lock()
         self.live_history = LiveHistory(server.args.state_dir, self.id)
-        self.fork_publication = asyncio.Lock()
+        self.publication_lock = asyncio.Lock()
         self._pending_extension_change = None
         self._verifying_extension_recovery = False
         self.restore_launch_preferences()
@@ -446,9 +447,9 @@ class Session:
                 self, require_complete=managed_change is not None or self._verifying_extension_recovery,
             )
         if fork_source is None and managed_change is None:
-            await self.save()
-        if self.rpc_closed:
-            raise ProtocolError("Aelix process closed its RPC stream", -32603)
+            await self.save(live=True)
+        else:
+            self.require_live_worker()
         return snapshot
 
     async def selector_startup(self, nonce, operation):
@@ -569,7 +570,25 @@ class Session:
         # A profile owns its live filter and must be re-evaluated after edits.
         self.active_tools = None
 
-    async def save(self, inherited_history=None):
+    def require_live_worker(self, expected=None, *, committed=False):
+        proc, lease = self.proc, self.lease
+        if (proc is None or proc.returncode is not None or lease is None or lease.closed
+                or self.rpc_closed or self._close_task is not None
+                or (expected is not None and (proc is not expected[0] or lease is not expected[1]))):
+            kind = "session_worker_closed_after_commit" if committed else "session_worker_unavailable"
+            raise ProtocolError("Aelix process closed its RPC stream", -32603, {"kind": kind})
+        return proc, lease
+
+    async def save(self, inherited_history=None, *, live=False, managed_commit=False):
+        before_commit = None
+        if live:
+            worker = self.require_live_worker()
+
+            def before_commit():
+                self.require_live_worker(worker)
+                if managed_commit:
+                    self.extension_commit_started = True
+
         if inherited_history is not None:
             self.fork_projection = True
         row = (self.id, self.cwd, self.server.args.profile, self.state.get("sessionFile"),
@@ -584,7 +603,10 @@ class Session:
             "forkHead": self.fork_head,
             "trustProject": self.trust_project, "agentsEnabled": self.agents_enabled,
             "backendMessageCount": self.state.get("messageCount", self.state.get("message_count", 0))}
-        await write_store(self.server.args.state_dir, save_session, row, preferences, inherited_history)
+        await write_store(self.server.args.state_dir, save_session, row, preferences, inherited_history,
+                          before_commit=before_commit)
+        if live:
+            self.require_live_worker(worker, committed=True)
 
     def selectors(self):
         result = self.controls.selectors()
@@ -1287,25 +1309,22 @@ class Session:
                 self.trust_project = trust_project
             if agents_enabled is not None:
                 self.agents_enabled = agents_enabled
-            if not preserve_history:
-                await self.save()
-            if managed_change is not None:
-                # Keep session/cancel routed to the mutation while the candidate
-                # starts. Other requests still have the activity/mutation locks.
+            async with self.publication_lock:
+                if not preserve_history:
+                    await self.save()
+                if managed_change is not None:
+                    # Only Stop can address the candidate before publication.
+                    self.server.restarting_sessions[self.id] = self
+                snapshot = await self.start(filename, managed_change=managed_change)
+                await self.commands()
+                if preserve_history:
+                    await self.update({"sessionUpdate": "current_mode_update",
+                                       "currentModeId": self.controls.permission_mode})
+                    await self.update({"sessionUpdate": "config_option_update", "configOptions": self.controls.options()})
+                await self.publish_context_usage()
+                await self.publish_recovery_warnings()
+                await self.save(live=True, managed_commit=managed_change is not None)
                 self.server.sessions[self.id] = self
-            snapshot = await self.start(filename, managed_change=managed_change)
-            await self.commands()
-            if preserve_history:
-                await self.update({"sessionUpdate": "current_mode_update",
-                                   "currentModeId": self.controls.permission_mode})
-                await self.update({"sessionUpdate": "config_option_update", "configOptions": self.controls.options()})
-            await self.publish_context_usage()
-            if managed_change is None:
-                await self.save()
-            await self.publish_recovery_warnings()
-            if managed_change is not None:
-                await self.save()
-            self.server.sessions[self.id] = self
             return snapshot
         except BaseException:
             if held_lease is not None:
@@ -1316,6 +1335,8 @@ class Session:
             await self.close()
             raise
         finally:
+            self.extension_commit_started = False
+            self.server.restarting_sessions.pop(self.id, None)
             self.server.starting_ids.discard(self.id)
             self.changing -= 1
 
@@ -1657,7 +1678,7 @@ class Session:
         self.invalidate_image_acceptance()
         self.image_epoch = None
         self.tool_arrived.set()
-        if self.management_task and not self.management_task.done():
+        if self.management_task and not self.management_task.done() and not self.extension_commit_started:
             self.management_task.cancel()
         for task in [*self.permission_connections, *self.permissions, *self.ui_tasks]:
             task.cancel()
@@ -1745,8 +1766,8 @@ class Session:
             self.socket_server.close()
             await self.socket_server.wait_closed()
             self.socket_server = None
-        # A fork publication owns the staging file and lease through commit.
-        async with self.fork_publication:
+        # Publication owns the lease and worker files until the save and registration settle.
+        async with self.publication_lock:
             if self.fork_peer_lease:
                 self.fork_peer_lease.close()
                 self.fork_peer_lease = None
@@ -1756,5 +1777,5 @@ class Session:
             if self.socket_dir:
                 shutil.rmtree(self.socket_dir, ignore_errors=True)
                 self.socket_dir = None
-        if self.server.sessions.get(self.id) is self:
-            self.server.sessions.pop(self.id, None)
+            if self.server.sessions.get(self.id) is self:
+                self.server.sessions.pop(self.id, None)

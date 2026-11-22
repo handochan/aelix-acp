@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import Server, Session, ProtocolError
 from aelix_acp.runtime.commands import split_command
 from aelix_acp.runtime.extensions import extension_reference, run_extension_action, same_extension
-from aelix_acp.runtime.store import LiveHistory
 from support import process_alive
 
 
@@ -233,13 +232,13 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_starts_reserve_the_process_limit(self):
         self.server.args.max_sessions = 1
         entered, release = asyncio.Event(), asyncio.Event()
-        class Starting:
+        class Starting(Session):
             instances = 0
-            def __init__(self, server, identifier, cwd, **_options):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
                 Starting.instances += 1
-                self.id = identifier
-                self.mutation_lock = asyncio.Lock()
-                self.live_history = LiveHistory(server.args.state_dir, identifier)
+            def require_live_worker(self):
+                pass
             async def start(self, filename):
                 entered.set()
                 await release.wait()

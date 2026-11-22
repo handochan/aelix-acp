@@ -43,10 +43,25 @@ def open_store(directory: str) -> sqlite3.Connection:
     return db
 
 
-async def write_store(directory, write, *args, diagnostic="session_store_write_failed"):
+async def write_store(directory, write, *args, diagnostic="session_store_write_failed", before_commit=None):
     """Run a write on its own connection, keeping the caller's lease through commit."""
-    task = asyncio.create_task(asyncio.to_thread(_write_store, directory, write, args))
     cancelled = False
+    if before_commit is not None:
+        loop = asyncio.get_running_loop()
+        owner = asyncio.current_task()
+        prior_cancels = owner.cancelling()
+
+        async def admit():
+            # Serialize admission with Stop and worker exit on the event loop.
+            if cancelled or owner.cancelling() > prior_cancels:
+                raise ProtocolError("session_publication_cancelled", -32003)
+            before_commit()
+
+        def check_commit():
+            asyncio.run_coroutine_threadsafe(admit(), loop).result()
+    else:
+        check_commit = None
+    task = asyncio.create_task(asyncio.to_thread(_write_store, directory, write, args, check_commit))
     while True:
         try:
             result, failure = await asyncio.shield(task)
@@ -64,14 +79,17 @@ async def write_store(directory, write, *args, diagnostic="session_store_write_f
     return result
 
 
-def _write_store(directory, write, args):
+def _write_store(directory, write, args, check_commit):
     try:
         filename = Path(directory).expanduser() / "sessions.sqlite3"
         if filename.is_symlink():
             raise ValueError("Session database must not be a symbolic link")
         with closing(sqlite3.connect(filename, timeout=WRITE_TIMEOUT)) as db, db:
             db.execute("PRAGMA synchronous=FULL")
-            return write(db, *args), None
+            result = write(db, *args)
+            if check_commit is not None:
+                check_commit()
+            return result, None
     except Exception as failure:
         return None, failure
 

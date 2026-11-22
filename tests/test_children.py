@@ -991,6 +991,10 @@ class ReplayTests(unittest.IsolatedAsyncioTestCase):
         server = await self.server(capabilities)
 
         async def start(session, filename):
+            session.proc = SimpleNamespace(returncode=None)
+            session.lease = acquire(self.root, session.id)
+            self.addCleanup(session.lease.close)
+
             async def rpc(command, **kwargs):
                 return {}
             session.rpc = rpc
@@ -1240,6 +1244,7 @@ class FenceOrderTests(Base):
         async def nothing(*args, **kwargs):
             pass
         self.session._end_worker = end_worker
+        self.session.lease = SimpleNamespace(closed=False)
         self.session.start = self.session.commands = self.session.publish_context_usage = nothing
         restart = asyncio.create_task(self.session.restart())
         # Read by the reader after restart() raised the counter, before its close() runs.

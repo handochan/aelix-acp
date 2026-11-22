@@ -60,6 +60,7 @@ class Server:
         self.image_policies = ()
         self.active_request_ids = set()
         self.sessions = {}
+        self.restarting_sessions = {}
         self.starting_ids = set()
         self.pending = {}
         self.response_limits = {}
@@ -252,15 +253,13 @@ class Server:
                 session.lease = acquire_lease(self.args.state_dir, identifier)
                 draft = await write_store(self.args.state_dir, forks.reserve, self.args.state_dir,
                                           identifier, parent, filename)
-                await session.start(fork_source={**draft, "file": filename, "peer": peer, "sessionId": parent,
-                                                 "expectedSha256": head["sha256"]},
-                                    fork_preferences=preferences)
-                await session.commands()
-                result = {"sessionId": identifier, **session.selectors()}
-                async with session.fork_publication:
-                    if session.rpc_closed or session.ending:
-                        raise ProtocolError("Aelix process closed its RPC stream", -32603)
-                    await session.save(session.fork_history())
+                async with session.publication_lock:
+                    await session.start(fork_source={**draft, "file": filename, "peer": peer, "sessionId": parent,
+                                                     "expectedSha256": head["sha256"]},
+                                        fork_preferences=preferences)
+                    await session.commands()
+                    result = {"sessionId": identifier, **session.selectors()}
+                    await session.save(session.fork_history(), live=True)
                     self.sessions[identifier] = session
                 try:
                     forks.receipt_path(self.args.state_dir, identifier).unlink(missing_ok=True)
@@ -409,28 +408,30 @@ class Server:
                                   initial_mode=getattr(self.args, "permission_mode", "default") if method == "session/new" else None)
                 session.index_snapshot = index_snapshot
                 session.client_mcp = params.get("mcpServers", [])
-                await session.start(session_file)
-                self.sessions[session_id] = session
-                await session.commands()
-                if method == "session/load":
+                async with session.publication_lock:
+                    await session.start(session_file)
+                    await session.commands()
+                    if method == "session/load":
+                        await session.live_history.flush()
+                        recorded = history(self.db, session_id)
+                        if (first := next(recorded, None)) is not None:
+                            nesting = session.declares(NESTED_TOOL_CALLS)
+                            for update in chain((first,), recorded):
+                                if not nesting and nested_only(update):
+                                    continue  # aelix-ai #612: the loading client's opt-in, as live.
+                                if session.private_host:
+                                    update.pop("rawOutput", None)
+                                await self.send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
+                        elif not session.fork_projection:
+                            for update in await self.native_history(session):
+                                await session.notify("session/update", {"sessionId": session_id, "update": update})
+                                await asyncio.sleep(0)
+                        await session.publish_context_usage()
+                        await session.save(live=True)
+                    await session.publish_recovery_warnings()
                     await session.live_history.flush()
-                    recorded = history(self.db, session_id)
-                    if (first := next(recorded, None)) is not None:
-                        nesting = session.declares(NESTED_TOOL_CALLS)
-                        for update in chain((first,), recorded):
-                            if not nesting and nested_only(update):
-                                continue  # aelix-ai #612: the loading client's opt-in, as live.
-                            if session.private_host:
-                                update.pop("rawOutput", None)
-                            await self.send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
-                    elif not session.fork_projection:
-                        for update in await self.native_history(session):
-                            await session.notify("session/update", {"sessionId": session_id, "update": update})
-                            await asyncio.sleep(0)
-                    await session.publish_context_usage()
-                    await session.save()
-                await session.publish_recovery_warnings()
-                await session.live_history.flush()
+                    session.require_live_worker()
+                    self.sessions[session_id] = session
             except BaseException:
                 self.sessions.pop(session_id, None)
                 if session:
@@ -513,7 +514,9 @@ class Server:
                     raise ProtocolError("Invalid native fork reference")
                 return await session.prompt(params.get("prompt"), metadata.get("aelix/requestId"), anchor)
         if method == "session/cancel":
-            await self.session(params).cancel()
+            session_id = require_string(params.get("sessionId"), "sessionId")
+            session = self.restarting_sessions.get(session_id) or self.session(params)
+            await session.cancel()
             return {}
         if method in ("session/set_mode", "session/set_model", "session/set_config_option"):
             session = self.session(params)

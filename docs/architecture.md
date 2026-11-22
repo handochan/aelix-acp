@@ -63,7 +63,11 @@ Changing extensions, trust or delegation restarts the child, preserving the
 transcript and ACP identity. Client MCP configuration and UI support rebind
 in memory. Supported session controls restore from saved preferences.
 Branching creates a new file and ACP identity, restores the parent and leaves
-navigation to Studio. Close preserves the index.
+navigation to Studio. Close preserves the index. A candidate worker keeps its
+lease through the final save and registration. ACP checks the worker and lease
+before commit and before publishing the live session. If the worker exits
+before commit admission, the save rolls back. An exit observed after commit
+rejects the live open and retains the committed session for `session/load`.
 
 ## Approval and trusted extensions
 
