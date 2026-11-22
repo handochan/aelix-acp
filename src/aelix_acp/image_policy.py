@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import struct
 import zlib
 from collections import Counter
@@ -20,9 +21,33 @@ MAX_REQUEST_COUNT = 20
 CAPTION = "The user attached one or more images."
 CAPTION_VERSION = 1
 PLACEHOLDER = "[Earlier image omitted from this request due to the image limit.]"
+# Pinned RPC only carries mimeType/data. The message_end reducer moves this
+# transport tag to source, which the native history codec round-trips.
+RUNNING_IMAGE_WIRE_PREFIX = "aelix-acp:running-image:v1,"
+RUNNING_IMAGE_SOURCE = "aelix-acp:running-image:v1"
+HISTORY_IMAGE_MARKER = re.compile(
+    rb'"source"\s*:\s*"' + re.escape(RUNNING_IMAGE_SOURCE.encode("ascii")) + rb'"|'
+    rb'"data"\s*:\s*"' + re.escape(RUNNING_IMAGE_WIRE_PREFIX.encode("ascii"))
+)
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 JPEG_SOF = {0xC0, 0xC1, 0xC2}
 MAX_HEADER = 256 * 1024
+
+
+RESPONSES_APIS = frozenset({"openai-responses", "openai-codex-responses"})
+VERIFIED_IMAGE_POLICIES = (
+    {
+        "route": ("openai-codex", "gpt-6-luna", "openai-codex-responses", "https://chatgpt.com/backend-api"),
+        "imageBytes": MAX_FILE,
+        "sidePixels": MAX_SIDE,
+        "rawBytes": MAX_REQUEST_BYTES,
+        "count": MAX_REQUEST_COUNT,
+        "bodyBytes": 12 * 1024**2,
+        "contextTokens": 1_050_000,
+        "imageTokens": 8192,
+        "outputTokens": 128_000,
+    },
+)
 
 
 class ImageRejected(ValueError):
@@ -169,6 +194,35 @@ def decode_image(encoded, mime, *, limit, max_side):
     return actual_mime, hashlib.sha256(raw).digest(), len(raw)
 
 
+def has_running_image(path):
+    """Detect provenance in a persisted native JSONL session without loading its images."""
+    tail = b""
+    with open(path, "rb") as history:
+        while chunk := history.read(64 * 1024):
+            data = tail + chunk
+            if HISTORY_IMAGE_MARKER.search(data):
+                return True
+            # The pinned codec writes compact field names and separators.
+            tail = data[-256:]
+    return False
+
+
+def is_running_image(block):
+    return block.source == RUNNING_IMAGE_SOURCE or block.data.startswith(RUNNING_IMAGE_WIRE_PREFIX)
+
+
+def preserve_image_origin(message, image_type):
+    if message.role != "user":
+        return None
+    content = [
+        replace(block, source=RUNNING_IMAGE_SOURCE, data=block.data.removeprefix(RUNNING_IMAGE_WIRE_PREFIX))
+        if isinstance(block, image_type) and block.data.startswith(RUNNING_IMAGE_WIRE_PREFIX)
+        else block
+        for block in message.content
+    ]
+    return replace(message, content=content) if content != message.content else None
+
+
 def project_images(original, budget, image_type, text_type):
     messages = list(original)
     kept = Counter()
@@ -183,13 +237,16 @@ def project_images(original, budget, image_type, text_type):
             block = message.content[ci]
             if not isinstance(block, image_type):
                 continue
+            if budget is None and not is_running_image(block):
+                continue
+            tagged = block.data.startswith(RUNNING_IMAGE_WIRE_PREFIX)
             if cutoff is None:
                 if kept.total() == budget["count"]:
                     cutoff = "image_count"
                 else:
                     try:
                         item = decode_image(
-                            block.data or block.source,
+                            block.data.removeprefix(RUNNING_IMAGE_WIRE_PREFIX) or block.source,
                             block.mime_type,
                             limit=budget["imageBytes"],
                             max_side=budget["sidePixels"],
@@ -202,6 +259,14 @@ def project_images(original, budget, image_type, text_type):
                         if total + item[2] <= budget["rawBytes"]:
                             kept[item] += 1
                             total += item[2]
+                            if tagged:
+                                if content is None:
+                                    content = list(message.content)
+                                content[ci] = replace(
+                                    block,
+                                    source=RUNNING_IMAGE_SOURCE,
+                                    data=block.data.removeprefix(RUNNING_IMAGE_WIRE_PREFIX),
+                                )
                             continue
                         cutoff = "raw_bytes"
             if content is None:
@@ -222,49 +287,135 @@ def project_images(original, budget, image_type, text_type):
     )
 
 
-def validate_payload(payload, policy, expected):
-    """Pinned Chat Completions payload before the SDK. Include tools and system text."""
-    wire = json.dumps(payload, allow_nan=False, ensure_ascii=True).encode("ascii")
-    if len(wire) > policy["bodyBytes"]:
-        raise ImageRejected("provider-body-limit")
+def responses_images(payload):
+    """Only visit slots which the pinned Responses encoder uses as content."""
+    entries = payload.get("input")
+    if not isinstance(entries, list):
+        raise ImageRejected("unmeasurable-provider-payload")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ImageRejected("unmeasurable-provider-payload")
+        kind = entry.get("type", "message")
+        if kind == "message":
+            role = entry.get("role")
+            if role not in ("user", "assistant", "system", "developer"):
+                raise ImageRejected("unmeasurable-provider-payload")
+            parts = entry.get("content")
+            text_kind = "output_text" if role == "assistant" else "input_text"
+            accepts_image = role == "user"
+        elif kind == "function_call_output":
+            if not isinstance(entry.get("call_id"), str) or not entry["call_id"]:
+                raise ImageRejected("unmeasurable-provider-payload")
+            parts = entry.get("output")
+            text_kind = "input_text"
+            accepts_image = True
+        elif kind == "function_call":
+            if not all(isinstance(entry.get(key), str) for key in ("call_id", "name", "arguments")):
+                raise ImageRejected("unmeasurable-provider-payload")
+            continue
+        elif kind == "reasoning":
+            # Native replays encrypted reasoning independently of messages.
+            for key, part_kind in (("summary", "summary_text"), ("content", "reasoning_text")):
+                items = entry.get(key)
+                if items is not None and (
+                    not isinstance(items, list)
+                    or any(
+                        not isinstance(part, dict)
+                        or part.get("type") != part_kind
+                        or not isinstance(part.get("text"), str)
+                        for part in items
+                    )
+                ):
+                    raise ImageRejected("unmeasurable-provider-payload")
+            continue
+        else:
+            raise ImageRejected("unmeasurable-provider-payload")
+        if isinstance(parts, str):
+            continue
+        if not isinstance(parts, list):
+            raise ImageRejected("unmeasurable-provider-payload")
+        for part in parts:
+            if not isinstance(part, dict):
+                raise ImageRejected("unmeasurable-provider-payload")
+            part_kind = part.get("type")
+            if part_kind == text_kind and isinstance(part.get("text"), str):
+                continue
+            if part_kind != "input_image" or not accepts_image:
+                raise ImageRejected("unmeasurable-provider-payload")
+            # The pinned encoder emits a data URL and uses auto detail.
+            if set(part) - {"type", "image_url", "detail"} or part.get("detail", "auto") != "auto":
+                raise ImageRejected("unmeasurable-provider-payload")
+            yield part.get("image_url")
+
+
+def completions_images(payload):
     pending = [payload]
-    images = Counter()
-    encoded_bytes = 0
-    budget = limits(policy)
     while pending:
         value = pending.pop()
         if isinstance(value, dict):
-            if "extra_body" in value or value.get("type") in ("input_image", "image"):
+            kind = value.get("type")
+            if "extra_body" in value or kind in ("image", "input_image"):
                 raise ImageRejected("unmeasurable-provider-payload")
-            if value.get("type") == "image_url":
-                image_url = value.get("image_url")
-                url = image_url.get("url") if isinstance(image_url, dict) else None
-                if not isinstance(url, str) or not url.startswith("data:"):
-                    raise ImageRejected("unmeasurable-provider-payload")
-                if images.total() >= budget["count"]:
-                    raise ImageRejected("provider-image-limit")
-                images[decode_image(url, None, limit=budget["imageBytes"], max_side=budget["sidePixels"])] += 1
-                encoded_bytes += len(url.partition(",")[2])
+            if kind == "image_url":
+                url = value.get("image_url")
+                yield url.get("url") if isinstance(url, dict) else None
                 continue
             pending.extend(value.values())
         elif isinstance(value, list):
             pending.extend(value)
+
+
+def validate_payload(payload, policy, expected):
+    """Validate the serialized image parts against the context window before HTTP."""
+    try:
+        wire = json.dumps(payload, allow_nan=False, ensure_ascii=True).encode("ascii")
+        if len(wire) > policy["bodyBytes"]:
+            raise ImageRejected("provider-body-limit")
+        body = json.loads(wire)
+    except ImageRejected:
+        raise
+    except (TypeError, ValueError, RecursionError):
+        raise ImageRejected("unmeasurable-provider-payload") from None
+    if not isinstance(body, dict) or "extra_body" in body:
+        raise ImageRejected("unmeasurable-provider-payload")
+    urls = responses_images(body) if policy["route"][2] in RESPONSES_APIS else completions_images(body)
+    images = Counter()
+    image_count = raw_bytes = encoded_bytes = 0
+    budget = limits(policy)
+    for url in urls:
+        if not isinstance(url, str) or not url.startswith("data:"):
+            raise ImageRejected("unmeasurable-provider-payload")
+        image_count += 1
+        if image_count > budget["count"]:
+            raise ImageRejected("provider-image-limit")
+        image = decode_image(url, None, limit=budget["imageBytes"], max_side=budget["sidePixels"])
+        raw_bytes += image[2]
+        if raw_bytes > budget["rawBytes"]:
+            raise ImageRejected("provider-image-limit")
+        images[image] += 1
+        encoded_bytes += len(url.partition(",")[2])
     if images != expected:
         raise ImageRejected("provider-image-mismatch")
     # Verified routes declare a conservative visual token allowance. Count
     # every remaining serialized byte against the textual context budget.
-    reserved_output = max(
-        payload.get("max_completion_tokens") or 0, payload.get("max_tokens") or 0, policy["outputTokens"]
-    )
+    output_limits = [body.get(key) for key in ("max_completion_tokens", "max_tokens", "max_output_tokens")]
+    if any(limit is not None and (type(limit) is not int or limit < 0) for limit in output_limits):
+        raise ImageRejected("unmeasurable-provider-payload")
+    reserved_output = max(policy["outputTokens"], *(limit or 0 for limit in output_limits))
     if (
-        len(wire) - encoded_bytes + images.total() * policy["imageTokens"] + reserved_output
+        len(wire) - encoded_bytes + image_count * policy["imageTokens"] + reserved_output
         > policy["contextTokens"]
     ):
         raise ImageRejected("provider-context-limit")
+    return body
 
 
 def setup(api):
-    from aelix_agent_core.harness.hooks import ContextResult
+    from aelix_agent_core.harness.hooks import (
+        BeforeProviderPayloadResult,
+        ContextResult,
+        MessageEndEventResult,
+    )
     from aelix_ai.messages import ImageContent, TextContent
 
     policies = json.loads(os.environ["AELIX_ACP_IMAGE_POLICIES"])
@@ -279,6 +430,11 @@ def setup(api):
         projected = sending = None
         state_path.unlink(missing_ok=True)
 
+    async def mark_image_origin(event, ctx):
+        message = preserve_image_origin(event.message, ImageContent)
+        if message is not None:
+            return MessageEndEventResult(message=message)
+
     async def window(event, ctx):
         nonlocal projected
         await reset(event, ctx)
@@ -288,23 +444,24 @@ def setup(api):
         )
         epoch = epoch_path.read_text(encoding="ascii") if epoch_path.is_file() else None
         projected = (model_fields(ctx.model) if ctx.model else None, images, stats, epoch)
-        return ContextResult(messages=messages)
+        if stats["omittedCount"] or images:
+            return ContextResult(messages=messages)
 
     async def before_payload(event, ctx):
         nonlocal sending, sequence
         sending = None
         state_path.unlink(missing_ok=True)
         policy = policy_for(event.model, policies)
+        route = model_fields(event.model) if event.model else None
+        if projected and projected[1] and (not policy or route != projected[0]):
+            raise ImageRejected("provider-route-changed")
         if not policy:
-            if projected and projected[1]:
-                raise ImageRejected("provider-route-changed")
             return
-        route = model_fields(event.model)
-        expected = projected[1] if projected and projected[0] == route else Counter()
         if not isinstance(event.payload, dict) or event.payload.get("model") != route[1]:
             raise ImageRejected("provider-route-changed")
-        validate_payload(event.payload, policy, expected)
-        if projected and projected[0] == route and projected[3]:
+        expected = projected[1] if projected and route == projected[0] else Counter()
+        payload = validate_payload(event.payload, policy, expected)
+        if projected and route == projected[0] and projected[3]:
             sequence += 1
             sending = {
                 "epoch": projected[3],
@@ -312,6 +469,7 @@ def setup(api):
                 "model": "/".join(route[:2]),
                 **projected[2],
             }
+        return BeforeProviderPayloadResult(payload=payload)
 
     async def after_response(event, ctx):
         nonlocal sending
@@ -327,6 +485,7 @@ def setup(api):
             pending.replace(state_path)
 
     api.on("before_agent_start", reset)
+    api.on("message_end", mark_image_origin, error_mode="throw")
     api.on("context", window, error_mode="throw")
     api.on("before_provider_payload", before_payload, error_mode="throw")
     api.on("after_provider_response", after_response)

@@ -17,6 +17,7 @@ import uuid
 import time
 import math
 
+from .image_policy import VERIFIED_IMAGE_POLICIES
 from . import __version__
 from .wire.errors import (ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH,
                           fork_head_changed, require_object, require_string)
@@ -57,7 +58,7 @@ class Server:
         self.host_bytes = None
         # Populate only with exact provider/model/API/endpoint routes that pass
         # final HTTP, Stop and log qualification with the pinned distribution.
-        self.image_policies = ()
+        self.image_policies = VERIFIED_IMAGE_POLICIES
         self.active_request_ids = set()
         self.sessions = {}
         self.pending_stop_sessions = {}

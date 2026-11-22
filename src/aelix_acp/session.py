@@ -290,8 +290,14 @@ class Session:
             args += ["-e", extension]
         # Consent sees arguments after other trusted extension hooks.
         args += ["-e", str(PACKAGE / "bridge.py")]
-        policies = self.server.image_policies if self.private_host else ()
-        if policies:
+        # Only a Host-negotiated worker gets route budgets. A generic reopen
+        # or fork needs the hook solely to suppress marked queued history.
+        policies = getattr(self.server, "image_policies", ()) if self.private_host else ()
+        history_file = fork_source["file"] if fork_source is not None else session_file
+        image_hook = bool(policies)
+        if not image_hook and history_file and Path(history_file).is_file():
+            image_hook = await asyncio.to_thread(image_policy.has_running_image, history_file)
+        if image_hook:
             args += ["-e", str(PACKAGE / "image_policy.py")]
         self.image_generation = uuid.uuid4().hex
         self.image_epoch = self.image_turn_id = None
@@ -319,8 +325,8 @@ class Session:
         if self.private_host:
             for name in ("ANTHROPIC_LOG", "OPENAI_LOG", "GEMINI_NEXT_GEN_API_LOG"):
                 env.pop(name, None)
-            if policies:
-                env["AELIX_ACP_IMAGE_POLICIES"] = json.dumps(policies)
+        if image_hook:
+            env["AELIX_ACP_IMAGE_POLICIES"] = json.dumps(policies)
         guard_selectors = bool(saved_agent and resume_file)
         if guard_selectors:
             env["AELIX_ACP_SELECTOR_STARTUP_FILE"] = str(Path(resume_file).resolve())
