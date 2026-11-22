@@ -21,7 +21,6 @@ import uuid
 
 from .wire.errors import (ProtocolError, BackendError, after_dispatch, delivery_unknown, fork_head_changed,
                           is_native_session_locked, require_object, require_string, session_changing, session_locked)
-from .wire.diagnostics import ReopenDiagnostics
 from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter, encode_frame
 from . import image_policy
@@ -357,7 +356,7 @@ class Session:
                 self.proc.kill()
                 await self.proc.wait()
                 raise
-        self.stderr_task = asyncio.create_task(self.read_stderr(reopen_file=resume_file))
+        self.stderr_task = asyncio.create_task(self.read_stderr())
         self.tasks = {asyncio.create_task(self.read_rpc()), self.stderr_task}
         try:
             self.state = await self.rpc("get_state")
@@ -687,25 +686,16 @@ class Session:
             if _project_history:
                 self.history_requests.discard(request_id)
 
-    async def read_stderr(self, *, reopen_file=None):
+    async def read_stderr(self):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         writer = None if self.private_host else StdoutWriter(sys.stderr.fileno())
-        diagnostics = ReopenDiagnostics(reopen_file, self.id) if writer and reopen_file else None
         try:
             while chunk := await self.proc.stderr.read(4096):
-                # Keep the bounded raw tail for native lock detection. A
-                # reopened worker's diagnostics are checked as complete lines.
+                # Bounded copy for native refusals reported only on stderr.
                 self.stderr_tail = (self.stderr_tail + chunk)[-STDERR_TAIL:]
-                if writer is None:
-                    continue
-                if diagnostics is not None:
-                    for line in diagnostics.feed(chunk):
-                        await writer.write(line)
-                else:
+                if writer is not None:
                     text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
                     await writer.write(text.encode("utf-8"))
-            if diagnostics is not None and (line := diagnostics.finish()):
-                await writer.write(line)
         finally:
             if writer is not None:
                 writer.close()

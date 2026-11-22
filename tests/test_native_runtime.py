@@ -1313,7 +1313,7 @@ def setup(api):
         await self.prompt("WRITE_TEST", "stable-request")
         self.assertEqual(len(self.model_requests), count)
 
-    async def test_generic_reopened_worker_forwards_only_path_free_runtime_diagnostics(self):
+    async def test_generic_reopened_worker_preserves_native_stderr_passthrough(self):
         await self.prompt("seed saved history")
         await self.client.close()
         extension = self.root / "runtime_stderr.py"
@@ -1325,6 +1325,8 @@ def setup(api):
                 async def log(_event, ctx):
                     print(f"warning from {Path(ctx.cwd) / 'ABS_PATH_SENTINEL'}", file=sys.stderr, flush=True)
                     print("warning from RELATIVE_PATH_SENTINEL.jsonl.", file=sys.stderr, flush=True)
+                    print("Could not read RELATIVE_WITHOUT_SUFFIX_SENTINEL", file=sys.stderr, flush=True)
+                    print(".-" * 8192, file=sys.stderr, flush=True)
                     print("Warning: ACP_REOPEN_RUNTIME_DIAGNOSTIC", file=sys.stderr, flush=True)
                 api.on("before_agent_start", log)
         """), encoding="utf-8")
@@ -1336,9 +1338,11 @@ def setup(api):
                 await asyncio.sleep(0.01)
         await self.client.close()
         self.assertIn(b"Warning: ACP_REOPEN_RUNTIME_DIAGNOSTIC", self.client.stderr)
-        self.assertNotIn(os.fsencode(self.root), self.client.stderr)
-        self.assertNotIn(b"ABS_PATH_SENTINEL", self.client.stderr)
-        self.assertNotIn(b"RELATIVE_PATH_SENTINEL", self.client.stderr)
+        self.assertIn(os.fsencode(self.root / "ABS_PATH_SENTINEL"), self.client.stderr)
+        self.assertIn(b"RELATIVE_PATH_SENTINEL.jsonl.", self.client.stderr)
+        self.assertIn(b"Could not read RELATIVE_WITHOUT_SUFFIX_SENTINEL", self.client.stderr)
+        prefix = f"[aelix:{self.session[:8]}] ".encode()
+        self.assertIn(b".-" * 8192, self.client.stderr.replace(prefix, b""))
 
     async def test_process_restart_restores_history_and_model_selection(self):
         await self.config("model", "fixture/two")

@@ -21,7 +21,7 @@ from aelix_acp.runtime import host_bytes, native_frames, native_history, session
 from aelix_acp.runtime.store import append_event, cache_recovered_history, history, open_store
 from aelix_acp.server import Server
 from aelix_acp.session import Session
-from aelix_acp.wire.diagnostics import MAX_LINE_BYTES, RECOVERY_NOTICE, ReopenDiagnostics
+from aelix_acp.wire.errors import BackendError, ProtocolError
 from support import AcpClient
 
 MIB = 1024**2
@@ -32,41 +32,6 @@ EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
 def response(messages):
     return json.dumps({"type": "response", "command": "get_messages", "success": True,
                        "id": REQUEST_ID, "data": {"messages": messages}}).encode() + b"\n"
-
-
-class ReopenDiagnosticsTests(unittest.TestCase):
-    def test_split_diagnostics_keep_safe_lines_and_drop_path_bearing_lines(self):
-        filename = "/workspace/private\nSPLIT_PATH_SENTINEL"
-        raw = (
-            f"WARNING:aelix_agent_core.session.jsonl_storage:Recovered damaged session file {filename}: skipped 1 line\n"
-            f"Recovered damaged session file {filename}: skipped 1 line\n"
-            "absolute /private/ABS_PATH_SENTINEL\n"
-            "windows C:\\workspace\\WINDOWS_PATH_SENTINEL\n"
-            "drive C:DRIVE_PATH_SENTINEL\n"
-            "relative RELATIVE_PATH_SENTINEL.jsonl.\n"
-            "dotfile .123DOTFILE_SENTINEL.\n"
-            "rotated log ROTATED_PATH_SENTINEL.log.1.\n"
-            "numeric suffix NUMERIC_PATH_SENTINEL.42!\n"
-            "path: BARE_PATH_SENTINEL\n"
-            "encoded %2fprivate%2fENCODED_PATH_SENTINEL\n"
-            "WARNING:aelix_agent_core.harness:Runtime diagnostic available with version 1.2.3.\r\n"
-            "안전한 런타임 진단.\n"
-        ).encode()
-        raw += b"x" * MAX_LINE_BYTES + b"/LEAK_FROM_LONG_LINE\nFinal safe diagnostic"
-        prefix = b"[aelix:fixture] "
-        expected = [
-            RECOVERY_NOTICE,
-            prefix + b"WARNING:aelix_agent_core.harness:Runtime diagnostic available with version 1.2.3.\n",
-            prefix + "안전한 런타임 진단.\n".encode(),
-            prefix + b"Final safe diagnostic\n",
-        ]
-        for size in (1, 13, 4096):
-            with self.subTest(chunk=size):
-                diagnostics = ReopenDiagnostics(filename, "fixture")
-                actual = [line for offset in range(0, len(raw), size)
-                          for line in diagnostics.feed(raw[offset:offset + size])]
-                actual.append(diagnostics.finish())
-                self.assertEqual(actual, expected)
 
 
 class NativeHistoryFrames(unittest.IsolatedAsyncioTestCase):
@@ -212,6 +177,25 @@ class HistoryReplayTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([updates[0]["content"]["text"], updates[2]["content"]["text"]], ["before", "after"])
                 self.assertEqual(updates[1]["toolCallId"], "call")
                 self.assertEqual(updates[1]["content"][0]["content"]["text"], native_history.TOOL_RESULT_OMITTED)
+
+    async def test_underlying_history_errors_use_fixed_diagnostics(self):
+        private_detail = "fixture/path SYNTHETIC_BODY iVBORw0KGgo="
+        with TemporaryDirectory() as directory:
+            server = Server(SimpleNamespace(state_dir=directory))
+            native = SimpleNamespace(rpc=AsyncMock(side_effect=BackendError(private_detail, "get_messages")))
+            session = SimpleNamespace(id="fixture", read_native_history=AsyncMock(return_value=[
+                {"role": "user", "content": "before"},
+            ]))
+            with contextlib.closing(server.db), patch(
+                "aelix_acp.server.cache_recovered_history", side_effect=sqlite3.OperationalError(private_detail)
+            ):
+                for operation in (Session.read_native_history(native), server.native_history(session)):
+                    with self.assertRaises(ProtocolError) as failure:
+                        await operation
+                    self.assertEqual((failure.exception.code, str(failure.exception), failure.exception.data), (
+                        -32603, "Native session history is unavailable", {"kind": "native_history_unavailable"},
+                    ))
+                    self.assertIsNone(failure.exception.__cause__)
 
     async def test_cache_is_atomic_and_recorded_cursor_excludes_later_updates(self):
         update = {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "recorded"}}
@@ -388,16 +372,30 @@ class NativeHistoryIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signed_result["content"][0]["content"]["text"], "signed result")
         self.assertNotIn("SIGNATURE_SENTINEL", json.dumps(signed_call))
 
-    async def test_generic_reopen_reports_damaged_native_tail_without_leaking_details(self):
+    def seed_truncated(self):
         filename = self.seed([{"role": "user", "content": [{"type": "text", "text": "survived"}]}])
         with filename.open("ab") as stream:
             stream.write(b'{"type":"TAIL_BODY_SENTINEL')
+        return filename
+
+    async def test_generic_reopen_relays_the_native_recovery_warning(self):
+        filename = self.seed_truncated()
         client = await self.open()
         self.assertEqual([item["content"]["text"] for item in self.replay(client)], ["survived"])
+        async with asyncio.timeout(5):
+            while os.fsencode(filename) not in client.stderr:
+                await asyncio.sleep(0.01)
         await client.close()
-        self.assertIn(b"Native session recovered from damaged history.", client.stderr)
+        self.assertIn(b"Recovered damaged session file", client.stderr)
+        self.assertNotIn(b"TAIL_BODY_SENTINEL", client.stderr)
+
+    async def test_studio_host_reopen_does_not_expose_the_native_recovery_warning(self):
+        filename = self.seed_truncated()
+        client = await self.open(private=True)
+        self.assertEqual([item["content"]["text"] for item in self.replay(client)], ["survived"])
+        await client.close()
+        self.assertNotIn(b"Recovered damaged session file", client.stderr)
         self.assertNotIn(os.fsencode(filename), client.stderr)
-        self.assertNotIn(b"fixture.jsonl", client.stderr)
         self.assertNotIn(b"TAIL_BODY_SENTINEL", client.stderr)
 
     async def test_native_text_below_the_retained_history_budget(self):
