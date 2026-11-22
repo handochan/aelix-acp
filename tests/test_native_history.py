@@ -228,7 +228,9 @@ class HistoryReplayTests(unittest.IsolatedAsyncioTestCase):
             blocker.execute("BEGIN IMMEDIATE")
             with patch.object(store, "_recovery_transaction", observed):
                 recovery = asyncio.create_task(cache_recovered_history(directory, "fixture", [update]))
-                live = asyncio.create_task(store.append_live_event(db, "other", update))
+                recording = store.LiveHistory(directory, "other")
+                recording.append(update)
+                live = asyncio.create_task(recording.flush())
                 try:
                     await asyncio.wait_for(entered.wait(), 2)
                     self.assertFalse(recovery.done())

@@ -128,7 +128,7 @@ class SessionControls:
             with contextlib.suppress(ProtocolError):
                 await self.refresh()
                 if publish:
-                    self.session.save()
+                    await self.session.save()
                     await self.session.update({"sessionUpdate": "config_option_update", "configOptions": self.options()})
                     if config_id == "permission_mode":
                         await self.session.update({"sessionUpdate": "current_mode_update", "currentModeId": self.permission_mode})
@@ -157,7 +157,7 @@ class SessionControls:
             self.capabilities = await self.session.rpc("aelix_control", method="capabilities", params={})
         result = {"configOptions": self.options()}
         if publish:
-            self.session.save()
+            await self.session.save()
             await self.session.update({"sessionUpdate": "config_option_update", **result})
         return result
 
@@ -175,7 +175,7 @@ class SessionControls:
         if mode == "default":
             self.permission_mode = "default"
             if persist:
-                self.session.save()
+                await self.session.save()
         result = await self.session.rpc("aelix_control", method="permissions/set", params={"mode": mode})
         self.native_mode = result.get("mode")
         if self.native_mode != mode:

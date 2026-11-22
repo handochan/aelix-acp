@@ -13,11 +13,12 @@ import unittest
 from support import AcpClient
 
 EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
-HOLD_SECONDS = float(os.environ.get("AELIX_ACP_CONTENTION_SECONDS", "0.3"))
+HOLD_SECONDS = os.environ.get("AELIX_ACP_CONTENTION_SECONDS")
 SOURCE = os.environ.get("AELIX_ACP_CONTENTION_SOURCE")
 METRIC = b"control-contention "
 TOOL_ID = "call_control_contention"
 DELTA = "Fixture delta under contention."
+REQUEST_ID = "control-contention-turn"
 
 
 def report(label):
@@ -88,7 +89,7 @@ class ObservedClient(AcpClient):
                     self.metric_arrived.notify_all()
 
     async def observe(self, key):
-        async with asyncio.timeout(15), self.metric_arrived:
+        async with asyncio.timeout(8), self.metric_arrived:
             await self.metric_arrived.wait_for(lambda: key in self.metrics)
             return self.metrics[key]
 
@@ -179,28 +180,58 @@ class NativeControlContention(unittest.IsolatedAsyncioTestCase):
     def prompt(self, text):
         return asyncio.create_task(self.client.request("session/prompt", {
             "sessionId": self.session, "prompt": [{"type": "text", "text": text}],
+            "_meta": {"aelix/requestId": REQUEST_ID},
         }, timeout=25))
 
     @contextlib.asynccontextmanager
     async def writer_lock(self):
         with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3", timeout=0)) as db:
-            db.execute("BEGIN IMMEDIATE")
+            async with asyncio.timeout(8):
+                while True:
+                    try:
+                        db.execute("BEGIN IMMEDIATE")
+                        break
+                    except sqlite3.OperationalError as error:
+                        if error.sqlite_errorcode != sqlite3.SQLITE_BUSY:
+                            raise
+                        await asyncio.sleep(0.01)
             release = {}
             hold = asyncio.Event()
 
-            async def unlock():
-                await hold.wait()
-                await asyncio.sleep(HOLD_SECONDS)
+            def unlock():
                 release["file"] = self.proof.exists()
                 db.rollback()
                 release["time"] = perf_counter_ns()
 
-            timer = asyncio.create_task(unlock())
+            async def timed_unlock():
+                await hold.wait()
+                await asyncio.sleep(float(HOLD_SECONDS))
+                unlock()
+
+            timer = asyncio.create_task(timed_unlock()) if HOLD_SECONDS else None
             try:
-                yield hold, release
+                yield hold, release, db
             finally:
-                hold.set()
-                await timer
+                if timer is None:
+                    unlock()
+                else:
+                    hold.set()
+                    await timer
+
+    def receipt_state(self, db):
+        return db.execute("SELECT state FROM turns WHERE session_id=? AND request_key=?",
+                          (self.session, REQUEST_ID)).fetchone()
+
+    async def check_reopen(self, text, result):
+        await self.client.request("session/close", {"sessionId": self.session})
+        self.client.updates.clear()
+        await self.client.request("session/load", {"sessionId": self.session, "cwd": str(self.root), "mcpServers": []})
+        updates = [e["params"]["update"] for e in self.client.updates if e.get("method") == "session/update"]
+        self.assertIn(text, [u["content"]["text"] for u in updates if u["sessionUpdate"] == "user_message_chunk"])
+        count = len(self.client.requests)
+        self.assertEqual(await self.prompt(text), result)
+        self.assertEqual(len(self.client.requests), count)
+        return updates
 
     @staticmethod
     def measurements(case, start, inputs, native, release, **extra):
@@ -213,46 +244,69 @@ class NativeControlContention(unittest.IsolatedAsyncioTestCase):
         print(json.dumps({"case": case, "acp_received_ms": elapsed(inputs), "native_done_ms": elapsed(native),
                           "lock_released_ms": elapsed(release["time"]), **extra}))
 
-    async def test_allow_once_reaches_native_with_an_external_writer(self):
+    async def check_permission(self, option, *, writes):
         asked = asyncio.Event()
-        allow = asyncio.Event()
+        reply = asyncio.Event()
 
         async def answer(_):
             asked.set()
-            await allow.wait()
-            return "allow-once"
+            await reply.wait()
+            return option
 
         self.client.permission = answer
         prompt = self.prompt("WRITE_FIXTURE")
         await asyncio.wait_for(asked.wait(), 15)
         self.assertFalse(self.proof.exists())
-        async with self.writer_lock() as (hold, release):
+        async with self.writer_lock() as (hold, release, db):
             start = perf_counter_ns()
             hold.set()
-            allow.set()
+            reply.set()
             received = await self.client.observe("allow_received")
             completed = await self.client.observe("native_tool_end")
-        self.assertEqual((await prompt)["stopReason"], "end_turn")
-        self.assertEqual(self.proof.read_text(encoding="utf-8"), "approved")
-        self.measurements("allow-once", start, received, completed, release, file_before_release=release["file"])
+            if not HOLD_SECONDS:
+                self.assertEqual(self.receipt_state(db), ("running",))
+                self.assertEqual(self.proof.exists(), writes)
+        result = await prompt
+        self.assertEqual(result["stopReason"], "end_turn")
+        self.assertEqual(self.proof.exists(), writes)
+        if writes:
+            self.assertEqual(self.proof.read_text(encoding="utf-8"), "approved")
+        self.measurements(option, start, received, completed, release, file_before_release=release["file"])
+        if not HOLD_SECONDS:
+            updates = await self.check_reopen("WRITE_FIXTURE", result)
+            statuses = [u["status"] for u in updates if u.get("toolCallId") == TOOL_ID]
+            self.assertEqual(statuses, ["pending", "pending", "in_progress", "completed"] if writes else
+                             ["pending", "pending", "failed"])
+
+    async def test_allow_once_reaches_native_with_an_external_writer(self):
+        await self.check_permission("allow-once", writes=True)
+
+    async def test_reject_reaches_native_with_an_external_writer(self):
+        await self.check_permission("reject-once", writes=False)
 
     async def test_stop_reaches_running_native_with_an_external_writer(self):
         prompt = self.prompt("STOP_FIXTURE")
         await asyncio.wait_for(self.model_started.wait(), 15)
-        async with self.writer_lock() as (hold, release):
+        async with self.writer_lock() as (hold, release, db):
             self.send_delta.set()
             await self.client.observe("native_delta")
             self.assertFalse(prompt.done())
             start = perf_counter_ns()
             hold.set()
-            await self.client.request("session/cancel", {"sessionId": self.session})
+            await self.client.request("session/cancel", {"sessionId": self.session}, timeout=8)
             client_done = perf_counter_ns()
             received = await self.client.observe("stop_received")
             aborted = await self.client.observe("native_abort_ack")
+            if not HOLD_SECONDS:
+                self.assertEqual(self.receipt_state(db), ("running",))
         self.assertFalse(self.finish_stream.is_set())
-        self.assertEqual((await prompt)["stopReason"], "cancelled")
+        result = await prompt
+        self.assertEqual(result["stopReason"], "cancelled")
         self.measurements("running-stop", start, received, aborted, release,
                           acp_stop_reply_ms=round((client_done - start) / 1e6, 2))
+        if not HOLD_SECONDS:
+            updates = await self.check_reopen("STOP_FIXTURE", result)
+            self.assertIn(DELTA, [u["content"]["text"] for u in updates if u["sessionUpdate"] == "agent_message_chunk"])
 
 
 if __name__ == "__main__":

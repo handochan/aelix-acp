@@ -60,7 +60,7 @@ async def _run_extension_action(server, session, raw) -> dict:
                                        _timeout=getattr(server.args, "command_timeout", 600) or None)
             await session.controls.refresh()
             await session.restore_tools()
-            session.save()
+            await session.save()
             await session.commands()
             return result
         if len(arguments) != 1:

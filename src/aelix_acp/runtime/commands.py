@@ -117,7 +117,7 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         if args:
             await session.rpc("set_session_name", name=args)
         session.state = await session.rpc("get_state")
-        session.save()
+        await session.save()
         await output(session.state.get("sessionName") or "Unnamed session")
     elif name == "export":
         await output(await session.rpc("export_html", **({"outputPath": args} if args else {})))
@@ -187,7 +187,7 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
             if operation == "use":
                 await session.controls.refresh()
                 await session.sync_profile_tools()
-                session.save()
+                await session.save()
                 await session.commands()
         elif operation == "run":
             profile, _, task = remainder.partition(" ")
@@ -219,7 +219,7 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
             raise ProtocolError(f"/{name} failed in the Aelix command handler", -32603)
     if session.proc and session.proc.returncode is None and not session.rpc_closed:
         session.state = await session.rpc("get_state")
-        session.save()
+        await session.save()
     await session.update({"sessionUpdate": "config_option_update", "configOptions": session.controls.options()})
     return True, None
 

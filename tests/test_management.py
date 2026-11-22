@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import Server, Session, ProtocolError
 from aelix_acp.runtime.commands import split_command
 from aelix_acp.runtime.extensions import extension_reference, run_extension_action, same_extension
+from aelix_acp.runtime.store import LiveHistory
 from support import process_alive
 
 
@@ -192,7 +193,7 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
     async def test_delete_reserves_the_actor_until_its_records_are_removed(self):
         self.server.sessions[self.session.id] = self.session
         self.session.cwd = str(self.root.resolve())
-        self.session.save()
+        await self.session.save()
         entered, release = asyncio.Event(), asyncio.Event()
         async def close():
             entered.set()
@@ -238,6 +239,7 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
                 Starting.instances += 1
                 self.id = identifier
                 self.mutation_lock = asyncio.Lock()
+                self.live_history = LiveHistory(server.args.state_dir, identifier)
             async def start(self, filename):
                 entered.set()
                 await release.wait()

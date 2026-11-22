@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -368,6 +369,42 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.prompt("DELEGATE_WRITE"), {"stopReason": "end_turn"})
         self.assertFalse((self.root / "child.txt").exists())
         self.assertIn("Denied by the user", json.dumps(self.child_requests[-1]["messages"][-1]))
+
+    async def test_allow_for_this_agent_reaches_native_while_history_is_locked(self):
+        await self.open(mode="default")
+        asked, allow = asyncio.Event(), asyncio.Event()
+
+        async def decide(params):
+            if ":" not in params["toolCall"]["toolCallId"]:
+                return "allow-once"
+            asked.set()
+            await allow.wait()
+            return "allow-always"
+
+        self.client.permission = decide
+        turn = asyncio.create_task(self.prompt("DELEGATE_WRITE"))
+        await asyncio.wait_for(asked.wait(), 30)
+        proof = self.root / "child.txt"
+        self.assertFalse(proof.exists())
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3", timeout=0)) as db:
+            async with asyncio.timeout(8):
+                while True:
+                    try:
+                        db.execute("BEGIN IMMEDIATE")
+                        break
+                    except sqlite3.OperationalError as error:
+                        if error.sqlite_errorcode != sqlite3.SQLITE_BUSY:
+                            raise
+                        await asyncio.sleep(0.01)
+            try:
+                allow.set()
+                await self.until(lambda: any(u.get("status") == "completed" and ":" in u.get("toolCallId", "")
+                                             for u in self.updates()), timeout=8)
+                self.assertEqual(proof.read_text(encoding="utf-8"), "child")
+                await self.manage("children/list", timeout=8)
+            finally:
+                db.rollback()
+        self.assertEqual(await turn, {"stopReason": "end_turn"})
 
     async def test_session_cancel_denies_an_open_child_request(self):
         await self.open(mode="default")
