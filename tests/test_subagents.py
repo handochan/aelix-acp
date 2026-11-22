@@ -72,6 +72,7 @@ class SessionProgressTests(unittest.IsolatedAsyncioTestCase):
         self.session = Session(self.server, "session", self.temp.name)
 
     async def asyncTearDown(self):
+        await self.session.live_history.flush()
         self.server.db.close()
         self.temp.cleanup()
 
