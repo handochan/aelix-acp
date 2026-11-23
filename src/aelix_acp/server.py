@@ -284,6 +284,8 @@ class Server:
         return session_relay.bind_session(session, result, binding_id)
 
     async def close_session(self, session):
+        # Defense in depth: normal dispatch acquires the activity lease first
+        # and rejects a conflicting request before it reaches this check.
         if session.mutation_lock.locked():
             raise ProtocolError("Session is busy", -32000)
         async with session.mutation_lock:

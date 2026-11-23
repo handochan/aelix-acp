@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import redirect_stderr
+from contextlib import ExitStack, redirect_stderr
 import io
 import sqlite3
 import json
@@ -34,6 +34,88 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         await self.session.live_history.flush()
         self.server.db.close()
         self.tmp.cleanup()
+
+    async def test_close_session_rejects_held_mutation_lock(self):
+        async with self.session.mutation_lock:
+            with self.assertRaises(ProtocolError) as refused:
+                await asyncio.wait_for(self.server.close_session(self.session), timeout=2)
+        self.assertEqual((refused.exception.code, str(refused.exception)), (-32000, "Session is busy"))
+
+    async def test_dispatch_rejects_close_during_prompt_and_keeps_session_usable(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        messages = []
+
+        async def rpc(command, **kwargs):
+            if command == "prompt":
+                messages.append(kwargs["message"])
+                entered.set()
+                await release.wait()
+            return {}
+
+        self.session.rpc = rpc
+        self.server.sessions[self.session.id] = self.session
+        params = {"sessionId": self.session.id, "prompt": [{"type": "text", "text": "First prompt"}]}
+        with patch.object(self.server, "close_session", wraps=self.server.close_session) as close_session:
+            task = asyncio.create_task(self.server.dispatch("session/prompt", params))
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                with self.assertRaises(ProtocolError) as refused:
+                    await asyncio.wait_for(self.server.dispatch("session/close", {"sessionId": self.session.id}), 5)
+                self.assertEqual((refused.exception.code, str(refused.exception)), (-32000, "Session is busy"))
+                close_session.assert_not_awaited()
+            finally:
+                release.set()
+                result = await asyncio.wait_for(task, 5)
+        self.assertEqual(result, {"stopReason": "end_turn"})
+        self.assertIs(self.server.sessions.get(self.session.id), self.session)
+        params["prompt"] = [{"type": "text", "text": "Follow-up prompt"}]
+        self.assertEqual(await self.server.dispatch("session/prompt", params), {"stopReason": "end_turn"})
+        self.assertEqual(messages, ["First prompt", "Follow-up prompt"])
+
+    async def assert_close_rejected_during_start(self, method, params):
+        entered, release = asyncio.Event(), asyncio.Event()
+        starting_session = None
+
+        async def rpc(command, **kwargs):
+            return [] if command == "get_messages" else {}
+
+        with ExitStack() as stack:
+            async def start(session, _session_file):
+                nonlocal starting_session
+                starting_session = session
+                entered.set()
+                await release.wait()
+                session.lease = stack.enter_context(acquire(self.tmp.name, session.id))
+                session.proc = SimpleNamespace(returncode=None)
+                session.rpc = rpc
+
+            stack.enter_context(patch.object(Session, "start", start))
+            task = asyncio.create_task(self.server.dispatch(method, params))
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                with self.assertRaises(ProtocolError) as refused:
+                    await asyncio.wait_for(self.server.dispatch("session/close", {"sessionId": starting_session.id}), 5)
+                self.assertEqual((refused.exception.code, str(refused.exception)), (-32000, "Session is already starting"))
+            finally:
+                release.set()
+                result = await asyncio.wait_for(task, 5)
+
+            session_id = result["sessionId"] if method == "session/new" else params["sessionId"]
+            self.assertIs(self.server.sessions[session_id], starting_session)
+            self.assertNotIn(session_id, self.server.starting_ids)
+
+    async def test_close_rejects_session_while_new_is_starting(self):
+        await self.assert_close_rejected_during_start("session/new", {"cwd": self.tmp.name})
+
+    async def test_close_rejects_session_while_load_is_starting(self):
+        self.session.cwd = str(Path(self.tmp.name).resolve())
+        await self.session.save()
+        await self.assert_close_rejected_during_start("session/load", {"cwd": self.session.cwd, "sessionId": self.session.id})
+
+    async def test_initialize_advertises_session_close(self):
+        result = await self.server.dispatch("initialize", {"protocolVersion": 1})
+        capabilities = result["agentCapabilities"]["sessionCapabilities"]
+        self.assertEqual(capabilities.get("close"), {})
 
     async def test_pending_tool_is_created_once_and_does_not_run_before_permission(self):
         release = asyncio.Event()
