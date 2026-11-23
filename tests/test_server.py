@@ -35,6 +35,28 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.server.db.close()
         self.tmp.cleanup()
 
+    async def test_close_rejects_a_locked_session_with_the_activity_lease_free(self):
+        self.server.sessions[self.session.id] = self.session
+        # Hold only the mutation lock so dispatch can reach the close guard.
+        async with self.session.mutation_lock:
+            with self.assertRaises(ProtocolError) as refused:
+                await asyncio.wait_for(
+                    self.server.dispatch("session/close", {"sessionId": self.session.id}),
+                    timeout=2,
+                )
+        self.assertEqual((refused.exception.code, str(refused.exception)), (-32000, "Session is busy"))
+
+    async def test_close_rejects_a_starting_session(self):
+        self.server.starting_ids.add(self.session.id)
+        with self.assertRaises(ProtocolError) as refused:
+            await self.server.dispatch("session/close", {"sessionId": self.session.id})
+        self.assertEqual((refused.exception.code, str(refused.exception)), (-32000, "Session is already starting"))
+
+    async def test_initialize_advertises_session_close(self):
+        result = await self.server.dispatch("initialize", {"protocolVersion": 1})
+        capabilities = result["agentCapabilities"]["sessionCapabilities"]
+        self.assertEqual(capabilities.get("close"), {})
+
     async def test_pending_tool_is_created_once_and_does_not_run_before_permission(self):
         release = asyncio.Event()
 
