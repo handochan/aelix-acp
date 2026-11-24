@@ -59,6 +59,7 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
         self.child_gate, self.parent_gate = asyncio.Event(), asyncio.Event()
         self.child_waiting = asyncio.Event()
         self.calls = 0
+        self.agent_call_id = None
         self.listener = await asyncio.start_server(self.model, "127.0.0.1", 0)
         port = self.listener.sockets[0].getsockname()[1]
         (self.root / "agent/models.json").write_text(json.dumps({"providers": {"fixture": {
@@ -91,7 +92,8 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
 
     def call(self, name, arguments):
         self.calls += 1
-        return {"role": "assistant", "tool_calls": [{"index": 0, "id": f"call_{name}_{self.calls}", "type": "function",
+        call_id = self.agent_call_id if name == "agent" and self.agent_call_id else f"call_{name}_{self.calls}"
+        return {"role": "assistant", "tool_calls": [{"index": 0, "id": call_id, "type": "function",
                 "function": {"name": name, "arguments": json.dumps(arguments)}}]}, "tool_calls"
 
     async def parent_turn(self, request):
@@ -506,6 +508,9 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
 
     async def open_with_transcript(self, *, extensions=()):
         opened = await self.open(capabilities={**NESTING, "aelix/transcript": {"version": 1}}, extensions=extensions)
+        self.require_transcript(opened)
+
+    def require_transcript(self, opened):
         capability = opened["_meta"].get("aelix/transcriptCapability")
         if capability is None and os.environ.get("AELIX_ACP_REQUIRE_TRANSCRIPT") != "1":
             self.skipTest("This native runtime does not advertise transcript/list")
@@ -565,6 +570,91 @@ def setup(api):
             self.assertEqual(done["_meta"]["aelix/transcript"]["nativeSessionId"], receipt["nativeSessionId"])
             children = done["_meta"]["aelix/subagents"]["children"]
             self.assertEqual(children[0]["id"], live_done["_meta"]["aelix/subagents"]["children"][0]["id"])
+
+    async def test_transcript_replays_subagents_separately_when_call_id_is_reused(self):
+        self.agent_call_id = "call_agent_reused"
+        # Record from a client that has not opted into live transcript metadata.
+        self.require_transcript(await self.open())
+        children_per_turn = []
+        for _ in range(2):
+            self.client.updates.clear()
+            self.assertEqual(await self.prompt("DELEGATE_WRITE"), {"stopReason": "end_turn"})
+            self.assertEqual(self.agent_call(), self.agent_call_id)
+            completed, = [frame for frame in self.card(self.agent_call_id) if frame.get("status") == "completed"]
+            children_per_turn.append(completed["_meta"]["aelix/subagents"])
+        self.assertNotEqual(children_per_turn[0]["children"][0]["id"], children_per_turn[1]["children"][0]["id"])
+        request_counts = len(self.parent_requests), len(self.child_requests)
+        await self.client.close()
+        self.clients.remove(self.client)
+        self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=["--enable-agents"],
+            capabilities={"_meta": {**NESTING, "aelix/transcript": {"version": 1}}})
+        self.clients.append(self.client)
+        previous_ids = None
+        load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        for _ in range(2):
+            self.client.updates.clear()
+            await self.client.request("session/load", load, timeout=120)
+            starts = [frame for frame in self.updates()
+                      if frame.get("sessionUpdate") == "tool_call" and frame.get("title") == "agent"]
+            card_ids = [start["toolCallId"] for start in starts]
+            self.assertEqual(len(set(card_ids)), 2)
+            for card_id, expected in zip(card_ids, children_per_turn, strict=True):
+                start, end = self.card(card_id)
+                self.assertEqual(end["status"], "completed")
+                self.assertEqual(start["_meta"]["aelix/subagents"], expected)
+                self.assertEqual(end["_meta"]["aelix/subagents"], expected)
+            if previous_ids is not None:
+                self.assertEqual(card_ids, previous_ids)
+            previous_ids = card_ids
+        self.assertEqual((len(self.parent_requests), len(self.child_requests)), request_counts)
+
+    async def test_transcript_keeps_late_child_progress_off_a_reused_call_card(self):
+        waiting = [asyncio.Event(), asyncio.Event()]
+        release = [asyncio.Event(), asyncio.Event()]
+
+        async def gated_child(request):
+            index = len(self.child_requests)
+            self.child_requests.append(request)
+            waiting[index].set()
+            await release[index].wait()
+            return {"role": "assistant", "content": f"CHILD_DONE {index}"}, "stop"
+
+        self.child_turn = gated_child
+        self.agent_call_id = "call_agent_reused"
+        await self.open_with_transcript()
+        turn = None
+        try:
+            self.assertEqual(await self.prompt("SPAWN_HOLD"), {"stopReason": "end_turn"})
+            await asyncio.wait_for(waiting[0].wait(), 60)
+            first = self.last_child(self.agent_call_id)["id"]
+            self.client.updates.clear()
+            turn = asyncio.create_task(self.prompt("DELEGATE_HOLD"))
+            await asyncio.wait_for(waiting[1].wait(), 60)
+            release[0].set()
+            await self.until(lambda: any(
+                child.get("id") == first and child.get("end")
+                for update in self.card(self.agent_call_id)
+                if (child := update.get("_meta", {}).get("aelix/child"))))
+            release[1].set()
+            self.assertEqual(await turn, {"stopReason": "end_turn"})
+        finally:
+            for gate in release:
+                gate.set()
+            if turn is not None:
+                await asyncio.gather(turn, return_exceptions=True)
+
+        completed, = [frame for frame in self.card(self.agent_call_id) if frame.get("status") == "completed"]
+        current = [child["id"] for child in completed["_meta"]["aelix/subagents"]["children"] if child["id"] != first]
+        self.assertEqual(len(current), 1)
+        self.client.updates.clear()
+        await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []},
+                                  timeout=120)
+        starts = [frame for frame in self.updates()
+                  if frame.get("sessionUpdate") == "tool_call" and frame.get("title") == "agent"]
+        self.assertEqual(len(starts), 2)
+        children = [[child["id"] for child in self.card(start["toolCallId"])[-1]["_meta"]["aelix/subagents"]["children"]]
+                    for start in starts]
+        self.assertEqual(children, [[first], current])
 
     async def test_transcript_preserves_standalone_nested_tool_updates(self):
         await self.open_with_transcript()

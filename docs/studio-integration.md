@@ -156,10 +156,14 @@ where the call is unambiguous within the selected path. Repeated native
 call IDs get distinct replay card IDs. ACP records the result receipt's
 durable key against the originating call occurrence. A reducer can rewrite
 the stored `tool_call_id`, and replay still completes the original card using
-the stored result. Recorded progress follows the verified origin. Legacy tool
-metadata without a verifiable association stays in the archived display
-history. Tool progress retains `_meta["aelix/subagents"]` and the negotiated
-nested tool metadata. With `aelix/nestedToolCalls`, ACP also replays recorded
+the stored result. Progress on a verified tool stream follows that call
+occurrence, including when another turn reuses its raw call ID. Late progress
+that cannot be attributed to an occurrence stays in the archived display
+history, as does other legacy tool metadata without a verifiable association.
+ACP also excludes already-active children from a later occurrence's replay
+snapshot when their late progress reached the same live raw-ID card.
+Tool progress retains `_meta["aelix/subagents"]` and the negotiated nested
+tool metadata. With `aelix/nestedToolCalls`, ACP also replays recorded
 standalone synthetic parent cards and their nested tool updates, including
 when the native snapshot is empty.
 

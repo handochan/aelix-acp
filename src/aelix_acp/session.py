@@ -1117,8 +1117,12 @@ class Session:
     async def native_update(self, update, event, role):
         supported = self.native_transcript()
         coordinates = transcript.live(event, role) if supported else None
-        if coordinates and self.transcript_enabled():
-            update = transcript.tagged(update, coordinates)
+        recorded_meta = {}
+        if coordinates:
+            if self.transcript_enabled():
+                update = transcript.tagged(update, coordinates)
+            elif role == "toolResult":
+                recorded_meta[transcript.TOOL_STREAM_META] = coordinates
         if event["type"] == "tool_execution_start" and supported:
             call_id = update["toolCallId"]
             origin = None
@@ -1129,10 +1133,17 @@ class Session:
                 self.tool_occurrences[call_id] += 1
             if coordinates is not None:
                 self.pending_tool_results[transcript.stream_key(coordinates)] = (call_id, origin)
-            recorded = {**update, "_meta": {**update.get("_meta", {}), transcript.TOOL_ORIGIN_META: origin}}
-            await self.record_update(update, recorded=recorded)
-        else:
-            await self.record_update(update)
+                # These children were already known when this execution
+                # started. Their late progress can enter the live raw-ID
+                # rollup but belongs outside this occurrence on replay.
+                previous_children = set(self.subagents.children.get(call_id, ())) | {
+                    child_id for (_, child_id), parent in self.children.parents.items() if parent == call_id}
+                if previous_children:
+                    recorded_meta[transcript.TOOL_STREAM_META] = {
+                        **coordinates, "previousChildren": sorted(previous_children)}
+            recorded_meta[transcript.TOOL_ORIGIN_META] = origin
+        recorded = {**update, "_meta": {**update.get("_meta", {}), **recorded_meta}} if recorded_meta else None
+        await self.record_update(update, recorded=recorded)
 
     async def settle_message(self, event, message):
         role = message.get("role")

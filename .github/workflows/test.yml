@@ -85,6 +85,8 @@ jobs:
           test_native_children.NativeChildrenTests.test_a_cancelled_calls_report_is_replayed_by_session_load
           test_native_children.NativeChildrenTests.test_transcript_replays_rewritten_tool_result_on_its_original_card
           test_native_children.NativeChildrenTests.test_transcript_preserves_standalone_nested_tool_updates
+          test_native_children.NativeChildrenTests.test_transcript_replays_subagents_separately_when_call_id_is_reused
+          test_native_children.NativeChildrenTests.test_transcript_keeps_late_child_progress_off_a_reused_call_card
         env:
           PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}/tests
           AELIX_ACP_TEST_AELIX: ${{ github.workspace }}/.native-core/.venv/bin/aelix

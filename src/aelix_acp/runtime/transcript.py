@@ -12,12 +12,14 @@ import uuid
 
 from . import native_history
 from .children import SYNTHETIC_PREFIX, nested_only
+from .subagents import META_KEY as SUBAGENTS_META
 from ..wire.errors import ProtocolError, SESSION_LOCKED
 
 META = "aelix/transcript"
 CAPABILITY = "aelix/transcriptCapability"
 TOOL_RESULT_META = "aelix/transcriptResult"  # SQLite only
 TOOL_ORIGIN_META = "aelix/transcriptOrigin"  # SQLite only
+TOOL_STREAM_META = "aelix/transcriptToolStream"  # SQLite only
 METHOD = "transcript/list"
 SETTLED = "_aelix/transcript/settled"
 VERSION = {"version": 1}
@@ -233,19 +235,52 @@ def recorded_result(call_id, origin, coordinates):
 
 def display_update(update):
     meta = update.get("_meta")
-    if isinstance(meta, dict) and TOOL_ORIGIN_META in meta:
-        del meta[TOOL_ORIGIN_META]
+    if isinstance(meta, dict) and (TOOL_ORIGIN_META in meta or TOOL_STREAM_META in meta):
+        meta.pop(TOOL_ORIGIN_META, None)
+        meta.pop(TOOL_STREAM_META, None)
         if not meta:
             del update["_meta"]
     return update
 
 
-async def _tool_overlay(recorded, native_id, origins, result_entries, nesting):
-    """A provider call ID can recur on a different branch or in another turn."""
-    recorded_origins = {}
+def _recorded_tool_stream(meta):
+    # Earlier adapters kept live coordinates only when the client opted in.
+    coordinates = meta.get(TOOL_STREAM_META, meta.get(META))
+    if isinstance(coordinates, dict) and coordinates.get("source") == "live" and coordinates.get("role") == "toolResult":
+        if all(identifier(coordinates.get(key)) for key in ("nativeSessionId", "bindingId", "streamId")):
+            return stream_key(coordinates)
+    return None
+
+
+def _recorded_tool_fields(meta, previous_children=()):
+    fields = {key: value for key, value in meta.items() if key not in (META, TOOL_ORIGIN_META, TOOL_STREAM_META)}
+    if previous_children and (subagents := fields.get(SUBAGENTS_META)):
+        # A native tool update has a verified stream, but the live ACP
+        # rollup can also contain late events routed by a reused raw ID.
+        fields[SUBAGENTS_META] = {**subagents,
+            "children": [child for child in subagents["children"] if child["id"] not in previous_children]}
+    return fields
+
+
+def _occurrences(rows, native_id):
+    calls = {}
+    for row in rows:
+        entry_id = row.coordinates["entryId"]
+        counts = Counter()
+        for index, update in enumerate(row.updates):
+            if update["sessionUpdate"] == "tool_call":
+                call_id = update["toolCallId"]
+                calls[entry_id, index] = call_id, (native_id, entry_id, counts[call_id])
+                counts[call_id] += 1
+    return calls
+
+
+async def _tool_overlay(recorded, native_id, selected, unique_origins, result_entries, nesting):
+    """Overlay only the metadata whose recorded call is still on this path."""
+    recorded_origins, streams = {}, {}
     ambiguous, synthetic_parents = set(), set()
     links = {}
-    metadata, auxiliary = defaultdict(dict), []
+    metadata, scoped_metadata, auxiliary = defaultdict(dict), defaultdict(dict), []
     auxiliary_bytes = 0
     for index, update in enumerate(recorded):
         if index % 128 == 127:
@@ -261,41 +296,63 @@ async def _tool_overlay(recorded, native_id, origins, result_entries, nesting):
         coordinates = meta.get(META)
         adapter_event = isinstance(coordinates, dict) and coordinates.get("source") == "adapter"
         nested_event = nested_only(update)
+        stream = _recorded_tool_stream(meta)
         if not nested_event and isinstance(call_id, str) and (
                 TOOL_ORIGIN_META in meta or update.get("sessionUpdate") == "tool_call"):
-            key = _origin_key(meta.get(TOOL_ORIGIN_META))
+            origin = _origin_key(meta.get(TOOL_ORIGIN_META))
             if call_id in recorded_origins:
                 ambiguous.add(call_id)
-            recorded_origins[call_id] = key
+            recorded_origins[call_id] = origin
+            occurrence = (call_id, origin)
+            if stream is not None and stream[0] == native_id and occurrence in selected:
+                private = meta.get(TOOL_STREAM_META, {})
+                streams[stream] = (occurrence, set(private.get("previousChildren", ())))
         if adapter_event or nested_event:
             parent = meta.get("parentToolCallId")
             if (nested_event and parent is None and isinstance(call_id, str)
                     and call_id.startswith(SYNTHETIC_PREFIX) and update.get("sessionUpdate") == "tool_call"):
                 synthetic_parents.add(call_id)
             linked = (parent is None or parent in synthetic_parents
-                      or recorded_origins.get(parent) == (native_id, origins.get(parent), 0))
+                      or (parent in unique_origins and recorded_origins.get(parent) == unique_origins[parent]))
             if adapter_event or (nesting and linked):
                 auxiliary_bytes += len(json.dumps(update, ensure_ascii=False).encode("utf-8"))
                 if auxiliary_bytes > MAX_BYTES or len(auxiliary) >= MAX_ROWS:
                     raise native_history.unavailable()
                 auxiliary.append(update)
             continue
-        if isinstance(call_id, str) and recorded_origins.get(call_id) == (native_id, origins.get(call_id), 0):
-            metadata[call_id].update({key: value for key, value in meta.items() if key not in (META, TOOL_ORIGIN_META)})
-    return metadata, auxiliary, ambiguous, synthetic_parents, links
+
+        if not isinstance(call_id, str):
+            continue
+        if stream is not None:
+            scope = streams.get(stream)
+            if scope is None or scope[0][0] != call_id:
+                continue
+            occurrence, previous_children = scope
+            fields = _recorded_tool_fields(meta, previous_children)
+            scoped_metadata[occurrence].update(fields)
+        elif call_id in unique_origins and recorded_origins.get(call_id) == unique_origins[call_id]:
+            occurrence = (call_id, unique_origins[call_id])
+            fields = _recorded_tool_fields(meta)
+        else:
+            continue
+        metadata[occurrence].update(fields)
+
+    # A bare raw ID cannot identify a late frame after reuse, even when
+    # only one of its historical occurrences is on the selected path.
+    associated = unique_origins.keys() - ambiguous
+    return ({occurrence: fields if occurrence[0] in associated else scoped_metadata.get(occurrence)
+             for occurrence, fields in metadata.items()}, auxiliary, associated, synthetic_parents, links)
 
 
 async def reconcile(snapshot, recorded, *, nesting):
     """Project native membership exactly once, preserving associated ACP metadata."""
     native_id = snapshot.marker["nativeSessionId"]
-    call_counts = Counter(update["toolCallId"] for row in snapshot.rows for update in row.updates
-                          if update["sessionUpdate"] == "tool_call")
-    origins = {update["toolCallId"]: row.coordinates["entryId"] for row in snapshot.rows for update in row.updates
-               if update["sessionUpdate"] == "tool_call" and call_counts[update["toolCallId"]] == 1}
+    calls = _occurrences(snapshot.rows, native_id)
+    call_counts = Counter(call_id for call_id, _ in calls.values())
+    unique_origins = {call_id: origin for call_id, origin in calls.values() if call_counts[call_id] == 1}
     result_entries = {row.coordinates["entryId"] for row in snapshot.rows if row.role == "toolResult"}
-    metadata, auxiliary, ambiguous, synthetic_parents, links = await _tool_overlay(
-        recorded, native_id, origins, result_entries, nesting)
-    associated = origins.keys() - ambiguous
+    metadata, auxiliary, associated, synthetic_parents, links = await _tool_overlay(
+        recorded, native_id, set(calls.values()), unique_origins, result_entries, nesting)
     result_counts = Counter(update["toolCallId"] for row in snapshot.rows for update in row.updates
                             if update["sessionUpdate"] == "tool_call_update" and row.coordinates["entryId"] not in links)
     pending = {}
@@ -305,17 +362,15 @@ async def reconcile(snapshot, recorded, *, nesting):
         entry_id = row.coordinates["entryId"]
         if row.role == "assistant":
             current_calls.clear()
-        occurrences_in_row = Counter()
         for index, update in enumerate(row.updates):
+            occurrence = None
             kind = update["sessionUpdate"]
             call_id = update.get("toolCallId")
             if kind == "tool_call":
                 card_id = call_id if call_counts[call_id] == 1 else _card_id(native_id, row, index)
-                origin = (native_id, entry_id, occurrences_in_row[call_id])
-                occurrence = (call_id, origin)
+                occurrence = calls[entry_id, index]
                 pending[occurrence] = card_id
                 current_calls[call_id].append(occurrence)
-                occurrences_in_row[call_id] += 1
                 update = {**update, "toolCallId": card_id}
             elif kind == "tool_call_update":
                 original = links.get(entry_id)
@@ -323,13 +378,17 @@ async def reconcile(snapshot, recorded, *, nesting):
                 card_id = None
                 if original is not None and original[1] is not None:
                     card_id = pending.pop(original, None)
+                    if card_id is not None:
+                        occurrence = original
                 elif original_id == call_id:
                     # If the assistant receipt was lost, retain the usual raw
                     # match for unchanged IDs on the current assistant.
-                    calls = current_calls[call_id]
-                    while calls and card_id is None:
-                        card_id = pending.pop(calls.popleft(), None)
-                call_id = original_id if card_id is not None else None
+                    queue = current_calls[call_id]
+                    while queue and card_id is None:
+                        candidate = queue.popleft()
+                        card_id = pending.pop(candidate, None)
+                        if card_id is not None:
+                            occurrence = candidate
                 if card_id is None:
                     raw_id = update["toolCallId"]
                     if original is None and not call_counts[raw_id] and result_counts[raw_id] == 1:
@@ -340,8 +399,8 @@ async def reconcile(snapshot, recorded, *, nesting):
                                          "title": "tool", "kind": "other", "status": "in_progress"}, row, native_id, part)
                     part += 1
                 update = {**update, "toolCallId": card_id}
-            if call_id in associated and metadata.get(call_id):
-                update = {**update, "_meta": metadata[call_id]}
+            if fields := metadata.get(occurrence):
+                update = {**update, "_meta": fields}
             yield replay_update(update, row, native_id, part)
             part += 1
     for update in auxiliary:

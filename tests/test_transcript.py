@@ -92,13 +92,29 @@ class TranscriptToolTests(unittest.IsolatedAsyncioTestCase):
             )
         ]
         snapshot = transcript.Snapshot({"nativeSessionId": "native"}, rows)
-        updates = [update async for update in transcript.reconcile(snapshot, (), nesting=True)]
+        progress = [{"version": 1, "children": [{"id": f"child-{index}"}]} for index in (1, 2)]
+        recorded = []
+        for index, (start_seq, end_seq) in enumerate(((1, 2), (3, 4))):
+            # The same stream ID on another binding belongs to another call.
+            coordinates = {"source": "live", "role": "toolResult", "nativeSessionId": "native",
+                           "bindingId": f"worker-{index}", "streamId": "execution"}
+            key = transcript.META if index == 0 else transcript.TOOL_STREAM_META
+            origin = {"nativeSessionId": "native", "entryId": str(start_seq)}
+            recorded.extend([
+                {**call, "_meta": {transcript.TOOL_ORIGIN_META: origin, key: coordinates}},
+                {**result, "_meta": {key: coordinates, "aelix/subagents": progress[index]}},
+                transcript.recorded_result("same", origin, {"nativeSessionId": "native", "entryId": str(end_seq)}),
+            ])
+        recorded.append({**result, "_meta": {"aelix/subagents": {"children": [{"id": "ambiguous-late-child"}]}}})
+        updates = [update async for update in transcript.reconcile(snapshot, recorded, nesting=True)]
         tool_ids = [update["toolCallId"] for update in updates]
         self.assertEqual(tool_ids[0], tool_ids[1])
         self.assertEqual(tool_ids[2], tool_ids[3])
         self.assertNotEqual(tool_ids[0], tool_ids[2])
         self.assertEqual([update["_meta"][transcript.META]["sequence"] for update in updates], [1, 2, 3, 4])
-
+        self.assertEqual([update["_meta"]["aelix/subagents"] for update in updates],
+                         [progress[0], progress[0], progress[1], progress[1]])
+        self.assertTrue(all(set(update["_meta"]) == {transcript.META, "aelix/subagents"} for update in updates))
 
     async def test_rewritten_duplicate_calls_follow_receipt_occurrences(self):
         call = {"sessionUpdate": "tool_call", "toolCallId": "same", "status": "in_progress"}
