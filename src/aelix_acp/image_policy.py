@@ -35,6 +35,12 @@ MAX_HEADER = 256 * 1024
 
 
 RESPONSES_APIS = frozenset({"openai-responses", "openai-codex-responses"})
+SDK_BODY_APIS = frozenset({"openai-completions", "openai-responses"})
+SDK_REQUEST_OPTIONS = frozenset({"extra_headers", "extra_query", "timeout"})
+SDK_EXTRA_BODY_KEYS = frozenset({
+    "reasoning", "provider", "enable_thinking", "chat_template_kwargs",
+    "thinking", "tool_stream", "providerOptions", "prompt_cache_retention",
+})
 VERIFIED_IMAGE_POLICIES = (
     {
         "route": ("openai-codex", "gpt-6-luna", "openai-codex-responses", "https://chatgpt.com/backend-api"),
@@ -365,10 +371,36 @@ def completions_images(payload):
             pending.extend(value)
 
 
+def provider_body_bytes(payload, api):
+    """Encode the pinned Codex body or a qualified SDK route that sends JSON."""
+    if api in SDK_BODY_APIS:
+        params = {key: value for key, value in payload.items() if key not in SDK_REQUEST_OPTIONS}
+        # The native adapters relocate provider fields after the hook. Let the
+        # same functions determine the order in which the SDK appends them.
+        relocated = SDK_EXTRA_BODY_KEYS if api == "openai-completions" else {"prompt_cache_retention"}
+        if params.keys() & relocated:
+            if api == "openai-completions":
+                from aelix_ai.providers.openai_completions import _relocate_extra_body_params
+            else:
+                from aelix_ai.providers.openai_responses import _relocate_extra_body_params
+            _relocate_extra_body_params(params)
+        extra = params.pop("extra_body", {})
+        # openai 2.54.0 create() emits schema order, with the two required
+        # Completions arguments first. Codex passes its dict straight to httpx.
+        order = ("messages", "model") if api == "openai-completions" else ()
+        keys = sorted(params, key=lambda key: (key not in order, key))
+        payload = {**{key: params[key] for key in keys}, **extra}
+    # The SDK's openapi_dumps and httpx 0.28.1's encode_json use these options.
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
 def validate_payload(payload, policy, expected):
     """Validate the serialized image parts against the context window before HTTP."""
+    if not isinstance(payload, dict) or "extra_body" in payload:
+        raise ImageRejected("unmeasurable-provider-payload")
+    api = policy["route"][2]
     try:
-        wire = json.dumps(payload, allow_nan=False, ensure_ascii=True).encode("ascii")
+        wire = provider_body_bytes(payload, api)
         if len(wire) > policy["bodyBytes"]:
             raise ImageRejected("provider-body-limit")
         body = json.loads(wire)
@@ -376,9 +408,7 @@ def validate_payload(payload, policy, expected):
         raise
     except (TypeError, ValueError, RecursionError):
         raise ImageRejected("unmeasurable-provider-payload") from None
-    if not isinstance(body, dict) or "extra_body" in body:
-        raise ImageRejected("unmeasurable-provider-payload")
-    urls = responses_images(body) if policy["route"][2] in RESPONSES_APIS else completions_images(body)
+    urls = responses_images(body) if api in RESPONSES_APIS else completions_images(body)
     images = Counter()
     image_count = raw_bytes = encoded_bytes = 0
     budget = limits(policy)
@@ -407,6 +437,8 @@ def validate_payload(payload, policy, expected):
         > policy["contextTokens"]
     ):
         raise ImageRejected("provider-context-limit")
+    if api in SDK_BODY_APIS:
+        body.update((key, payload[key]) for key in SDK_REQUEST_OPTIONS if key in payload)
     return body
 
 
