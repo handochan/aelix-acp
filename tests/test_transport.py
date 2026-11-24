@@ -142,15 +142,16 @@ class NonBlockingWriterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(os.read(read_fd, 4096), b"fir")
         self.assertEqual(attempts, 2)
 
-
-    def test_file_enospc_is_permanent(self):
+    def test_regular_file_errors_remain_permanent(self):
         with tempfile.TemporaryFile() as output:
-            failure = OSError(errno.ENOSPC, "disk is full")
-            with patch("aelix_acp.stdio.os.write", side_effect=failure) as write:
-                with self.assertRaises(OSError) as raised:
-                    write_all(output.fileno(), b"frame")
-                self.assertIs(raised.exception, failure)
-                write.assert_called_once()
+            for code in (errno.ENOSPC, errno.EINVAL):
+                with self.subTest(code=code):
+                    failure = OSError(code, "injected file write error")
+                    with patch("aelix_acp.stdio.os.write", side_effect=failure) as write:
+                        with self.assertRaises(OSError) as raised:
+                            write_all(output.fileno(), b"frame")
+                        self.assertIs(raised.exception, failure)
+                        write.assert_called_once()
 
 
 @unittest.skipUnless(os.name == "posix", "Requires POSIX non-blocking pipes")

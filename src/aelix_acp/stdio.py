@@ -80,14 +80,37 @@ class StdinReader:
         self.stopped.set()
 
 
+def _write_windows(fd, raw):
+    try:
+        return os.write(fd, raw)
+    except OSError as error:
+        if error.errno != errno.EINVAL or not stat.S_ISFIFO(os.fstat(fd).st_mode):
+            raise
+        # CRT _write can report ERROR_NO_DATA as EINVAL when a nowait pipe
+        # closes. WriteFile preserves the Win32 error, which CPython maps
+        # to BrokenPipeError. It also leaves unrelated EINVAL failures intact.
+        from _winapi import WriteFile
+        from msvcrt import get_osfhandle
+        try:
+            written, _ = WriteFile(get_osfhandle(fd), raw)
+        except OSError as win_error:
+            if win_error.winerror == 233:  # ERROR_PIPE_NOT_CONNECTED
+                raise BrokenPipeError(errno.EPIPE, win_error.strerror) from win_error
+            raise
+        if not written:
+            raise BlockingIOError(errno.EAGAIN, "Windows pipe has no write space") from None
+        return written
+
+
 def write_all(fd, raw):
     """Finish a raw write without changing the inherited descriptor's flags."""
+    write = _write_windows if os.name == "nt" else os.write
     remaining = memoryview(raw)
     writable = None
     size = len(remaining)
     while remaining:
         try:
-            written = os.write(fd, remaining[:size])
+            written = write(fd, remaining[:size])
         except OSError as error:
             if os.name == "nt" and error.errno == errno.ENOSPC and stat.S_ISFIFO(os.fstat(fd).st_mode):
                 # Python 3.11 exposes the CRT's ENOSPC when a nowait pipe writes
