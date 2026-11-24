@@ -25,12 +25,12 @@ Run with the installed, unchanged wheels from Studio native `83714045439478b17ab
 
 ```sh
 PYTHONPATH=src "$native/python" scripts/test_running_images.py --aelix "$native/aelix" --stop-trials 100
-PYTHONPATH=src "$native/python" scripts/test_running_images_host.py --host "$host" --aelix "$native/aelix"
+PYTHONPATH=src "$native/python" scripts/test_running_images_host.py --host "$host" --aelix "$native/aelix" --studio "$studio"
 ```
 
 The review run used the deployed 64 KiB native stdout reader. The macOS arm64 pinned-wheel loopback covered 26 provider requests, the ordered text/image submissions in both native queues, and a 48,944,611 B `agent_end` frame. The worker settled Stop and served the next explicit request.
 
-The paired Host probe confirms the protected byte grant and immutable re-prepare. It also verifies that standard assistant, tool and RPC error markers reach the Host wire, then checks Host SDK TRACE and HTTP diagnostics for raw and JSON-escaped copies. Use `--expect-sdk-leak` against the original H-1 head as a positive control. Renderer console and crash breadcrumbs require Studio integration evidence.
+The paired Host probe uses Bun and a Studio checkout with its workspace dependencies installed. It drives the Studio running-input client through the protected Host. The client reports `unknown` after an aborted image-write HTTP request and recovers the receipt by looking up the original key. The probe confirms the immutable re-prepare and verifies that standard assistant, tool and RPC error markers reach the Host wire, then checks Host SDK TRACE and HTTP diagnostics for raw and JSON-escaped copies. Use `--expect-sdk-leak` against the original H-1 head as a positive control. Renderer console and crash breadcrumbs require Studio integration evidence.
 
 The pipe timing probe writes an 8,387,799 B steer line to an OS subprocess and immediately writes abort while the peer delays reading for 20 ms. It measures until the abort ACK. Native/provider settling is measured separately above.
 

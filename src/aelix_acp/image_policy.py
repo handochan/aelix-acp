@@ -8,6 +8,8 @@ import re
 import struct
 import zlib
 from collections import Counter
+from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import replace
 from pathlib import Path
 
@@ -35,6 +37,18 @@ MAX_HEADER = 256 * 1024
 
 
 RESPONSES_APIS = frozenset({"openai-responses", "openai-codex-responses"})
+SDK_BODY_APIS = frozenset({"openai-completions", "openai-responses"})
+SDK_REQUEST_OPTIONS = frozenset({"extra_headers", "extra_query", "timeout"})
+_HTTP_TOKEN = r"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
+_HTTP_QUOTED = r'"(?:[^"\\\r\n]|\\[^\r\n])*"'
+JSON_CONTENT_TYPE = re.compile(
+    rf"application/json(?:[ \t]*;[ \t]*{_HTTP_TOKEN}[ \t]*=[ \t]*(?:{_HTTP_TOKEN}|{_HTTP_QUOTED}))*",
+    re.IGNORECASE | re.ASCII,
+)
+SDK_EXTRA_BODY_KEYS = frozenset({
+    "reasoning", "provider", "enable_thinking", "chat_template_kwargs",
+    "thinking", "tool_stream", "providerOptions", "prompt_cache_retention",
+})
 VERIFIED_IMAGE_POLICIES = (
     {
         "route": ("openai-codex", "gpt-6-luna", "openai-codex-responses", "https://chatgpt.com/backend-api"),
@@ -365,20 +379,76 @@ def completions_images(payload):
             pending.extend(value)
 
 
-def validate_payload(payload, policy, expected):
+def content_type_headers(headers):
+    if headers is None:
+        return {}
+    if not isinstance(headers, Mapping):
+        raise ImageRejected("unmeasurable-provider-payload")
+    return {name: value for name, value in headers.items()
+            if isinstance(name, (str, bytes)) and name.lower() in ("content-type", b"content-type")}
+
+
+def require_sdk_json(provider_headers, extra_headers):
+    # OpenAI merges mappings by exact spelling, then httpx looks up headers
+    # case-insensitively. Different spellings can therefore coexist on the wire.
+    effective = {"Content-Type": "application/json", **provider_headers, **content_type_headers(extra_headers)}
+    content_types = []
+    for value in effective.values():
+        if isinstance(value, bytes):
+            value = value.decode("ascii")
+        if not isinstance(value, str):
+            from openai import Omit
+
+            if isinstance(value, Omit):
+                continue
+            raise ImageRejected("unmeasurable-provider-payload")
+        content_types.append(value)
+    # httpx joins different spellings with a comma. Content-Type is a single
+    # media type, so a duplicate or a missing field is unverifiable.
+    if len(content_types) != 1 or not JSON_CONTENT_TYPE.fullmatch(content_types[0].strip(" \t")):
+        raise ImageRejected("unmeasurable-provider-payload")
+
+
+def provider_body_bytes(payload, api):
+    """Encode the pinned Codex body or a qualified SDK route that sends JSON."""
+    if api in SDK_BODY_APIS:
+        params = {key: value for key, value in payload.items() if key not in SDK_REQUEST_OPTIONS}
+        # The native adapters relocate provider fields after the hook. Let the
+        # same functions determine the order in which the SDK appends them.
+        relocated = SDK_EXTRA_BODY_KEYS if api == "openai-completions" else {"prompt_cache_retention"}
+        if params.keys() & relocated:
+            if api == "openai-completions":
+                from aelix_ai.providers.openai_completions import _relocate_extra_body_params
+            else:
+                from aelix_ai.providers.openai_responses import _relocate_extra_body_params
+            _relocate_extra_body_params(params)
+        extra = params.pop("extra_body", {})
+        # openai 2.54.0 create() emits schema order, with the two required
+        # Completions arguments first. Codex passes its dict straight to httpx.
+        order = ("messages", "model") if api == "openai-completions" else ()
+        keys = sorted(params, key=lambda key: (key not in order, key))
+        payload = {**{key: params[key] for key in keys}, **extra}
+    # The SDK's openapi_dumps and httpx 0.28.1's encode_json use these options.
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def validate_payload(payload, policy, expected, *, sdk_headers=None):
     """Validate the serialized image parts against the context window before HTTP."""
+    if not isinstance(payload, dict) or "extra_body" in payload:
+        raise ImageRejected("unmeasurable-provider-payload")
+    api = policy["route"][2]
     try:
-        wire = json.dumps(payload, allow_nan=False, ensure_ascii=True).encode("ascii")
+        if api in SDK_BODY_APIS:
+            require_sdk_json(sdk_headers or {}, payload.get("extra_headers"))
+        wire = provider_body_bytes(payload, api)
         if len(wire) > policy["bodyBytes"]:
             raise ImageRejected("provider-body-limit")
         body = json.loads(wire)
     except ImageRejected:
         raise
-    except (TypeError, ValueError, RecursionError):
+    except (TypeError, ValueError, RecursionError, ImportError):
         raise ImageRejected("unmeasurable-provider-payload") from None
-    if not isinstance(body, dict) or "extra_body" in body:
-        raise ImageRejected("unmeasurable-provider-payload")
-    urls = responses_images(body) if policy["route"][2] in RESPONSES_APIS else completions_images(body)
+    urls = responses_images(body) if api in RESPONSES_APIS else completions_images(body)
     images = Counter()
     image_count = raw_bytes = encoded_bytes = 0
     budget = limits(policy)
@@ -407,6 +477,8 @@ def validate_payload(payload, policy, expected):
         > policy["contextTokens"]
     ):
         raise ImageRejected("provider-context-limit")
+    if api in SDK_BODY_APIS:
+        body.update((key, payload[key]) for key in SDK_REQUEST_OPTIONS if key in payload)
     return body
 
 
@@ -424,6 +496,7 @@ def setup(api):
     ready_path = state_path.with_name("image-ready")
     sequence = 0
     projected = sending = None
+    sdk_request = ContextVar("image-sdk-request", default=None)
 
     async def reset(event, ctx):
         nonlocal projected, sending
@@ -447,6 +520,18 @@ def setup(api):
         if stats["omittedCount"] or images:
             return ContextResult(messages=messages)
 
+    async def before_request(event, ctx):
+        route = model_fields(event.model) if event.model else None
+        sdk_request.set(None)
+        if route and route[2] in SDK_BODY_APIS and policy_for(event.model, policies):
+            # This last hook sees the chained provider/auth options before the
+            # native adapter merges them over the model's client defaults.
+            headers = {
+                **content_type_headers(event.model.headers),
+                **content_type_headers(event.stream_options.get("headers")),
+            }
+            sdk_request.set((route, headers))
+
     async def before_payload(event, ctx):
         nonlocal sending, sequence
         sending = None
@@ -460,7 +545,13 @@ def setup(api):
         if not isinstance(event.payload, dict) or event.payload.get("model") != route[1]:
             raise ImageRejected("provider-route-changed")
         expected = projected[1] if projected and route == projected[0] else Counter()
-        payload = validate_payload(event.payload, policy, expected)
+        headers = None
+        if route[2] in SDK_BODY_APIS:
+            request = sdk_request.get()
+            if request is None or request[0] != route:
+                raise ImageRejected("unmeasurable-provider-payload")
+            headers = request[1]
+        payload = validate_payload(event.payload, policy, expected, sdk_headers=headers)
         if projected and route == projected[0] and projected[3]:
             sequence += 1
             sending = {
@@ -487,6 +578,7 @@ def setup(api):
     api.on("before_agent_start", reset)
     api.on("message_end", mark_image_origin, error_mode="throw")
     api.on("context", window, error_mode="throw")
+    api.on("before_provider_request", before_request, error_mode="throw")
     api.on("before_provider_payload", before_payload, error_mode="throw")
     api.on("after_provider_response", after_response)
     api.on("session_before_compact", reset)

@@ -34,10 +34,10 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def make_image(label, size=None):
+def make_image(label, size=None, *, dimensions=(1, 1)):
     output = io.BytesIO()
     color = tuple(hashlib.sha256(label.encode()).digest()[:3])
-    image = Image.new("RGB", (1, 1), color)
+    image = Image.new("RGB", dimensions, color)
     image.save(output, "JPEG" if label.endswith(".jpg") else "PNG")
     sample = output.getvalue()
     if size is None:
@@ -143,8 +143,8 @@ def setup(api):
 """, encoding="utf-8")
         return package
 
-    def add_image(self, label, size):
-        data = make_image(label, size)
+    def add_image(self, label, size=None, *, dimensions=(1, 1)):
+        data = make_image(label, size, dimensions=dimensions)
         (self.root / "images" / label).write_bytes(data)
         mime = "image/jpeg" if label.endswith(".jpg") else "image/png"
         fingerprint = digest(data)
@@ -226,6 +226,8 @@ def setup(api):
             wire_id = f"http-{len(self.requests) + 1}"
             self.requests.append({"status": status, "error": error, "httpBytes": length, "rawBytes": raw,
                                   "providerRequestId": wire_id, "model": request["model"],
+                                  "httpSha256": digest(body),
+                                  "outputTokens": max(request.get("max_tokens", 0), request.get("max_completion_tokens", 0)),
                                   "base64Bytes": sum(b64 for _, _, b64 in sizes), "images": images,
                                   "placeholders": placeholders, "messages": rows})
             response = (json.dumps({"error": {"message": error, "type": "invalid_request_error",

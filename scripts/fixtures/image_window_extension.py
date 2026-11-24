@@ -1,13 +1,16 @@
 """Trusted extensions used only by the A-0 probe."""
+import asyncio
 import base64
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
+from runpy import run_path
 import uuid
 
 from aelix_agent_core.harness.hooks import (
-    BeforeProviderPayloadResult, ContextResult, MessageEndEventResult, ToolResultPatch,
+    BeforeAgentStartResult, BeforeProviderPayloadResult, ContextResult, MessageEndEventResult, ToolResultPatch,
 )
 from aelix_agent_core.types import AgentTool
 from aelix_ai.messages import ImageContent, TextContent
@@ -41,6 +44,8 @@ def setup(api):
         text = message.content[0].text
         if text == "steer":
             content = [message.content[0], fixture_image("steer.jpg"), fixture_image("steer-added.png")]
+        elif text in ("dimension-8000", "dimension-8001"):
+            content = [message.content[0], fixture_image(f"{text}.png")]
         elif text == "legacy large":
             image = fixture_image("legacy-large.png")
             content = [message.content[0], ImageContent(source="data:image/png;base64," + image.data)]
@@ -59,11 +64,39 @@ def setup(api):
             return BeforeProviderPayloadResult(payload={**payload, "messages": [*payload["messages"], extra]})
         return None
 
+    async def fixed_system_prompt(event, ctx):
+        if Path(ctx.cwd, "provider-body.jsonl").is_file():
+            # The default prompt contains today's date. Keep every boundary
+            # case byte-for-byte identical even if the probe crosses midnight.
+            return BeforeAgentStartResult(system_prompt="Synthetic image budget fixture.")
+
+    async def measure_body(event, ctx):
+        path = Path(ctx.cwd, "provider-body.jsonl")
+        if path.is_file():
+            policy_path = Path(__file__).resolve().parents[2] / "src/aelix_acp/image_policy.py"
+            encode = run_path(str(policy_path))["provider_body_bytes"]
+            body = encode(event.payload, event.model.api)
+            with path.open("a", encoding="ascii") as file:
+                file.write(json.dumps([len(body), hashlib.sha256(body).hexdigest()]) + "\n")
+
+    async def hold_after_drain(event, ctx):
+        gate = Path(ctx.cwd, "hold-after-drain")
+        if gate.is_file():
+            reader, writer = await asyncio.open_connection("127.0.0.1", int(gate.read_text()))
+            try:
+                assert await reader.readexactly(1) == b"!"
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
     api.register_tool(AgentTool(name="fixture_image", description="Return fixture pixels",
                                 parameters={"type": "object", "properties": {}}, execute=execute))
     api.on("tool_result", tool_result)
     api.on("message_end", message_end)
     api.on("before_provider_payload", reinsert_image)
+    api.on("before_agent_start", fixed_system_prompt, error_mode="throw")
+    api.on("before_provider_payload", measure_body, error_mode="throw")
+    api.on("agent_end", hold_after_drain, error_mode="throw")
 
 
 def image_raw_bytes(block):

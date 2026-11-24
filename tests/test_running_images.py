@@ -552,6 +552,33 @@ class ImageRelayTests(unittest.IsolatedAsyncioTestCase):
             {"status": "unknown"},
         )
 
+    async def test_cancel_after_image_write_retains_unknown_at_original_key(self):
+        default = self.session.rpc.side_effect
+        written = asyncio.Event()
+        writes = []
+
+        async def stall_after_write(command, **kwargs):
+            if command == "get_state":
+                return await default(command, **kwargs)
+            kwargs["_image_write"][1]()
+            writes.append(command)
+            written.set()
+            await asyncio.Future()
+
+        self.session.rpc.side_effect = stall_after_write
+        request = asyncio.create_task(self.submit())
+        original = {"requestId": self.input()["requestId"]}
+        try:
+            await asyncio.wait_for(written.wait(), 5)
+            self.assertEqual(await self.request(session_relay.LOOKUP_METHOD, original), {"status": "pending"})
+        finally:
+            request.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+        self.assertEqual(await self.request(session_relay.LOOKUP_METHOD, original), {"status": "unknown"})
+        self.assertEqual(writes, ["steer"])
+        self.server.host_bytes.acquire.assert_awaited_once()
+
     async def test_timeout_after_write_does_not_reissue(self):
         default = self.session.rpc.side_effect
 
