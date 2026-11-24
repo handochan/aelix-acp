@@ -33,48 +33,76 @@ def marker_variants(marker):
     return {value.encode("utf-8") for value in variants}
 
 
-async def cancel_h1_http_after_handoff(port, path, token, request_body, handoffs, lookup):
-    reader, writer = await asyncio.open_connection("127.0.0.1", port)
-    body = json.dumps(request_body).encode("utf-8")
-    writer.write(
-        f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
-        f"x-aionui-studio-auth: {token}\r\nContent-Type: application/json\r\n"
-        f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii") + body
-    )
-    await writer.drain()
-    response = asyncio.create_task(reader.read(1))
+async def cancel_h1_http_after_handoff(root, studio, bun, caller_config, handoffs):
+    fixture = Path(__file__).resolve().parent / "fixtures/running_input_host.ts"
+    log_path = root / "studio-caller.log"
+    with log_path.open("wb") as log:
+        caller = await asyncio.create_subprocess_exec(
+            str(bun), "--tsconfig-override", str(studio / "tsconfig.json"), str(fixture),
+            cwd=studio, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=log,
+        )
+
+    async def command(text):
+        caller.stdin.write(text.encode("utf-8") + b"\n")
+        await caller.stdin.drain()
+
+    async def result():
+        line = await caller.stdout.readline()
+        assert line, log_path.read_text(encoding="utf-8", errors="replace")
+        return json.loads(line)
+
     ack_writer = None
     try:
-        async with asyncio.timeout(10):
-            ack_reader, ack_writer = await handoffs.get()
-            assert await ack_reader.readline() == b"written 1\n"
-            assert not response.done(), "Host returned an HTTP response before ACP settled the receipt"
-            response.cancel()
-            writer.transport.abort()
+        async with asyncio.timeout(20):
+            await command(json.dumps(caller_config))
+            # A native ACK marks handoff. The actual Studio transport aborts its
+            # fetch while ACP still holds the unsettled H1 receipt.
+            handoff = asyncio.create_task(handoffs.get())
+            sent = asyncio.create_task(result())
             try:
-                await response
-            except asyncio.CancelledError:
-                outcome = "unknown"
-            else:
-                raise AssertionError("The cancelled HTTP request returned a result")
-            await writer.wait_closed()
-            assert await lookup() == {"status": "pending"}
+                await asyncio.wait({handoff, sent}, return_when=asyncio.FIRST_COMPLETED)
+                if sent.done():
+                    raise AssertionError(f"Studio finished before native handoff: {sent.result()}")
+                ack_reader, ack_writer = handoff.result()
+                assert await ack_reader.readline() == b"written 1\n"
+                await command("cancel")
+                observed = await sent
+            finally:
+                for task in (handoff, sent):
+                    if not task.done():
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
+            receipt = observed["receipt"]
+            assert receipt["status"] == "unknown", receipt
+            assert receipt["failure"] == {"status": 0} and observed["preserveDraft"]
+            assert receipt["requestId"] == caller_config["requestId"] and observed["writes"] == 1
+            await command("lookup")
+            assert await result() == {"status": "pending"}
             ack_writer.write(b"!")
             await ack_writer.drain()
             assert await ack_reader.readline() == b"settled 1\n"
-            found = await lookup()
-            assert found["status"] == "completed", found
-            assert found["result"]["accepted"] and found["result"]["captionAdded"], found
-            return outcome, found["result"]
+            await command("lookup")
+            found = await result()
+            assert found["writes"] == 1 and found["result"]["status"] == "completed", found
+            final = found["result"]["receipt"]
+            for key in ("bindingId", "turnId", "requestId", "mode"):
+                assert receipt[key] == final[key], found
+            assert final["status"] == "queued" and final["captionAdded"], found
+            caller.stdin.close()
+            assert await caller.wait() == 0, log_path.read_text(encoding="utf-8", errors="replace")
+            return receipt, observed["grant"]
     finally:
-        response.cancel()
-        writer.close()
+        caller.stdin.close()
         if ack_writer is not None:
             ack_writer.close()
             await ack_writer.wait_closed()
+        if caller.returncode is None:
+            caller.kill()
+            await caller.wait()
 
 
-async def host_run(root, host_bin, aelix, *, expect_sdk_leak=False):
+async def host_run(root, host_bin, aelix, studio, bun, *, expect_sdk_leak=False):
     from spike_image_window import Probe, sse
     from test_running_images import key
 
@@ -373,17 +401,6 @@ server.main()
         )
         scope = "/api/conversations/" + created["id"]
         await api(scope + "/runtime/ensure", "POST")
-        discovery = await api(scope + "/acp-extensions")
-        assert discovery["hostBytes"] is True, discovery
-        binding = discovery["bindingId"]
-
-        async def call(method, payload):
-            result = await api(
-                scope + "/acp-extensions",
-                "POST",
-                {"bindingId": binding, "method": "_aelix/session/" + method, "payload": payload},
-            )
-            return result["result"]
 
         async def wait_idle():
             async with asyncio.timeout(10):
@@ -399,41 +416,25 @@ server.main()
 
         await api(scope + "/messages", "POST", {"content": prompt_marker})
         await asyncio.wait_for(probe.arrivals.get(), 10)
-        async with asyncio.timeout(5):
-            while not (running := await call("input/state", {}))["active"]:
-                await asyncio.sleep(0.05)
-        prepare = {"bindingId": binding, "prepareId": key(1), "refs": [{"kind": "local", "path": str(fixture)}]}
-        original = await api(scope + "/byte-grants", "POST", prepare)
-        assert original["grants"][0]["sha256"] == hashlib.sha256(raw).hexdigest()
-        fixture.write_bytes(b"changed after grant")
-        replay = await api(scope + "/byte-grants", "POST", prepare)
-        assert original["grants"] == replay["grants"] and original["expiresAtMs"] == replay["expiresAtMs"]
-        data = {
-            "turnId": running["turnId"],
-            "requestId": key(1),
-            "message": "",
-            "grants": [original["grants"][0]["id"]],
-        }
-        async def lookup():
-            return await call("requests/lookup", {"requestId": key(1)})
-
-        outcome, result = await cancel_h1_http_after_handoff(
-            port,
-            scope + "/acp-extensions",
-            token,
-            {"bindingId": binding, "method": "_aelix/session/input/steer-images", "payload": data},
+        receipt, grant = await cancel_h1_http_after_handoff(
+            root, studio, bun,
+            {"port": port, "token": token, "conversationId": created["id"],
+             "requestId": key(1), "path": str(fixture)},
             handoffs,
-            lookup,
         )
-        assert outcome == "unknown"
-        assert result["inputKind"] == "pixels" and result["turnId"] == running["turnId"], result
+        assert grant["sha256"] == hashlib.sha256(raw).hexdigest()
+        binding = receipt["bindingId"]
         probe.gate.set()
         async with asyncio.timeout(10):
             while len(probe.requests) < 2:
                 await asyncio.sleep(0.05)
         assert probe.requests[-1]["images"] == ["private-file-marker.png"]
         async with asyncio.timeout(5):
-            while (await call("input/image-state", {}))["status"] != "available":
+            while True:
+                payload = {"bindingId": binding, "method": "_aelix/session/input/image-state", "payload": {}}
+                code, answer = await asyncio.to_thread(get, scope + "/acp-extensions", "POST", payload)
+                if code == 200 and answer["data"]["result"]["status"] == "available":
+                    break
                 await asyncio.sleep(0.05)
         await wait_idle()
         inject_tool = True
@@ -485,14 +486,14 @@ server.main()
         assert not leaked, f"Standard frame markers in Host diagnostics: {leaked}"
     assert base64.b64encode(raw)[:76] not in logs
     assert hashlib.sha256(raw).hexdigest().encode() not in logs
-    assert original["grants"][0]["id"].encode() not in logs
+    assert grant["id"].encode() not in logs
     print(
         json.dumps(
             {
                 "hostBytes": True,
                 "idempotentPrepare": True,
                 "providerImages": 1,
-                "httpCancelledOutcome": outcome,
+                "httpCancelledOutcome": receipt["status"],
                 "originalKeyRecovered": True,
                 "nativeImageWrites": 1,
                 "observedStandardFrames": sorted(observed),
@@ -506,6 +507,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", type=Path, required=True)
     parser.add_argument("--aelix", type=Path, required=True)
+    parser.add_argument("--studio", type=Path, required=True, help="Studio checkout with its dependencies installed")
+    parser.add_argument("--bun", default="bun", help="Bun executable")
     parser.add_argument("--expect-sdk-leak", action="store_true", help="positive control for the old H-1 binary")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="acp-h1-pair-") as location:
@@ -514,6 +517,8 @@ def main():
                 Path(location).resolve(),
                 args.host.resolve(),
                 args.aelix.resolve(),
+                args.studio.resolve(),
+                args.bun,
                 expect_sdk_leak=args.expect_sdk_leak,
             )
         )
