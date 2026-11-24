@@ -5,6 +5,7 @@ import errno
 import os
 import queue
 import select
+import stat
 import sys
 import threading
 import time
@@ -83,11 +84,18 @@ def write_all(fd, raw):
     """Finish a raw write without changing the inherited descriptor's flags."""
     remaining = memoryview(raw)
     writable = None
+    size = len(remaining)
     while remaining:
         try:
-            written = os.write(fd, remaining)
+            written = os.write(fd, remaining[:size])
         except OSError as error:
-            if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+            if os.name == "nt" and error.errno == errno.ENOSPC and stat.S_ISFIFO(os.fstat(fd).st_mode):
+                # Python 3.11 exposes the CRT's ENOSPC when a nowait pipe writes
+                # zero bytes. Retry a smaller write before waiting for space.
+                if size > 1:
+                    size //= 2
+                    continue
+            elif error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                 raise
             if os.name == "nt":
                 # select() cannot wait on Windows pipe handles.
@@ -102,30 +110,44 @@ def write_all(fd, raw):
         if not written:
             raise BrokenPipeError("Client stdout closed")
         remaining = remaining[written:]
+        size = len(remaining)
 
 
-_stderr_lock = threading.Lock()
-_diagnostics = queue.Queue(maxsize=8)
-_diagnostics_thread = None
-_diagnostics_start_lock = threading.Lock()
+_stderr_queue = queue.Queue(maxsize=8)
+_stderr_thread = None
+_stderr_start_lock = threading.Lock()
 
 
-def write_stderr(fd, raw):
-    # Native stderr forwarding and ACP diagnostics share the inherited stream.
-    with _stderr_lock:
-        write_all(fd, raw)
-
-
-def _pump_diagnostics():
+def _pump_stderr():
+    binary_fds = set()
     while True:
-        fd, raw, done = _diagnostics.get()
+        fd, raw, done = _stderr_queue.get()
         try:
-            write_stderr(fd, raw)
+            if os.name == "nt" and fd not in binary_fds:
+                import msvcrt
+                # setmode and _write take the same CRT descriptor lock.
+                msvcrt.setmode(fd, os.O_BINARY)
+                binary_fds.add(fd)
+            write_all(fd, raw)
         except OSError:
             pass
         finally:
             if done is not None:
                 done.set()
+
+
+def offer_stderr(fd, raw, done=None):
+    """Admit a whole record without waiting for the inherited stderr reader."""
+    global _stderr_thread
+    with _stderr_start_lock:
+        if _stderr_thread is None:
+            _stderr_thread = threading.Thread(target=_pump_stderr, name="acp-stderr", daemon=True)
+            _stderr_thread.start()
+    try:
+        _stderr_queue.put_nowait((fd, raw, done))
+    except queue.Full:
+        return False
+    return True
 
 
 def write_diagnostic(message):
@@ -150,16 +172,8 @@ def write_diagnostic(message):
         else:
             done = None
 
-        global _diagnostics_thread
-        with _diagnostics_start_lock:
-            if _diagnostics_thread is None:
-                _diagnostics_thread = threading.Thread(target=_pump_diagnostics, name="acp-diagnostics", daemon=True)
-                _diagnostics_thread.start()
-        # Diagnostics are best effort if the reader stalls. An admitted record
-        # is written in full rather than publishing a partial diagnostic.
-        _diagnostics.put_nowait((fd, raw, done))
-        if done is not None:
+        if offer_stderr(fd, raw, done) and done is not None:
             # Give a terminal diagnostic time to flush without stalling exit.
             done.wait(0.2)
-    except (OSError, queue.Full):
+    except OSError:
         pass

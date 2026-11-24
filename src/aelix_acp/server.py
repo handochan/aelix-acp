@@ -6,6 +6,7 @@ import base64
 import sqlite3
 import asyncio
 import contextlib
+import errno
 import json
 from itertools import chain
 import os
@@ -26,7 +27,7 @@ from .runtime.store import (open_store, load_preferences, history, legacy_permis
 from .runtime.controls import MODE_IDS
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
-from .stdio import StdinReader, write_diagnostic, write_stderr
+from .stdio import StdinReader, offer_stderr, write_diagnostic
 from .wire.transport import decode_frame, encode_frame, StdoutWriter
 from .runtime.extensions import run_extension_action, require_consent
 from .runtime.leases import acquire as acquire_lease
@@ -50,6 +51,7 @@ MANAGE_ACTIONS = frozenset({"resources/list", "resources/reload", "settings/get"
                             *CONCURRENT_CONTROLS})
 # How long the adapter waits for the client's answer to a request it sent, unless the caller says.
 CLIENT_REQUEST_SECONDS = 290
+STDOUT_DRAIN_SECONDS = 1
 
 
 class Server:
@@ -69,27 +71,52 @@ class Server:
         self.pending = {}
         self.response_limits = {}
         self.tasks = set()
+        self.replies = set()
         self.cleanup_tasks = set()
         self.closing = False  # The client is gone: sessions end without sending.
         self.output_lock = asyncio.Lock()
         self.output = None
-        self.stderr_output = None
+        self.output_error = None
+        self.run_task = None
         self.managed_extensions = getattr(args, "managed_extensions", None)
 
     async def send(self, message, *, before_send=None):
         async with self.output_lock:
+            if self.output_error is not None:
+                raise self.output_error
+            if self.closing:
+                raise BrokenPipeError("ACP server is closing")
             raw = encode_frame(message)
             if self.output is None:
-                self.output = StdoutWriter()
+                self.output = StdoutWriter(on_failure=self.output_failed)
             if before_send is None:
                 await self.output.write(raw)
             else:
                 await self.output.write(raw, before_queue=before_send)
 
+    def output_failed(self, error):
+        self.output_error = error
+        if self.run_task is not None and not self.closing:
+            self.run_task.cancel()
+
+    def task_done(self, tasks, task):
+        tasks.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            if not self.closing and self.output_error is None:
+                write_diagnostic(f"[aelix-acp] Request task failed: {type(error).__name__}")
+
+    def queue_reply(self, message):
+        # A bounded reply backlog keeps stdin readable during invalid-input
+        # floods. Its overflow drops whole messages before they reach stdout.
+        if not self.closing and len(self.replies) < 16:
+            task = asyncio.create_task(self.send(message))
+            self.replies.add(task)
+            task.add_done_callback(lambda done: self.task_done(self.replies, done))
+
     async def forward_stderr(self, raw):
-        if self.stderr_output is None:
-            self.stderr_output = StdoutWriter(sys.stderr.fileno(), write_raw=write_stderr)
-        await self.stderr_output.write(raw)
+        if sys.stderr is not None:
+            with contextlib.suppress(OSError):
+                offer_stderr(sys.stderr.fileno(), raw)
 
     async def client_request(self, method, params, *, withdraw=False, timeout=None, max_response_bytes=None, before_send=None):
         """The client's result for one request, waited for up to `timeout` (CLIENT_REQUEST_SECONDS) seconds.
@@ -113,8 +140,7 @@ class Server:
             return await asyncio.wait_for(future, timeout or CLIENT_REQUEST_SECONDS)
         except (asyncio.CancelledError, TimeoutError):
             if withdraw and not self.closing and (future.cancelled() or not future.done()):
-                with contextlib.suppress(Exception):
-                    await self.send({"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": request_id}})
+                self.queue_reply({"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": request_id}})
             raise
         finally:
             self.pending.pop(request_id, None)
@@ -639,6 +665,8 @@ class Server:
                         await session.update({"sessionUpdate": "current_mode_update",
                                               "currentModeId": session.controls.permission_mode})
         except Exception as exc:
+            if self.output_error is not None or self.closing:
+                return
             if request_id is not None and not replied:
                 error = {"code": getattr(exc, "code", -32603), "message": str(exc)}
                 if isinstance(exc, ProtocolError) and exc.data is not None:
@@ -653,19 +681,25 @@ class Server:
     async def run(self):
         reader = StdinReader()
         loop = asyncio.get_running_loop()
-        run_task = asyncio.current_task()
+        self.run_task = run_task = asyncio.current_task()
+
+        def stop():
+            if not self.closing:
+                run_task.cancel()
+
         installed_signals = []
         for sig in [signal.SIGTERM, *([signal.SIGHUP] if hasattr(signal, "SIGHUP") else [])]:
             with contextlib.suppress(NotImplementedError):
-                loop.add_signal_handler(sig, run_task.cancel)
+                loop.add_signal_handler(sig, stop)
                 installed_signals.append(sig)
+        eof = False
         try:
             while line := await reader.readline():
                 try:
                     message = decode_frame(line)
                 except ProtocolError as error:
-                    await self.send({"jsonrpc": "2.0", "id": None,
-                                     "error": {"code": error.code, "message": str(error)}})
+                    self.queue_reply({"jsonrpc": "2.0", "id": None,
+                                      "error": {"code": error.code, "message": str(error)}})
                     continue
                 if "method" not in message:
                     future = self.pending.get(message.get("id"))
@@ -686,39 +720,50 @@ class Server:
                     continue
                 if not self.initialized and message["method"] not in ("initialize",):
                     if message.get("id") is not None:
-                        await self.send({"jsonrpc": "2.0", "id": message["id"],
-                                         "error": {"code": -32600, "message": "Call initialize first"}})
+                        self.queue_reply({"jsonrpc": "2.0", "id": message["id"],
+                                          "error": {"code": -32600, "message": "Call initialize first"}})
                     continue
                 request_id = message.get("id")
                 if request_id is not None and request_id in self.active_request_ids:
-                    await self.send({"jsonrpc": "2.0", "id": request_id,
-                                     "error": {"code": -32600, "message": "Duplicate active request id"}})
+                    self.queue_reply({"jsonrpc": "2.0", "id": request_id,
+                                      "error": {"code": -32600, "message": "Duplicate active request id"}})
                     continue
                 if len(self.tasks) >= 64 and message["method"] != "session/cancel":
                     if request_id is not None:
-                        await self.send({"jsonrpc": "2.0", "id": request_id,
-                                         "error": {"code": -32000, "message": "Too many concurrent requests"}})
+                        self.queue_reply({"jsonrpc": "2.0", "id": request_id,
+                                          "error": {"code": -32000, "message": "Too many concurrent requests"}})
                     continue
                 if request_id is not None:
                     self.active_request_ids.add(request_id)
                 task = asyncio.create_task(self.handle(message))
                 self.tasks.add(task)
-                task.add_done_callback(self.tasks.discard)
+                task.add_done_callback(lambda done: self.task_done(self.tasks, done))
+            eof = True
+        except asyncio.CancelledError:
+            if self.output_error is None:
+                raise
         finally:
             reader.close()
             self.closing = True
-            for task in list(self.tasks):
+            tasks = self.tasks | self.replies
+            for task in tasks:
                 task.cancel()
-            await asyncio.gather(*self.tasks, return_exceptions=True)
+            if self.output:
+                if eof:
+                    try:
+                        await self.output.drain(STDOUT_DRAIN_SECONDS)
+                    except TimeoutError:
+                        self.output_error = TimeoutError(errno.ETIMEDOUT, "ACP stdout drain timed out")
+                self.output.close()
+            await asyncio.gather(*tasks, return_exceptions=True)
             await asyncio.gather(*(s.close() for s in self.sessions.values()), return_exceptions=True)
             await asyncio.gather(*list(self.cleanup_tasks), return_exceptions=True)
             self.db.close()
-            if self.output:
-                self.output.close()
-            if self.stderr_output:
-                self.stderr_output.close()
+            self.run_task = None
             for sig in installed_signals:
                 loop.remove_signal_handler(sig)
+        if self.output_error is not None:
+            raise self.output_error
 
 
 def main():

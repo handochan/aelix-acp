@@ -14,74 +14,97 @@ import time
 import unittest
 from unittest.mock import patch
 
+from aelix_acp.stdio import write_all
 from aelix_acp.wire.transport import StdoutWriter, encode_frame
 from test_lifecycle import FAKE_CHILD
 
 
-@unittest.skipUnless(os.name == "posix", "Requires POSIX non-blocking pipes")
+def set_pipe_nonblocking(fd):
+    if os.name != "nt":
+        os.set_blocking(fd, False)
+        return
+    # Windows Python 3.11 cannot set pipe mode through os.set_blocking.
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+    set_mode = ctypes.WinDLL("kernel32", use_last_error=True).SetNamedPipeHandleState
+    set_mode.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p, ctypes.c_void_p)
+    set_mode.restype = wintypes.BOOL
+    nowait = wintypes.DWORD(1)  # PIPE_NOWAIT
+    if not set_mode(msvcrt.get_osfhandle(fd), ctypes.byref(nowait), None, None):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 class NonBlockingWriterTests(unittest.IsolatedAsyncioTestCase):
     def observe_backpressure(self, writer):
         write = os.write
         backpressure = asyncio.Event()
+        errnos = set()
 
         def observe(fd, data):
             try:
                 return write(fd, data)
-            except BlockingIOError:
-                if fd == writer.fd:
+            except OSError as error:
+                if fd == writer.fd and error.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOSPC):
+                    writer.loop.call_soon_threadsafe(errnos.add, error.errno)
                     writer.loop.call_soon_threadsafe(backpressure.set)
                 raise
 
-        return backpressure, patch("aelix_acp.stdio.os.write", new=observe)
+        return backpressure, errnos, patch("aelix_acp.stdio.os.write", new=observe)
 
     async def test_large_frames_are_complete_and_ordered_with_a_slow_reader(self):
         read_fd, write_fd = os.pipe()
-        self.addCleanup(os.close, write_fd)
         self.addCleanup(os.close, read_fd)
-        os.set_blocking(read_fd, False)
-        os.set_blocking(write_fd, False)
+        self.addCleanup(os.close, write_fd)
+        set_pipe_nonblocking(write_fd)
         writer = StdoutWriter(write_fd)
         self.addCleanup(writer.close)
         large = {"jsonrpc": "2.0", "id": 1, "result": {"text": "한글" * (1024 * 1024 // 6)}}
         following = {"jsonrpc": "2.0", "id": 2, "error": {"code": -32601, "message": "unknown method"}}
         first, second = map(encode_frame, (large, following))
-        backpressure, observing = self.observe_backpressure(writer)
+        backpressure, errnos, observing = self.observe_backpressure(writer)
 
         async def read_slowly():
             received = bytearray()
             while len(received) < len(first) + len(second):
-                try:
-                    received.extend(os.read(read_fd, 4096))
-                except BlockingIOError:
-                    pass
+                chunk = await asyncio.to_thread(os.read, read_fd, 4096)
+                if not chunk:
+                    raise EOFError("stdout closed before the queued frames completed")
+                received.extend(chunk)
                 await asyncio.sleep(0.001)
             return bytes(received)
 
         with observing:
             write_first = asyncio.create_task(writer.write(first))
             write_second = asyncio.create_task(writer.write(second))
+            reading = None
             try:
                 await asyncio.wait_for(backpressure.wait(), 5)
                 self.assertFalse(write_first.done())
                 self.assertFalse(write_second.done())
+                reading = asyncio.create_task(read_slowly())
                 received, _, _ = await asyncio.wait_for(
-                    asyncio.gather(read_slowly(), write_first, write_second), 10)
+                    asyncio.gather(reading, write_first, write_second), 10)
             finally:
-                for task in (write_first, write_second):
+                tasks = (write_first, write_second) if reading is None else (write_first, write_second, reading)
+                for task in tasks:
                     task.cancel()
-                await asyncio.gather(write_first, write_second, return_exceptions=True)
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-        self.assertFalse(os.get_blocking(write_fd))
+        if os.name != "nt":
+            self.assertFalse(os.get_blocking(write_fd))
+        elif sys.version_info[:2] == (3, 11):
+            self.assertIn(errno.ENOSPC, errnos)
         self.assertEqual(received, first + second)
         self.assertEqual([json.loads(line) for line in received.splitlines()], [large, following])
 
     async def test_closed_pipe_wakes_writer_waiting_on_backpressure(self):
         read_fd, write_fd = os.pipe()
         self.addCleanup(os.close, write_fd)
-        os.set_blocking(write_fd, False)
+        set_pipe_nonblocking(write_fd)
         writer = StdoutWriter(write_fd)
         self.addCleanup(writer.close)
-        backpressure, observing = self.observe_backpressure(writer)
+        backpressure, _, observing = self.observe_backpressure(writer)
         with observing:
             pending = asyncio.create_task(writer.write(b"x" * (1024 * 1024)))
             try:
@@ -96,7 +119,6 @@ class NonBlockingWriterTests(unittest.IsolatedAsyncioTestCase):
         read_fd, write_fd = os.pipe()
         self.addCleanup(os.close, write_fd)
         self.addCleanup(os.close, read_fd)
-        os.set_blocking(read_fd, False)
         writer = StdoutWriter(write_fd)
         self.addCleanup(writer.close)
         write = os.write
@@ -119,6 +141,16 @@ class NonBlockingWriterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(raised.exception.errno, errno.EIO)
         self.assertEqual(os.read(read_fd, 4096), b"fir")
         self.assertEqual(attempts, 2)
+
+
+    def test_file_enospc_is_permanent(self):
+        with tempfile.TemporaryFile() as output:
+            failure = OSError(errno.ENOSPC, "disk is full")
+            with patch("aelix_acp.stdio.os.write", side_effect=failure) as write:
+                with self.assertRaises(OSError) as raised:
+                    write_all(output.fileno(), b"frame")
+                self.assertIs(raised.exception, failure)
+                write.assert_called_once()
 
 
 @unittest.skipUnless(os.name == "posix", "Requires POSIX non-blocking pipes")

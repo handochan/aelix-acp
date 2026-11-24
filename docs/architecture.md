@@ -55,9 +55,18 @@ Unicode, nonfinite numbers and excess requests are rejected. Stderr drains in
 chunks. Cancellation reaches native control tasks without waiting for their
 mutation lock and cancels pending dialogs.
 
-Stdout and forwarded native stderr use bounded daemon writers on raw descriptors. A client that stops
-reading cannot block the event loop or Python's buffered-stdout shutdown lock.
-EOF can cancel queued replies; disconnected clients must recover through history.
+Stdout writes complete frames in order on a daemon. Stdin keeps processing
+cancellation and permission replies while output is blocked. Validation errors
+and client-request withdrawals have a separate backlog of 16 replies. If it
+fills, the adapter discards new entries before writing any of their bytes.
+Native stderr drains continuously into a shared best-effort sink. A full
+inherited stderr queue can discard whole chunks and diagnostics.
+
+On stdin EOF, the adapter discards queued frames and gives an active stdout
+write one second to finish. A closed stdout reader ends the connection, even
+with stdin open. An EOF drain timeout exits with status 2. A client that never
+resumes reading can see a truncated final line and must recover through
+history.
 
 Changing extensions, trust or delegation restarts the child, preserving the
 transcript and ACP identity. Client MCP configuration and UI support rebind

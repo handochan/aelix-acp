@@ -17,10 +17,10 @@ MAX_FRAME_BYTES = 16 * 1024 * 1024
 
 class StdoutWriter:
     """Bounded daemon writes without blocking the loop or Python buffer locks."""
-    def __init__(self, fd=None, *, write_raw=write_all):
+    def __init__(self, fd=None, *, on_failure=None):
         self.loop = asyncio.get_running_loop()
         self.fd = sys.stdout.fileno() if fd is None else fd
-        self.write_raw = write_raw
+        self.on_failure = on_failure
         if sys.platform == "win32":
             import msvcrt
             msvcrt.setmode(self.fd, os.O_BINARY)
@@ -28,6 +28,7 @@ class StdoutWriter:
         self.credit = asyncio.Semaphore(2)
         self.pending = set()
         self.stopped = threading.Event()
+        self.finished = asyncio.Event()
         threading.Thread(target=self.pump, name="acp-stdout", daemon=True).start()
 
     async def write(self, raw, *, before_queue=None):
@@ -43,7 +44,9 @@ class StdoutWriter:
         self.queue.put_nowait((raw, future, before_queue is not None))
         await future
 
-    def settle(self, future, error):
+    def settle(self, future, error, first_failure):
+        if first_failure and self.on_failure is not None:
+            self.on_failure(error)
         self.pending.discard(future)
         self.credit.release()
         if not future.done():
@@ -54,40 +57,54 @@ class StdoutWriter:
 
     def pump(self):
         failed = None
-        while not self.stopped.is_set():
-            item = self.queue.get()
-            if item is None:
-                return
-            raw, future, withdrawable = item
-            error = None
-            if failed is None:
-                try:
-                    # A reverse pull cancelled while waiting in the writer queue
-                    # can still be dropped before any bytes reach the descriptor.
-                    if not (withdrawable and future.cancelled()):
-                        self.write_raw(self.fd, raw)
-                except OSError as failure:
-                    error = failure
-                    # This frame may have been partially written. Fail later
-                    # frames without appending bytes to the unfinished line.
-                    failed = type(failure), failure.args
-            else:
-                error_type, args = failed
-                error = error_type(*args)
+        try:
+            while True:
+                item = self.queue.get()
+                if item is None or self.stopped.is_set():
+                    return
+                raw, future, withdrawable = item
+                error = None
+                first_failure = False
+                if failed is None:
+                    try:
+                        # A reverse pull cancelled in the queue can be dropped
+                        # before any bytes reach the descriptor.
+                        if not (withdrawable and future.cancelled()):
+                            write_all(self.fd, raw)
+                    except OSError as failure:
+                        error = failure
+                        first_failure = True
+                        # An incomplete line cannot be followed by another frame.
+                        failed = type(failure), failure.args
+                else:
+                    error_type, args = failed
+                    error = error_type(*args)
+                self.loop.call_soon_threadsafe(self.settle, future, error, first_failure)
+        except RuntimeError:  # The event loop may already have closed.
+            return
+        finally:
             try:
-                self.loop.call_soon_threadsafe(self.settle, future, error)
+                self.loop.call_soon_threadsafe(self.finished.set)
             except RuntimeError:
-                return
+                pass
 
-    def close(self):
+    def stop(self):
         self.stopped.set()
-        for future in self.pending:
-            if not future.done():
-                future.cancel()
         try:
             self.queue.put_nowait(None)
         except queue.Full:
             pass
+
+    async def drain(self, timeout):
+        """Stop accepting queued frames and give the active write time to finish."""
+        self.stop()
+        await asyncio.wait_for(self.finished.wait(), timeout)
+
+    def close(self):
+        self.stop()
+        for future in self.pending:
+            if not future.done():
+                future.cancel()
 
 
 def encode_frame(message: dict) -> bytes:

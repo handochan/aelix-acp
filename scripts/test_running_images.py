@@ -14,7 +14,7 @@ from unittest.mock import patch
 from spike_image_window import EXTENSION, META, MIB, Probe, ProbeServer, digest, sse
 from spike_image_window_review import StderrCapture
 
-from aelix_acp import image_policy, session
+from aelix_acp import image_policy
 from aelix_acp.runtime import host_bytes
 
 
@@ -509,12 +509,12 @@ class RunningImages(Probe):
         await self.server.dispatch("session/close", {"sessionId": self.session_id})
         self.server.host_bytes = None
         self.server.relay_enabled = False
-        capture = StderrCapture(2)
+        capture = StderrCapture()
         debug_variables = {"OPENAI_LOG", "ANTHROPIC_LOG", "GEMINI_NEXT_GEN_API_LOG"}
         quiet_env = {name: value for name, value in os.environ.items() if name not in debug_variables}
         with (
             patch.dict(os.environ, quiet_env, clear=True),
-            patch.object(session, "StdoutWriter", lambda fd: capture),
+            patch.object(self.server, "forward_stderr", capture.write),
         ):
             await self.server.dispatch(
                 "session/load", {"sessionId": self.session_id, "cwd": str(self.root), "mcpServers": []}

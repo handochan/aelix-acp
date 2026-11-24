@@ -754,17 +754,12 @@ class Session:
 
     async def read_stderr(self):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        forward = not self.private_host
         while chunk := await self.proc.stderr.read(4096):
             # Bounded copy for native refusals reported only on stderr.
             self.stderr_tail = (self.stderr_tail + chunk)[-STDERR_TAIL:]
-            if forward:
+            if not self.private_host:
                 text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
-                try:
-                    await self.server.forward_stderr(text.encode("utf-8"))
-                except OSError:
-                    # Keep draining the native pipe if the client closed stderr.
-                    forward = False
+                await self.server.forward_stderr(text.encode("utf-8"))
 
     async def read_native_history(self):
         try:
@@ -1157,19 +1152,26 @@ class Session:
                         allowed = outcome.get("outcome") == "selected" and outcome.get("optionId") == "allow-once"
                     finally:
                         self.permissions.discard(permission_task)
-                if allowed and not self.cancelled:
-                    await self.update({"sessionUpdate": "tool_call_update",
-                                       "toolCallId": request["toolCallId"], "status": "in_progress"})
         except (Exception, asyncio.CancelledError):
             allowed = False
         finally:
-            self.permission_connections.discard(owner)
-            with contextlib.suppress(ConnectionError):
-                writer.write((json.dumps({"allow": allowed and not self.cancelled}) + "\n").encode())
+            try:
+                granted = allowed and not self.cancelled
+                writer.write((json.dumps({"allow": granted}) + "\n").encode())
+                # This socket carries only this tiny reply. Send it before
+                # publishing progress, which can wait on the ACP stdout pipe.
                 await writer.drain()
-            writer.close()
-            with contextlib.suppress(ConnectionError):
-                await writer.wait_closed()
+                writer.close()
+                if granted:
+                    await self.update({"sessionUpdate": "tool_call_update",
+                                       "toolCallId": request["toolCallId"], "status": "in_progress"})
+            except (ConnectionError, OSError):
+                pass
+            finally:
+                self.permission_connections.discard(owner)
+                writer.close()
+                with contextlib.suppress(ConnectionError):
+                    await writer.wait_closed()
 
     async def commands(self):
         data = await self.rpc("get_commands")
