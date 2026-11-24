@@ -156,7 +156,12 @@ startup or on a session switch) and a second adapter's ACP lease become
 request R7), native's refusal text is the only signal; one function in
 `wire/errors.py` matches it so R7 can replace it.
 
-Session load prefers recorded ACP history. When it is missing, the adapter
+With transcript v1 negotiated, session load stages the selected branch from
+native `transcript/list` and reconciles it with ACP tool metadata and adapter
+display events before replying. The host applies that projection only after
+the successful load marker. See [Transcript synchronization](studio-integration.md#transcript-synchronization-acp-22-host-4).
+
+Legacy session load prefers recorded ACP history. When it is missing, the adapter
 scans the pinned native `get_messages` response in chunks, replaces native
 images with text placeholders, and recovers text and tool calls in order.
 It discards unused tool arguments while scanning. Oversized arguments and

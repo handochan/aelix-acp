@@ -519,12 +519,44 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(report)
         await self.client.close()
         self.clients.remove(self.client)
-        self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=["--enable-agents"])
+        meta = "aelix/transcript"
+        self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=["--enable-agents"],
+                                          capabilities={"_meta": {meta: {"version": 1}}})
         self.clients.append(self.client)
-        await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []},
-                                  timeout=120)
+        load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        result = await self.client.request("session/load", load, timeout=120)
         replayed = [u for u in self.card(agent) if u.get("status") == "failed"]
-        self.assertEqual(replayed[-1]["content"][0]["content"]["text"], report)
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(replayed[0]["content"][0]["content"]["text"], report)
+        if meta not in result["_meta"]:
+            if os.environ.get("AELIX_ACP_REQUIRE_TRANSCRIPT") == "1":
+                self.fail("The transcript candidate must advertise transcript/list")
+            return  # Legacy native can only replay the recorded terminal frame.
+        self.assertEqual(replayed[0]["_meta"][meta]["role"], "toolResult")
+        child_meta = replayed[0]["_meta"]["aelix/subagents"]
+        self.assertTrue(child_meta)
+
+        # Reproduce the native write succeeding before ACP records the last
+        # frame, then repeat with the entire ACP display table empty.
+        for delete_all in (False, True):
+            await self.client.request("session/close", {"sessionId": self.session})
+            with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db, db:
+                if delete_all:
+                    db.execute("DELETE FROM events WHERE session_id=?", (self.session,))
+                else:
+                    db.execute("DELETE FROM events WHERE session_id=? AND json_extract(value, '$.toolCallId')=? "
+                               "AND json_extract(value, '$.status')='failed'", (self.session, agent))
+            for _ in range(2):
+                self.client.updates.clear()
+                await self.client.request("session/load", load, timeout=120)
+                card = self.card(agent)
+                self.assertEqual(sum(update["sessionUpdate"] == "tool_call" for update in card), 1)
+                terminal = [update for update in card if update.get("status") == "failed"]
+                self.assertEqual(len(terminal), 1)
+                self.assertEqual(terminal[0]["content"], replayed[0]["content"])
+                self.assertEqual(terminal[0]["_meta"][meta], replayed[0]["_meta"][meta])
+                if not delete_all:
+                    self.assertIn("aelix/subagents", terminal[0]["_meta"])
 
     async def test_one_session_cancel_sends_one_native_abort_in_the_first_two_seconds(self):
         extension = self.root / "slow_abort.py"

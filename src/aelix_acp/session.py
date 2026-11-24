@@ -23,12 +23,12 @@ from .wire.errors import (ProtocolError, BackendError, SOCKET_PATH_TOO_LONG, aft
 from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter, encode_frame
 from . import image_policy
-from .runtime import native_frames, native_history
+from .runtime import native_frames, native_history, transcript
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
-from .runtime.store import (LiveHistory, begin_turn, finish_turn, legacy_permission_mode, load_preferences,
+from .runtime.store import (LiveHistory, begin_turn, confirm_adapter_input, finish_turn, legacy_permission_mode, load_preferences,
                             recorded_turn, save_session, write_store)
-from .runtime.commands import (BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND,
+from .runtime.commands import (ALIASES, BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND,
                                compact_instructions, execute as execute_slash)
 from .runtime.extensions import extension_reference
 from .runtime.managed_extensions import managed_preferences
@@ -56,7 +56,7 @@ READ_ONLY_COMMANDS = frozenset({"get_state", "get_messages", "get_available_mode
 READ_ONLY_CONTROLS = frozenset({"capabilities", "resources/list", "settings/get", "permissions/get",
                                 "permissions/evaluate", "mcp/status", "extensions/list", "auth/status",
                                 "agents/list", "agents/show", "commands/cancel",
-                                "children/list", "children/events"})
+                                "children/list", "children/events", transcript.METHOD})
 # aelix-ai #612: a host's view of and interventions on delegated children. Native
 # answers them during a turn and during agents/run (its CONCURRENT_METHODS and the
 # two lock-free reads), so ACP sends them outside mutation_lock. They act on a
@@ -228,6 +228,9 @@ class Session:
         self.stderr_task = None
         self.stderr_tail = bytearray()
         self.controls = SessionControls(self)
+        self.adapter_event_binding = uuid.uuid4().hex
+        self.adapter_event_sequence = 0
+        self.pending_tool_origins = {}
         self.context = SessionContext(self)
         self.compaction_recovery_needed = False
         self.mutation_lock = asyncio.Lock()
@@ -269,6 +272,7 @@ class Session:
         self.launch_mode = mode
 
     async def start(self, session_file=None, *, fork_source=None, fork_preferences=None, managed_change=None):
+        self.pending_tool_origins.clear()
         if self.input_relay is not None:
             self.input_relay.observe_prompt(False)
         launch_prefix = getattr(self.server.args, "aelix_arg", [])
@@ -851,12 +855,13 @@ class Session:
             await self.context.native_compaction_event(event)
         elif kind == "message_start" and (event.get("message") or {}).get("role") == "assistant":
             self.failure = None
+            self.pending_tool_origins.clear()
         elif kind == "message_update":
             update = event.get("assistantMessageEvent") or event.get("assistant_message_event") or {}
             if update.get("type") in ("text_delta", "thinking_delta") and update.get("delta"):
-                await self.update({"sessionUpdate": "agent_thought_chunk" if update["type"] == "thinking_delta"
-                                   else "agent_message_chunk",
-                                   "content": {"type": "text", "text": update["delta"]}})
+                chunk = {"sessionUpdate": "agent_thought_chunk" if update["type"] == "thinking_delta"
+                         else "agent_message_chunk", "content": {"type": "text", "text": update["delta"]}}
+                await self.native_update(chunk, event, "assistant")
         elif kind in ("tool_execution_start", "tool_execution_update", "tool_execution_end"):
             call_id = event.get("toolCallId") or event.get("tool_call_id")
             name = event.get("toolName") or event.get("tool_name") or "tool"
@@ -868,7 +873,8 @@ class Session:
                 known = call_id in self.tools
                 self.tools[call_id] = call
                 self.tool_arrived.set()
-                await self.update({"sessionUpdate": "tool_call_update" if known else "tool_call", **call})
+                await self.native_update({"sessionUpdate": "tool_call_update" if known else "tool_call", **call},
+                                         event, "toolResult")
             else:
                 result = event.get("result") or event.get("partialResult") or event.get("partial_result") or {}
                 failed = event.get("isError", event.get("is_error", False)) or result.get("is_error", result.get("isError", False))
@@ -882,7 +888,7 @@ class Session:
                 # so a client that keeps only the newest frame still has them.
                 if meta := self.subagents.meta(call_id):
                     update["_meta"] = meta
-                await self.update(update)
+                await self.native_update(update, event, "toolResult")
                 if kind.endswith("end") and not failed:
                     details = result.get("details") or {}
                     if name == "analytics_init" and details.get("project"):
@@ -902,6 +908,7 @@ class Session:
             if error:
                 self.failure = "Native model request failed" if self.private_host else error
                 self.clear_image_sample()
+            await self.settle_message(event, message)
         elif kind == "aelix_subagent":
             await self.subagent_progress(event.get("event"), event.get("data") or {})
         elif kind == "aelix_child":
@@ -1089,8 +1096,50 @@ class Session:
             update = {"sessionUpdate": "tool_call_update", "toolCallId": call_id, "status": status, "_meta": meta}
         await self.update(update)
 
+    def offers_transcript(self):
+        return transcript.offered(getattr(self.server, "client_capabilities", {}))
+
+    async def native_update(self, update, event, role):
+        if self.offers_transcript() and (coordinates := transcript.live(event, role)):
+            update = transcript.tagged(update, coordinates)
+        if event["type"] == "tool_execution_start":
+            origin = self.pending_tool_origins.pop(update["toolCallId"], None)
+            recorded = {**update, "_meta": {**update.get("_meta", {}), transcript.TOOL_ORIGIN_META: origin}}
+            await self.record_update(update, recorded=recorded)
+        else:
+            await self.record_update(update)
+
+    async def settle_message(self, event, message):
+        role = message.get("role")
+        if not isinstance(role, str) or role not in transcript.ROLES:
+            return
+        coordinates = transcript.live(event, role)
+        if coordinates is None:
+            return
+        if role == "assistant":
+            self.pending_tool_origins = dict(transcript.tool_origins(message, coordinates))
+        if not self.offers_transcript():
+            return
+        if role == "user":
+            for index, update in enumerate(self.server.native_message_updates(self, message, canonical=True)):
+                chunk = transcript.tagged(update, {**coordinates, "part": index})
+                await self.notify("session/update", {"sessionId": self.id, "update": chunk})
+        await self.notify(transcript.SETTLED, {"sessionId": self.id, **coordinates})
+
+    def adapter_message(self, update, *, source="adapter"):
+        self.adapter_event_sequence += 1
+        return transcript.tagged(update, {"source": source, "eventId": uuid.uuid4().hex,
+                                          "bindingId": self.adapter_event_binding,
+                                          "sequence": self.adapter_event_sequence})
+
     async def update(self, update):
-        self.live_history.append(update)
+        if (update.get("sessionUpdate") in ("user_message_chunk", "agent_message_chunk", "agent_thought_chunk")
+                and transcript.supported(self.controls.capabilities)):
+            update = self.adapter_message(update)
+        await self.record_update(update)
+
+    async def record_update(self, update, *, recorded=None):
+        self.live_history.append(update if recorded is None else recorded)
         await self.notify("session/update", {"sessionId": self.id, "update": update})
 
     async def notify(self, method, params):
@@ -1504,8 +1553,9 @@ class Session:
             # Once native may have started work, a failure is final: an
             # automatic replay could repeat model calls and tool effects.
             error = after_dispatch(failure) if self.dispatched else failure
-            self.live_history.append({"sessionUpdate": "agent_message_chunk",
-                                      "content": {"type": "text", "text": "Request failed: " + str(error)}})
+            update = {"sessionUpdate": "agent_message_chunk",
+                      "content": {"type": "text", "text": "Request failed: " + str(error)}}
+            self.live_history.append(self.adapter_message(update) if transcript.supported(self.controls.capabilities) else update)
             if error is failure:
                 raise
             raise error from None
@@ -1584,10 +1634,17 @@ class Session:
         if instructions is not None and (
                 not text_only or "[[AION_FILES]]" in map(str.strip, instructions.splitlines())):
             raise ProtocolError("/compact accepts text instructions only")
+        command = text.partition(" ")[0].removeprefix("/") if text_only and text.startswith("/") else ""
+        adapter_input = instructions is not None or ALIASES.get(command, command) in BUILTINS
+        tracked_input = transcript.supported(self.controls.capabilities) and (adapter_input or bool(command))
+        first_input = self.adapter_event_sequence + 1
         for block in blocks:
             update = {"sessionUpdate": "user_message_chunk", "content": block}
+            if tracked_input:
+                update = self.adapter_message(update, source="adapter" if adapter_input else "composer")
             while not self.live_history.append(update, retry_if_full=True):
                 await self.live_history.flush()
+        last_input = self.adapter_event_sequence
         await self.live_history.flush()
         if code := self.live_history.failure:
             raise ProtocolError(code, -32603, {"kind": code})
@@ -1604,6 +1661,13 @@ class Session:
                     return {"stopReason": "cancelled"}
                 raise
             if handled and prepared is None:
+                if tracked_input and not adapter_input:
+                    try:
+                        await write_store(self.server.args.state_dir, confirm_adapter_input, self.id,
+                                          self.adapter_event_binding, first_input, last_input,
+                                          diagnostic="history_write_failed")
+                    except ProtocolError as error:
+                        print(error.data["kind"], file=sys.stderr)
                 return {"stopReason": "end_turn"}
             if prepared is not None:
                 text = prepared

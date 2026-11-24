@@ -31,7 +31,7 @@ from .wire.transport import decode_frame, encode_frame, StdoutWriter
 from .runtime.extensions import run_extension_action, require_consent
 from .runtime.leases import acquire as acquire_lease
 from .runtime.leases import lease_path
-from .runtime import forks, host_bytes, native_history, session_relay
+from .runtime import forks, host_bytes, native_history, session_relay, transcript
 from .runtime.children import NESTED_TOOL_CALLS, nested_only
 
 from .session import CONCURRENT_CONTROLS, LONG_CONTROLS, Session, text_content, tool_call
@@ -176,7 +176,7 @@ class Server:
                 raise native_history.unavailable() from None
         return updates
 
-    def native_message_updates(self, session, message):
+    def native_message_updates(self, session, message, *, canonical=False):
         role = message.get("role")
         if role not in ("user", "assistant", "toolResult"):
             return  # Harness-only messages aren't transcript rows.
@@ -193,10 +193,21 @@ class Server:
             if role == "assistant" and block_type == "toolCall":
                 call_id = native_history.tool_identity(block.get("tool_call_id") or block.get("id"))
                 name = native_history.tool_identity(block.get("tool_name") or block.get("name"))
-                update = {"sessionUpdate": "tool_call", **tool_call(call_id, name, {}, session.cwd, "in_progress")}
-                if block.get("argumentsOmitted") is True:
+                args = block.get("input") if canonical else None
+                omitted = block.get("argumentsOmitted") is True
+                if isinstance(args, dict) and len(json.dumps(args).encode()) > native_history.TOOL_CONTENT_BYTES:
+                    args, omitted = None, True
+                update = {"sessionUpdate": "tool_call", **tool_call(
+                    call_id, name, args if isinstance(args, dict) else {}, session.cwd, "in_progress")}
+                if omitted:
                     update["content"] = native_history.omitted_tool_content(native_history.TOOL_ARGUMENTS_OMITTED)
                 yield update
+                has_text = False
+            elif canonical and block_type == "thinking":
+                thought = native_history.string(block.get("thinking", ""))
+                for offset in range(0, len(thought), native_history.TEXT_CHUNK):
+                    yield {"sessionUpdate": "agent_thought_chunk",
+                           "content": native_history.text_block(thought[offset:offset + native_history.TEXT_CHUNK])}
                 has_text = False
             elif parts := native_history.display_parts(block):
                 if has_text and block_type == "text":
@@ -208,6 +219,34 @@ class Server:
                     for offset in range(0, len(text), native_history.TEXT_CHUNK):
                         yield {"sessionUpdate": kind,
                                "content": native_history.text_block(text[offset:offset + native_history.TEXT_CHUNK])}
+
+    async def replay_history(self, session):
+        await session.live_history.flush()
+        recorded = history(self.db, session.id)
+        nesting = session.declares(NESTED_TOOL_CALLS)
+        if session.offers_transcript() and transcript.supported(session.controls.capabilities):
+            snapshot = await transcript.read(
+                session.rpc, lambda message: self.native_message_updates(session, message, canonical=True))
+            session.require_live_worker()
+            async for update in transcript.reconcile(snapshot, recorded, nesting=nesting):
+                if session.private_host:
+                    update = {key: value for key, value in update.items() if key != "rawOutput"}
+                await session.notify("session/update", {"sessionId": session.id, "update": update})
+                await asyncio.sleep(0)
+            return snapshot.marker
+        recorded = (transcript.display_update(update) for update in recorded)
+        if (first := next(recorded, None)) is not None:
+            for update in chain((first,), recorded):
+                if not nesting and nested_only(update):
+                    continue
+                if session.private_host:
+                    update.pop("rawOutput", None)
+                await session.notify("session/update", {"sessionId": session.id, "update": update})
+        elif not session.fork_projection:
+            for update in await self.native_history(session):
+                await session.notify("session/update", {"sessionId": session.id, "update": update})
+                await asyncio.sleep(0)
+        return None
 
     async def fork_head(self, params):
         parent = require_string(params.get("sessionId"), "sessionId")
@@ -368,6 +407,7 @@ class Server:
                                           "_meta": {SUBAGENTS_META: {"version": 1, "on": "tool_call_update"},
                                                     **({session_relay.META_KEY: relay_ad} if relay_ad else {}),
                                                     **({host_bytes.META_KEY: {"version": 1}} if self.host_bytes else {}),
+                                                    transcript.META: transcript.VERSION,
                                                     "aelix/errors": {"sessionLocked": SESSION_LOCKED, "turnFailedAfterDispatch": TURN_FAILED_AFTER_DISPATCH}}},
                     "_meta": {"aelix/control": {"version": 1, "methods": ["_aelix/capabilities", "_aelix/manage"],
                               "clientActionCapability": "aelix/clientActions"},
@@ -406,6 +446,7 @@ class Server:
                 raise ProtocolError("Session is busy; cancel its turn before loading", -32000)
             self.starting_ids.add(session_id)
             session = None
+            snapshot = None
             try:
                 if previous:
                     self.sessions.pop(session_id, None)
@@ -421,20 +462,7 @@ class Server:
                         self.pending_stop_sessions[session_id] = session
                     await session.commands()
                     if method == "session/load":
-                        await session.live_history.flush()
-                        recorded = history(self.db, session_id)
-                        if (first := next(recorded, None)) is not None:
-                            nesting = session.declares(NESTED_TOOL_CALLS)
-                            for update in chain((first,), recorded):
-                                if not nesting and nested_only(update):
-                                    continue  # aelix-ai #612: the loading client's opt-in, as live.
-                                if session.private_host:
-                                    update.pop("rawOutput", None)
-                                await self.send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
-                        elif not session.fork_projection:
-                            for update in await self.native_history(session):
-                                await session.notify("session/update", {"sessionId": session_id, "update": update})
-                                await asyncio.sleep(0)
+                        snapshot = await self.replay_history(session)
                         await session.publish_context_usage()
                         await session.save(live=True)
                     await session.publish_recovery_warnings()
@@ -450,6 +478,8 @@ class Server:
                 self.pending_stop_sessions.pop(session_id, None)
                 self.starting_ids.discard(session_id)
             result = {**session.selectors(), **({"sessionId": session_id} if method.endswith("new") else {})}
+            if snapshot is not None:
+                result["_meta"][transcript.META] = snapshot
             return session_relay.bind_session(session, result, binding_id)
         if method == "session/close":
             return await self.close_session(self.session(params))

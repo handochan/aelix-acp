@@ -64,6 +64,113 @@ lands. The native lock is
 recognized from native's own refusal text until R7 provides a structured
 signal; the native transcript path is never copied into the error.
 
+## Transcript synchronization (ACP #22, Host #4)
+
+When the client offers transcript v1 and the native worker advertises
+control-v1 `transcript/list`, ACP replays one complete projection of the
+selected branch during `session/load`.
+It reads and validates all pages before emitting the projection. Successful
+load replies carry `_meta["aelix/transcript"]` with the completed snapshot
+coordinates. A load error or a response without that marker gives the host no
+snapshot to apply. Clients without the offer and older native workers use the
+legacy replay path and retain its display-event history. An incomplete or
+over-budget scan fails with `native_history_unavailable`. No load invokes the model, sends a prompt, or executes a tool.
+
+For example, these are the `update` of a replayed `session/update` and the
+snapshot marker in the successful load result:
+
+```json
+{
+  "sessionUpdate": "user_message_chunk",
+  "content": {"type": "text", "text": "Appended in the CLI"},
+  "_meta": {"aelix/transcript": {
+    "source": "replay", "nativeSessionId": "native-123", "entryId": "4ad1b348",
+    "parentEntryId": "a8c13400", "sequence": 3, "role": "user", "part": 0
+  }}
+}
+```
+
+```json
+{"_meta": {"aelix/transcript": {
+  "version": 1, "nativeSessionId": "native-123", "leafId": "c8434a01",
+  "totalMessages": 4, "recovered": false
+}}}
+```
+
+The durable key is `(nativeSessionId, entryId)`. Sequence is the one-based
+native message ordinal on the selected path. Siblings can share an ordinal,
+and forks use a new native session ID. Parts start at zero for each entry and
+are emitted in order. One assistant entry can contain text, thoughts and tool
+calls. A result is a separate `toolResult` entry, projected to the related
+card's terminal `tool_call_update`. Every native entry has at least one
+update, including empty or unencodable rows. Image blocks use display
+placeholders. Bounded display projections can omit oversized tool inputs or
+results. The same snapshot replays the same keys and order on each load. One
+load includes each logical entry once, even where ACP had already recorded
+its content or a terminal result. A valid empty snapshot has
+`totalMessages: 0`; a damaged but readable native path sets `recovered: true`.
+
+The adapter advertises support in `agentCapabilities._meta["aelix/transcript"]`
+as `{"version":1}`. A client offers the same object in
+`clientCapabilities._meta` to receive canonical replay, live native user
+messages and settlement notifications. For those clients, assistant and tool
+stream updates carry the live metadata when native supplies it. Live user chunks are emitted with their end receipt so the
+host can associate the submitted input with its stored message. A live delta
+and its later settlement look like this:
+
+```json
+{
+  "sessionUpdate": "agent_message_chunk",
+  "content": {"type": "text", "text": "Done"},
+  "_meta": {"aelix/transcript": {
+    "source": "live", "nativeSessionId": "native-123",
+    "bindingId": "native-binding", "streamId": "native-stream", "role": "assistant"
+  }}
+}
+```
+
+```json
+{"jsonrpc":"2.0","method":"_aelix/transcript/settled","params":{
+  "sessionId":"acp-session",
+  "source":"live","nativeSessionId":"native-123","bindingId":"native-binding",
+  "streamId":"native-stream","role":"assistant","status":"stored",
+  "entryId":"c8434a01","parentEntryId":"4ad1b348","sequence":4,"replaced":false
+}}
+```
+
+Group provisional chunks by `(bindingId, streamId)`. Only a `stored` settlement
+binds them to durable coordinates. `notStored`, `unknown`, `storageOnly`, and a
+missing settlement can leave provisional display content. A later load also
+resolves stored replacements, abandoned branches, lost receipts and native
+messages without a live event. Tool execution frames use the result stream.
+The live card continues to use `toolCallId`, and replay retains that ID
+where the call is unambiguous within the selected path. Repeated native
+call IDs get distinct replay card IDs. ACP associates recorded progress with
+the stored native assistant entry that originated the call. Legacy tool
+metadata without a verifiable association stays in the archived display
+history. Tool progress retains
+`_meta["aelix/subagents"]` and the negotiated nested tool metadata.
+
+### First load of an existing Studio conversation
+
+Host #4 must stage the replay through the successful load result. It keeps
+the old display history as an archive, then rebuilds the active native-backed
+portion from the complete projection, keyed by native IDs. Merge or replace
+by those keys on subsequent loads. Preserve application-owned messages,
+ACP-only updates and tool metadata with a verified card association. Adapter
+display events carry `source: "adapter"` when ACP can identify them. They
+have their own stable `eventId` and retain their recorded order. Their
+`sequence` is local to the adapter `bindingId`, in a separate namespace
+from native message sequence. Ambiguous
+legacy content remains in the archive. The host can retain its prior clean
+view when a load reports recovery. Keep composer echoes provisional and
+avoid inserting them again as native user messages. Older assistant chunking,
+formatted user echoes, images, tool output formatting, and old branch or
+cancelled display content can differ in the active conversation after
+reconstruction. The archive preserves the original representation.
+
+The native pin and Host #4 integration are coordinated under Studio D16.
+
 ## HEAD fork
 
 The ACP `session/fork` capability takes the registered parent ID, the same
@@ -82,8 +189,10 @@ older adapter or an independently owned native session returns `-33001`.
 
 The fork response omits historical replay. The host copies its message
 projection first and uses the same reference on child startup. Later `session/load`
-replays the inherited native text followed by the child's own ACP events. The
-native worker projects text from the captured cut before publication. Image
+with transcript v1 replays the child's selected native branch, including the
+inherited prefix. Legacy replay uses the inherited text followed by the
+child's ACP events. The native worker projects text from the captured cut
+before publication. Image
 payloads stay in the native transcript and remain available to the model.
 
 The adapter reserves one native destination before calling the worker and
