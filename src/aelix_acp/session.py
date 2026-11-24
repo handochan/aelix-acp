@@ -91,6 +91,34 @@ STDERR_TAIL = 16 * 1024
 FRAME_LIMIT = 16 * 1024 * 1024
 # An unauthenticated loopback peer gets one bounded line for its token.
 PRE_AUTH_LIMIT = 64 * 1024
+_SESSION_TEMP_PREFIX = "aelix-acp-"
+_BRIDGE_SOCKET_NAME = "bridge.sock"
+_SHORT_TEMP_DIR = "/tmp"
+
+
+def _make_session_dir(*, tcp):
+    if tcp:
+        return tempfile.mkdtemp(prefix=_SESSION_TEMP_PREFIX)
+
+    # bridge.sock is the only Unix socket. mkdtemp appends eight ASCII characters.
+    relative_socket = Path(_SESSION_TEMP_PREFIX + "x" * 8) / _BRIDGE_SOCKET_NAME
+    limit = 108 if sys.platform.startswith("linux") else 104
+
+    def fits(parent):
+        return len(os.fsencode(Path(parent) / relative_socket)) + 1 <= limit
+
+    default = tempfile.gettempdir()
+    if fits(default):
+        return tempfile.mkdtemp(prefix=_SESSION_TEMP_PREFIX, dir=default)
+    if os.name == "posix" and fits(_SHORT_TEMP_DIR):
+        try:
+            return tempfile.mkdtemp(prefix=_SESSION_TEMP_PREFIX, dir=_SHORT_TEMP_DIR)
+        except OSError:
+            # The short directory may be unavailable. Keep filesystem paths out of the error.
+            pass
+    raise ProtocolError(f"The Unix socket path cannot fit within the {limit}-byte AF_UNIX limit "
+                        "(including the terminating NUL). Set TMPDIR to a shorter, writable directory.",
+                        -32000, {"kind": "socket_path_too_long", "limitBytes": limit, "retryable": False})
 
 
 def tool_call(call_id, name, args, cwd, status="pending"):
@@ -263,10 +291,11 @@ class Session:
         # remains Ask until native confirms the just-read policy below.
         self.controls.permission_mode = "default"
         self.stderr_tail = bytearray()  # A refusal from an earlier worker must not label this one.
-        self.socket_dir = tempfile.mkdtemp(prefix="aelix-acp-")
+        tcp = sys.platform == "win32"
+        self.socket_dir = _make_session_dir(tcp=tcp)
         os.chmod(self.socket_dir, 0o700)
-        socket_path = str(Path(self.socket_dir) / "bridge.sock")
-        await self.listen(socket_path, tcp=sys.platform == "win32")
+        socket_path = str(Path(self.socket_dir) / _BRIDGE_SOCKET_NAME)
+        await self.listen(socket_path, tcp=tcp)
         args = [self.server.args.aelix, *launch_prefix, "--mode", "rpc", "--offline", "--no-extensions",
                 "--permission-mode", self.launch_mode,
                 "--append-system-prompt-file", str(PACKAGE / "profiles" / f"{self.server.args.profile}.md")]
