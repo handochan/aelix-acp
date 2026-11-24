@@ -19,6 +19,7 @@ beta.2 Preview 내부 검증 빌드는 ACP `117cf6c9d536c4aa98b1f3a6481c12464584
 | 텍스트·추론·도구·이미지 입력 | 스트리밍, 실패·취소, 파일 위치 | 표준 ACP |
 | 서브에이전트 진행 | native `aelix_subagent`·`aelix_child` → 부모 `agent` 도구 호출의 `tool_call_update` + `_meta` (`lastText`·`stuck`·`wrappingUp`·`currentTool`·`end` 포함). `aelix/nestedToolCalls`를 선언한 클라이언트에는 자식의 도구 호출도 `"<자식 id>:<호출 id>"` 도구 호출로(`session/load` 재생도 선언한 클라이언트에만) | 표준 ACP (기존 도구 카드), 중첩은 선택 |
 | 자식 제어 | `_aelix/manage children/list·events·steer·wrap_up·stop`: 턴·`agents/run` 중에도 응답, 워커 재시작·종료 중에는 거부 | `_aelix/manage` 화면 연결 필요 |
+| 자식 재개 | `_aelix/manage children/resume {id, task}`: 모델이 위임했다가 멈춘 자식을 그 세션에서 이어 실행(native aelix-ai #836). `agents/run`처럼 세션 잠금을 잡고 같은 deadline·취소를 씀 | `_aelix/manage` 화면 연결 필요 |
 | 자식 승인 | native `childApproval` → `session/request_permission` (Allow once / Allow for this agent / Reject). native가 버린 질문은 `$/cancel_request`로 거둠 | 표준 ACP, `aelix/clientActions` 클라이언트 |
 | 작업 알림 | native `aelix_notice` → `_aelix/notice`, `children/notices`가 알림 턴 실행 | `aelix/notices` 선언 필요 |
 | 세션 잠금 | native "already open" 거부와 ACP 세션 lease를 구조화된 오류로 | 오류 표시 |
