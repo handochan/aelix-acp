@@ -21,7 +21,8 @@ import uuid
 from .wire.errors import (ProtocolError, BackendError, SOCKET_PATH_TOO_LONG, after_dispatch, delivery_unknown, fork_head_changed,
                           is_native_session_locked, require_object, require_string, session_changing, session_locked)
 from .wire.process import terminate_owned
-from .wire.transport import StdoutWriter, encode_frame
+from .stdio import write_diagnostic
+from .wire.transport import encode_frame
 from . import image_policy
 from .runtime import native_frames, native_history
 from .runtime.controls import SessionControls, MODE_IDS
@@ -703,7 +704,7 @@ class Session:
                 try:
                     await self.save()
                 except ProtocolError as error:
-                    print(error.data["kind"], file=sys.stderr)
+                    write_diagnostic(error.data["kind"])
 
     async def rpc(self, command, *, _timeout=45, _image_write=None, _project_history=False, **kwargs):
         request_id = uuid.uuid4().hex
@@ -753,17 +754,17 @@ class Session:
 
     async def read_stderr(self):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        writer = None if self.private_host else StdoutWriter(sys.stderr.fileno())
-        try:
-            while chunk := await self.proc.stderr.read(4096):
-                # Bounded copy for native refusals reported only on stderr.
-                self.stderr_tail = (self.stderr_tail + chunk)[-STDERR_TAIL:]
-                if writer is not None:
-                    text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
-                    await writer.write(text.encode("utf-8"))
-        finally:
-            if writer is not None:
-                writer.close()
+        forward = not self.private_host
+        while chunk := await self.proc.stderr.read(4096):
+            # Bounded copy for native refusals reported only on stderr.
+            self.stderr_tail = (self.stderr_tail + chunk)[-STDERR_TAIL:]
+            if forward:
+                text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
+                try:
+                    await self.server.forward_stderr(text.encode("utf-8"))
+                except OSError:
+                    # Keep draining the native pipe if the client closed stderr.
+                    forward = False
 
     async def read_native_history(self):
         try:
@@ -807,7 +808,7 @@ class Session:
                     if not isinstance(event, dict):
                         raise ValueError("RPC frame must be an object")
                 except ValueError:
-                    print("[aelix-acp] Ignored non-JSON child stdout", file=sys.stderr)
+                    write_diagnostic("[aelix-acp] Ignored non-JSON child stdout")
                     continue
                 future = self.pending.get(event.get("id"))
                 if event.get("type") == "response" and future is not None:
@@ -895,7 +896,7 @@ class Session:
                                 "text": f"\n[AionUi 분석 미리보기]({preview})\n"}})
                         except (OSError, ValueError) as exc:
                             detail = type(exc).__name__ if self.private_host else str(exc)
-                            print(f"[aelix-acp] Standalone preview unavailable: {detail}", file=sys.stderr)
+                            write_diagnostic(f"[aelix-acp] Standalone preview unavailable: {detail}")
         elif kind == "message_end":
             message = event.get("message") or {}
             error = message.get("errorMessage") or message.get("error_message")
@@ -1450,8 +1451,7 @@ class Session:
                 await self.restart(preserve_history=True)
                 recovered = True
             except Exception as recovery_error:
-                print(f"[aelix-acp] Extension selection recovery failed: {type(recovery_error).__name__}",
-                      file=sys.stderr)
+                write_diagnostic(f"[aelix-acp] Extension selection recovery failed: {type(recovery_error).__name__}")
             finally:
                 self._verifying_extension_recovery = False
             details = {
@@ -1518,7 +1518,7 @@ class Session:
                 await write_store(self.server.args.state_dir, finish_turn, self.id, key, result, error,
                                   diagnostic="turn_receipt_write_failed")
             except Exception:
-                print("turn_receipt_write_failed", file=sys.stderr)
+                write_diagnostic("turn_receipt_write_failed")
 
     async def record_fork_head(self, anchor):
         def capture(filename):
@@ -1538,7 +1538,7 @@ class Session:
         except (OSError, ProtocolError) as error:
             self.fork_head = None
             if isinstance(error, ProtocolError) and (error.data or {}).get("kind") == "session_store_write_failed":
-                print("session_store_write_failed", file=sys.stderr)
+                write_diagnostic("session_store_write_failed")
 
     async def _prompt(self, blocks):
         if self.done and not self.done.done():
@@ -1800,7 +1800,7 @@ class Session:
         try:
             await self.end_children()
         except Exception as failure:  # A card left open must not keep the worker's resources.
-            print(f"[aelix-acp] Could not close the children's cards: {type(failure).__name__}", file=sys.stderr)
+            write_diagnostic(f"[aelix-acp] Could not close the children's cards: {type(failure).__name__}")
         await self.live_history.flush()
         if self.worker_job:
             self.worker_job.close()

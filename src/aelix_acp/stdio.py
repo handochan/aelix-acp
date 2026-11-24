@@ -1,9 +1,13 @@
-"""Bounded raw descriptor input without Windows Proactor pipe or buffered shutdown locks."""
+"""Raw descriptor I/O for the ACP process."""
 import asyncio
 import concurrent.futures
+import errno
 import os
+import queue
+import select
 import sys
 import threading
+import time
 
 
 class StdinReader:
@@ -73,3 +77,89 @@ class StdinReader:
 
     def close(self):
         self.stopped.set()
+
+
+def write_all(fd, raw):
+    """Finish a raw write without changing the inherited descriptor's flags."""
+    remaining = memoryview(raw)
+    writable = None
+    while remaining:
+        try:
+            written = os.write(fd, remaining)
+        except OSError as error:
+            if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise
+            if os.name == "nt":
+                # select() cannot wait on Windows pipe handles.
+                time.sleep(0.01)
+            else:
+                if writable is None:
+                    writable = select.poll()
+                    writable.register(fd, select.POLLOUT)
+                # HUP/ERR also wake poll. Let the next write report the OS error.
+                writable.poll()
+            continue
+        if not written:
+            raise BrokenPipeError("Client stdout closed")
+        remaining = remaining[written:]
+
+
+_stderr_lock = threading.Lock()
+_diagnostics = queue.Queue(maxsize=8)
+_diagnostics_thread = None
+_diagnostics_start_lock = threading.Lock()
+
+
+def write_stderr(fd, raw):
+    # Native stderr forwarding and ACP diagnostics share the inherited stream.
+    with _stderr_lock:
+        write_all(fd, raw)
+
+
+def _pump_diagnostics():
+    while True:
+        fd, raw, done = _diagnostics.get()
+        try:
+            write_stderr(fd, raw)
+        except OSError:
+            pass
+        finally:
+            if done is not None:
+                done.set()
+
+
+def write_diagnostic(message):
+    """Keep backpressure on stderr off the ACP event loop."""
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        try:
+            fd = stream.fileno()
+        except (AttributeError, OSError):
+            fd = None  # In-memory stderr redirection.
+        if fd is None or (os.name == "nt" and os.isatty(fd)):
+            print(message, file=stream)
+            return
+
+        raw = (message + "\n").encode(stream.encoding or "utf-8", stream.errors or "backslashreplace")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            done = threading.Event()
+        else:
+            done = None
+
+        global _diagnostics_thread
+        with _diagnostics_start_lock:
+            if _diagnostics_thread is None:
+                _diagnostics_thread = threading.Thread(target=_pump_diagnostics, name="acp-diagnostics", daemon=True)
+                _diagnostics_thread.start()
+        # Diagnostics are best effort if the reader stalls. An admitted record
+        # is written in full rather than publishing a partial diagnostic.
+        _diagnostics.put_nowait((fd, raw, done))
+        if done is not None:
+            # Give a terminal diagnostic time to flush without stalling exit.
+            done.wait(0.2)
+    except (OSError, queue.Full):
+        pass

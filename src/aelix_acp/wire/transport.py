@@ -9,6 +9,7 @@ import threading
 import os
 import queue
 
+from ..stdio import write_all
 from .errors import ProtocolError
 
 MAX_FRAME_BYTES = 16 * 1024 * 1024
@@ -16,9 +17,10 @@ MAX_FRAME_BYTES = 16 * 1024 * 1024
 
 class StdoutWriter:
     """Bounded daemon writes without blocking the loop or Python buffer locks."""
-    def __init__(self, fd=None):
+    def __init__(self, fd=None, *, write_raw=write_all):
         self.loop = asyncio.get_running_loop()
         self.fd = sys.stdout.fileno() if fd is None else fd
+        self.write_raw = write_raw
         if sys.platform == "win32":
             import msvcrt
             msvcrt.setmode(self.fd, os.O_BINARY)
@@ -51,23 +53,27 @@ class StdoutWriter:
                 future.set_exception(error)
 
     def pump(self):
+        failed = None
         while not self.stopped.is_set():
             item = self.queue.get()
             if item is None:
                 return
             raw, future, withdrawable = item
             error = None
-            try:
-                # A reverse pull cancelled while waiting in the writer queue
-                # can still be dropped before any bytes reach the descriptor.
-                view = memoryview(b"" if withdrawable and future.cancelled() else raw)
-                while view:
-                    written = os.write(self.fd, view)
-                    if not written:
-                        raise BrokenPipeError("Client stdout closed")
-                    view = view[written:]
-            except OSError as failure:
-                error = failure
+            if failed is None:
+                try:
+                    # A reverse pull cancelled while waiting in the writer queue
+                    # can still be dropped before any bytes reach the descriptor.
+                    if not (withdrawable and future.cancelled()):
+                        self.write_raw(self.fd, raw)
+                except OSError as failure:
+                    error = failure
+                    # This frame may have been partially written. Fail later
+                    # frames without appending bytes to the unfinished line.
+                    failed = type(failure), failure.args
+            else:
+                error_type, args = failed
+                error = error_type(*args)
             try:
                 self.loop.call_soon_threadsafe(self.settle, future, error)
             except RuntimeError:

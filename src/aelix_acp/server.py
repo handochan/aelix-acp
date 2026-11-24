@@ -26,7 +26,7 @@ from .runtime.store import (open_store, load_preferences, history, legacy_permis
 from .runtime.controls import MODE_IDS
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
-from .stdio import StdinReader
+from .stdio import StdinReader, write_diagnostic, write_stderr
 from .wire.transport import decode_frame, encode_frame, StdoutWriter
 from .runtime.extensions import run_extension_action, require_consent
 from .runtime.leases import acquire as acquire_lease
@@ -73,6 +73,7 @@ class Server:
         self.closing = False  # The client is gone: sessions end without sending.
         self.output_lock = asyncio.Lock()
         self.output = None
+        self.stderr_output = None
         self.managed_extensions = getattr(args, "managed_extensions", None)
 
     async def send(self, message, *, before_send=None):
@@ -84,6 +85,11 @@ class Server:
                 await self.output.write(raw)
             else:
                 await self.output.write(raw, before_queue=before_send)
+
+    async def forward_stderr(self, raw):
+        if self.stderr_output is None:
+            self.stderr_output = StdoutWriter(sys.stderr.fileno(), write_raw=write_stderr)
+        await self.stderr_output.write(raw)
 
     async def client_request(self, method, params, *, withdraw=False, timeout=None, max_response_bytes=None, before_send=None):
         """The client's result for one request, waited for up to `timeout` (CLIENT_REQUEST_SECONDS) seconds.
@@ -268,7 +274,7 @@ class Server:
                 try:
                     forks.receipt_path(self.args.state_dir, identifier).unlink(missing_ok=True)
                 except OSError:
-                    print("[aelix-acp] Could not remove committed fork receipt", file=sys.stderr)
+                    write_diagnostic("[aelix-acp] Could not remove committed fork receipt")
             except BaseException:
                 # Retain the draft's lifetime lease through shutdown and rollback.
                 lease, session.lease = session.lease, None
@@ -640,7 +646,7 @@ class Server:
                 await self.send({"jsonrpc": "2.0", "id": request_id, "error": error})
             else:
                 detail = type(exc).__name__ if self.host_bytes else str(exc)
-                print(f"[aelix-acp] {detail}", file=sys.stderr)
+                write_diagnostic(f"[aelix-acp] {detail}")
         finally:
             self.active_request_ids.discard(request_id)
 
@@ -709,6 +715,8 @@ class Server:
             self.db.close()
             if self.output:
                 self.output.close()
+            if self.stderr_output:
+                self.stderr_output.close()
             for sig in installed_signals:
                 loop.remove_signal_handler(sig)
 
@@ -748,7 +756,7 @@ def main():
     except (KeyboardInterrupt, BrokenPipeError, asyncio.CancelledError):
         pass
     except (sqlite3.DatabaseError, ValueError, OSError) as error:
-        print(f"[aelix-acp] Startup or transport failed: {error}", file=sys.stderr)
+        write_diagnostic(f"[aelix-acp] Startup or transport failed: {error}")
         raise SystemExit(2) from None
 
 
