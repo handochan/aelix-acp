@@ -74,7 +74,8 @@ load replies carry `_meta["aelix/transcript"]` with the completed snapshot
 coordinates. A load error or a response without that marker gives the host no
 snapshot to apply. Clients without the offer and older native workers use the
 legacy replay path and retain its display-event history. An incomplete or
-over-budget scan fails with `native_history_unavailable`. No load invokes the model, sends a prompt, or executes a tool.
+over-budget scan fails with `native_history_unavailable`. No load invokes
+the model, sends a prompt, or executes a tool.
 
 For example, these are the `update` of a replayed `session/update` and the
 snapshot marker in the successful load result:
@@ -111,12 +112,19 @@ its content or a terminal result. A valid empty snapshot has
 `totalMessages: 0`; a damaged but readable native path sets `recovered: true`.
 
 The adapter advertises support in `agentCapabilities._meta["aelix/transcript"]`
-as `{"version":1}`. A client offers the same object in
-`clientCapabilities._meta` to receive canonical replay, live native user
-messages and settlement notifications. For those clients, assistant and tool
-stream updates carry the live metadata when native supplies it. Live user chunks are emitted with their end receipt so the
-host can associate the submitted input with its stored message. A live delta
-and its later settlement look like this:
+as `{"version":1}`. This advertisement describes adapter support. The current
+native pin `83714045` uses legacy replay. Host #4 needs a native pin that
+includes aelix-ai #655 to enable transcript v1.
+
+Offer `{"version":1}` in `clientCapabilities._meta["aelix/transcript"]`.
+Each successful `session/new` or `session/load` with a supporting native worker
+reports `_meta["aelix/transcriptCapability"] = {"version":1}`. Its absence
+indicates legacy behavior for that session. The session capability is distinct
+from the completed snapshot marker, which appears only after canonical replay.
+When both the offer and per-session native capability are present, assistant
+and tool stream updates carry live metadata when native supplies it. ACP emits
+live user chunks with their end receipt so the host can associate the submitted
+input with its stored message. A live delta and its later settlement look like this:
 
 ```json
 {
@@ -145,11 +153,15 @@ resolves stored replacements, abandoned branches, lost receipts and native
 messages without a live event. Tool execution frames use the result stream.
 The live card continues to use `toolCallId`, and replay retains that ID
 where the call is unambiguous within the selected path. Repeated native
-call IDs get distinct replay card IDs. ACP associates recorded progress with
-the stored native assistant entry that originated the call. Legacy tool
+call IDs get distinct replay card IDs. ACP records the result receipt's
+durable key against the originating call occurrence. A reducer can rewrite
+the stored `tool_call_id`, and replay still completes the original card using
+the stored result. Recorded progress follows the verified origin. Legacy tool
 metadata without a verifiable association stays in the archived display
-history. Tool progress retains
-`_meta["aelix/subagents"]` and the negotiated nested tool metadata.
+history. Tool progress retains `_meta["aelix/subagents"]` and the negotiated
+nested tool metadata. With `aelix/nestedToolCalls`, ACP also replays recorded
+standalone synthetic parent cards and their nested tool updates, including
+when the native snapshot is empty.
 
 ### First load of an existing Studio conversation
 

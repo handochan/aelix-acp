@@ -83,8 +83,9 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
                                             capabilities={"_meta": dict(capabilities)},
                                             adapter_args=["--enable-agents", "--permission-mode", mode])
         self.clients.append(self.client)
-        self.session = (await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []},
-                                                  timeout=120))["sessionId"]
+        opened = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []}, timeout=120)
+        self.session = opened["sessionId"]
+        return opened
 
     # === the scripted model ===
 
@@ -502,6 +503,85 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await parent, {"stopReason": "end_turn"})
         await self.until(lambda: (self.root / "child.txt").exists())
         self.assertEqual((self.root / "parent.txt").read_text(), "parent")
+
+    async def open_with_transcript(self, *, extensions=()):
+        opened = await self.open(capabilities={**NESTING, "aelix/transcript": {"version": 1}}, extensions=extensions)
+        capability = opened["_meta"].get("aelix/transcriptCapability")
+        if capability is None and os.environ.get("AELIX_ACP_REQUIRE_TRANSCRIPT") != "1":
+            self.skipTest("This native runtime does not advertise transcript/list")
+        self.assertEqual(capability, {"version": 1})
+
+    async def test_transcript_replays_rewritten_tool_result_on_its_original_card(self):
+        extension = self.root / "rewrite_result.py"
+        extension.write_text("""
+from dataclasses import replace
+from aelix_agent_core.harness.hooks import MessageEndEventResult
+from aelix_ai.messages import AssistantMessage, TextContent, ToolCallContent, ToolResultMessage
+
+def setup(api):
+    def rewrite(event, ctx):
+        message = event.message
+        if isinstance(message, AssistantMessage):
+            content = [replace(block, tool_call_id="accepted-agent-call")
+                       if isinstance(block, ToolCallContent) and block.tool_name == "agent" else block
+                       for block in message.content]
+            if content != message.content:
+                return MessageEndEventResult(message=replace(message, content=content))
+        if isinstance(message, ToolResultMessage) and message.tool_name == "agent":
+            return MessageEndEventResult(message=replace(
+                message, tool_call_id="rewritten-by-reducer",
+                content=[TextContent(text="Rewritten native report")]))
+    api.on("message_end", rewrite)
+""", encoding="utf-8")
+        await self.open_with_transcript(extensions=[extension])
+        self.assertEqual(await self.prompt("DELEGATE_WRITE"), {"stopReason": "end_turn"})
+        original = self.agent_call()
+        self.assertEqual(original, "accepted-agent-call")
+        live_card = self.card(original)
+        live_done = next(update for update in live_card if update.get("status") == "completed")
+        live_result = live_done["_meta"]["aelix/transcript"]
+        receipt, = [event["params"] for event in self.client.updates
+                    if event["method"] == "_aelix/transcript/settled"
+                    and event["params"]["streamId"] == live_result["streamId"]]
+        self.assertTrue(receipt["replaced"])
+        self.assertEqual(receipt["status"], "stored")
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            session_file, = db.execute("SELECT file FROM sessions WHERE id=?", (self.session,)).fetchone()
+        entries = [json.loads(line) for line in Path(session_file).read_text(encoding="utf-8").splitlines()]
+        stored = next(entry["message"] for entry in entries if entry.get("id") == receipt["entryId"])
+        self.assertEqual(stored.get("tool_call_id") or stored.get("toolCallId"), "rewritten-by-reducer")
+
+        load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        for _ in range(2):
+            self.client.updates.clear()
+            await self.client.request("session/load", load, timeout=120)
+            self.assertFalse(self.card("rewritten-by-reducer"))
+            card = self.card(original)
+            self.assertEqual([update["sessionUpdate"] for update in card], ["tool_call", "tool_call_update"])
+            done = card[-1]
+            self.assertEqual(done["status"], "completed")
+            self.assertEqual(done["content"][0]["content"]["text"], "Rewritten native report")
+            self.assertEqual(done["_meta"]["aelix/transcript"]["entryId"], receipt["entryId"])
+            self.assertEqual(done["_meta"]["aelix/transcript"]["nativeSessionId"], receipt["nativeSessionId"])
+            children = done["_meta"]["aelix/subagents"]["children"]
+            self.assertEqual(children[0]["id"], live_done["_meta"]["aelix/subagents"]["children"][0]["id"])
+
+    async def test_transcript_preserves_standalone_nested_tool_updates(self):
+        await self.open_with_transcript()
+        result = await self.manage("agents/run", {"name": "worker", "task": "CHILD_WRITE child.txt"}, timeout=120)
+        self.assertTrue(result["result"]["ok"], result)
+        nested = [update for update in self.updates() if "parentToolCallId" in update.get("_meta", {})]
+        self.assertEqual([update["sessionUpdate"] for update in nested], ["tool_call", "tool_call_update"])
+        self.assertEqual(nested[-1]["status"], "completed")
+        parent = nested[0]["_meta"]["parentToolCallId"]
+        self.assertTrue(parent.startswith("aelix-child:"))
+        load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        for _ in range(2):
+            self.client.updates.clear()
+            opened = await self.client.request("session/load", load, timeout=120)
+            self.assertEqual(opened["_meta"]["aelix/transcript"]["totalMessages"], 0)
+            self.assertEqual(self.card(parent)[-1]["status"], "completed")
+            self.assertEqual(self.card(nested[0]["toolCallId"]), nested)
 
     # === #800 on ACP ===
 

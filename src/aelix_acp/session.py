@@ -6,6 +6,7 @@ import binascii
 import codecs
 import asyncio
 import contextlib
+from collections import Counter
 import json
 import hmac
 import hashlib
@@ -130,7 +131,10 @@ def tool_call(call_id, name, args, cwd, status="pending"):
               "status": status, "rawInput": args}
     path = args.get("path") or args.get("file_path")
     if isinstance(path, str):
-        p = Path(path).expanduser()
+        try:
+            p = Path(path).expanduser()
+        except RuntimeError:
+            return result
         result["locations"] = [{"path": str(p if p.is_absolute() else Path(cwd) / p)}]
     return result
 
@@ -230,7 +234,9 @@ class Session:
         self.controls = SessionControls(self)
         self.adapter_event_binding = uuid.uuid4().hex
         self.adapter_event_sequence = 0
-        self.pending_tool_origins = {}
+        self.tool_origin = None
+        self.tool_occurrences = Counter()
+        self.pending_tool_results = {}
         self.context = SessionContext(self)
         self.compaction_recovery_needed = False
         self.mutation_lock = asyncio.Lock()
@@ -272,7 +278,10 @@ class Session:
         self.launch_mode = mode
 
     async def start(self, session_file=None, *, fork_source=None, fork_preferences=None, managed_change=None):
-        self.pending_tool_origins.clear()
+        self.tool_origin = None
+        self.tool_occurrences.clear()
+        self.pending_tool_results.clear()
+        self.controls.capabilities = {}
         if self.input_relay is not None:
             self.input_relay.observe_prompt(False)
         launch_prefix = getattr(self.server.args, "aelix_arg", [])
@@ -657,6 +666,8 @@ class Session:
 
     def selectors(self):
         result = self.controls.selectors()
+        if self.native_transcript():
+            result["_meta"][transcript.CAPABILITY] = transcript.VERSION
         if self.recovery_warnings:
             result["_meta"]["aelix/recoveryWarnings"] = self.recovery_warnings
         return result
@@ -855,7 +866,8 @@ class Session:
             await self.context.native_compaction_event(event)
         elif kind == "message_start" and (event.get("message") or {}).get("role") == "assistant":
             self.failure = None
-            self.pending_tool_origins.clear()
+            self.tool_origin = None
+            self.tool_occurrences.clear()
         elif kind == "message_update":
             update = event.get("assistantMessageEvent") or event.get("assistant_message_event") or {}
             if update.get("type") in ("text_delta", "thinking_delta") and update.get("delta"):
@@ -1096,14 +1108,27 @@ class Session:
             update = {"sessionUpdate": "tool_call_update", "toolCallId": call_id, "status": status, "_meta": meta}
         await self.update(update)
 
-    def offers_transcript(self):
-        return transcript.offered(getattr(self.server, "client_capabilities", {}))
+    def native_transcript(self):
+        return transcript.supported(self.controls.capabilities)
+
+    def transcript_enabled(self):
+        return self.native_transcript() and transcript.offered(getattr(self.server, "client_capabilities", {}))
 
     async def native_update(self, update, event, role):
-        if self.offers_transcript() and (coordinates := transcript.live(event, role)):
+        supported = self.native_transcript()
+        coordinates = transcript.live(event, role) if supported else None
+        if coordinates and self.transcript_enabled():
             update = transcript.tagged(update, coordinates)
-        if event["type"] == "tool_execution_start":
-            origin = self.pending_tool_origins.pop(update["toolCallId"], None)
+        if event["type"] == "tool_execution_start" and supported:
+            call_id = update["toolCallId"]
+            origin = None
+            if self.tool_origin is not None:
+                # The stored assistant can differ from the live message_end
+                # payload. Native starts tools in the accepted source order.
+                origin = {**self.tool_origin, "occurrence": self.tool_occurrences[call_id]}
+                self.tool_occurrences[call_id] += 1
+            if coordinates is not None:
+                self.pending_tool_results[transcript.stream_key(coordinates)] = (call_id, origin)
             recorded = {**update, "_meta": {**update.get("_meta", {}), transcript.TOOL_ORIGIN_META: origin}}
             await self.record_update(update, recorded=recorded)
         else:
@@ -1111,14 +1136,20 @@ class Session:
 
     async def settle_message(self, event, message):
         role = message.get("role")
-        if not isinstance(role, str) or role not in transcript.ROLES:
+        if not self.native_transcript() or not isinstance(role, str) or role not in transcript.ROLES:
             return
         coordinates = transcript.live(event, role)
         if coordinates is None:
             return
         if role == "assistant":
-            self.pending_tool_origins = dict(transcript.tool_origins(message, coordinates))
-        if not self.offers_transcript():
+            self.tool_origin = ({key: coordinates[key] for key in ("nativeSessionId", "entryId")}
+                                if coordinates["status"] == "stored" else None)
+            self.tool_occurrences.clear()
+        elif role == "toolResult":
+            linked = self.pending_tool_results.pop(transcript.stream_key(coordinates), None)
+            if linked and coordinates["status"] == "stored":
+                self.live_history.append(transcript.recorded_result(*linked, coordinates))
+        if not self.transcript_enabled():
             return
         if role == "user":
             for index, update in enumerate(self.server.native_message_updates(self, message, canonical=True)):
@@ -1717,6 +1748,7 @@ class Session:
         self.done = asyncio.get_running_loop().create_future()
         self.failure = None
         self.tools.clear()
+        self.pending_tool_results.clear()
         self.subagents.clear()  # Per turn; self.children (spawned children's parents) stays.
         try:
             if self.private_host and self.server.image_policies:

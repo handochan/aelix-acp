@@ -100,6 +100,38 @@ class TranscriptToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([update["_meta"][transcript.META]["sequence"] for update in updates], [1, 2, 3, 4])
 
 
+    async def test_rewritten_duplicate_calls_follow_receipt_occurrences(self):
+        call = {"sessionUpdate": "tool_call", "toolCallId": "same", "status": "in_progress"}
+        result = {"sessionUpdate": "tool_call_update", "toolCallId": "changed", "status": "completed"}
+        snapshot = transcript.Snapshot({"nativeSessionId": "native"}, [
+            transcript.Row(transcript.position(row(1, "origin")), "assistant", [call, call]),
+            transcript.Row(transcript.position(row(2, "result-1")), "toolResult", [result]),
+            transcript.Row(transcript.position(row(3, "result-2")), "toolResult", [result]),
+        ])
+        recorded = [transcript.recorded_result(
+            "same", {"nativeSessionId": "native", "entryId": "origin", "occurrence": occurrence},
+            {"nativeSessionId": "native", "entryId": f"result-{index}"})
+            for index, occurrence in enumerate((1, 0), 1)]
+        updates = [update async for update in transcript.reconcile(snapshot, recorded, nesting=False)]
+        first, second, first_result, second_result = [update["toolCallId"] for update in updates]
+        self.assertNotEqual(first, second)
+        self.assertEqual((first_result, second_result), (second, first))
+
+    async def test_result_without_assistant_receipt_only_falls_back_for_unchanged_id(self):
+        call = {"sessionUpdate": "tool_call", "toolCallId": "visible", "status": "in_progress"}
+        result = {"sessionUpdate": "tool_call_update", "toolCallId": "visible", "status": "completed"}
+        snapshot = transcript.Snapshot({"nativeSessionId": "native"}, [
+            transcript.Row(transcript.position(row(1, "origin")), "assistant", [call]),
+            transcript.Row(transcript.position(row(2, "result")), "toolResult", [result]),
+        ])
+        for original, linked in (("visible", True), ("other", False)):
+            recorded = [transcript.recorded_result(original, None, {"nativeSessionId": "native", "entryId": "result"})]
+            with self.subTest(original=original):
+                updates = [update async for update in transcript.reconcile(snapshot, recorded, nesting=False)]
+                self.assertEqual(len(updates), 2 if linked else 3)
+                self.assertEqual(updates[-1]["status"], "completed")
+                self.assertEqual(updates[-1]["toolCallId"] == "visible", linked)
+
     async def test_overlay_requires_the_same_native_origin_as_the_recorded_tool(self):
         call = {"sessionUpdate": "tool_call", "toolCallId": "same", "status": "in_progress"}
         progress = {"sessionUpdate": "tool_call_update", "toolCallId": "same",

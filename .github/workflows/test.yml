@@ -83,6 +83,8 @@ jobs:
           .native-core/.venv/bin/python -m unittest -v
           test_native_runtime.NativeRuntimeTests.test_cli_appends_native_turns_with_stable_live_and_replay_ids
           test_native_children.NativeChildrenTests.test_a_cancelled_calls_report_is_replayed_by_session_load
+          test_native_children.NativeChildrenTests.test_transcript_replays_rewritten_tool_result_on_its_original_card
+          test_native_children.NativeChildrenTests.test_transcript_preserves_standalone_nested_tool_updates
         env:
           PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}/tests
           AELIX_ACP_TEST_AELIX: ${{ github.workspace }}/.native-core/.venv/bin/aelix

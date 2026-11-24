@@ -224,7 +224,7 @@ class Server:
         await session.live_history.flush()
         recorded = history(self.db, session.id)
         nesting = session.declares(NESTED_TOOL_CALLS)
-        if session.offers_transcript() and transcript.supported(session.controls.capabilities):
+        if session.transcript_enabled():
             snapshot = await transcript.read(
                 session.rpc, lambda message: self.native_message_updates(session, message, canonical=True))
             session.require_live_worker()
@@ -234,7 +234,7 @@ class Server:
                 await session.notify("session/update", {"sessionId": session.id, "update": update})
                 await asyncio.sleep(0)
             return snapshot.marker
-        recorded = (transcript.display_update(update) for update in recorded)
+        recorded = (transcript.display_update(update) for update in recorded if transcript.result_link(update) is None)
         if (first := next(recorded, None)) is not None:
             for update in chain((first,), recorded):
                 if not nesting and nested_only(update):
