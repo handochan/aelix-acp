@@ -18,7 +18,7 @@ import tempfile
 import time
 import uuid
 
-from .wire.errors import (ProtocolError, BackendError, after_dispatch, delivery_unknown, fork_head_changed,
+from .wire.errors import (ProtocolError, BackendError, SOCKET_PATH_TOO_LONG, after_dispatch, delivery_unknown, fork_head_changed,
                           is_native_session_locked, require_object, require_string, session_changing, session_locked)
 from .wire.process import terminate_owned
 from .wire.transport import StdoutWriter, encode_frame
@@ -107,8 +107,11 @@ def _make_session_dir(*, tcp):
     def fits(parent):
         return len(os.fsencode(Path(parent) / relative_socket)) + 1 <= limit
 
-    default = tempfile.gettempdir()
-    if fits(default):
+    try:
+        default = tempfile.gettempdir()
+    except FileNotFoundError:
+        default = None
+    if default is not None and fits(default):
         return tempfile.mkdtemp(prefix=_SESSION_TEMP_PREFIX, dir=default)
     if os.name == "posix" and fits(_SHORT_TEMP_DIR):
         try:
@@ -116,9 +119,10 @@ def _make_session_dir(*, tcp):
         except OSError:
             # The short directory may be unavailable. Keep filesystem paths out of the error.
             pass
-    raise ProtocolError(f"The Unix socket path cannot fit within the {limit}-byte AF_UNIX limit "
+    raise ProtocolError(f"Could not create a session directory for a Unix socket within the {limit}-byte AF_UNIX limit "
                         "(including the terminating NUL). Set TMPDIR to a shorter, writable directory.",
-                        -32000, {"kind": "socket_path_too_long", "limitBytes": limit, "retryable": False})
+                        SOCKET_PATH_TOO_LONG,
+                        {"kind": "socket_path_too_long", "limitBytes": limit, "retryable": False})
 
 
 def tool_call(call_id, name, args, cwd, status="pending"):

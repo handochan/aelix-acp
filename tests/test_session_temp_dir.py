@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from aelix_acp import session
-from aelix_acp.wire.errors import ProtocolError
+from aelix_acp.wire.errors import ProtocolError, SOCKET_PATH_TOO_LONG
 
 
 class SessionTempDirTests(unittest.TestCase):
@@ -39,6 +39,7 @@ class SessionTempDirTests(unittest.TestCase):
             session._make_session_dir(tcp=False)
         mkdtemp.assert_not_called()
         error = caught.exception
+        self.assertEqual(error.code, SOCKET_PATH_TOO_LONG)
         self.assertEqual(error.data, {"kind": "socket_path_too_long", "limitBytes": 104, "retryable": False})
         self.assertNotIn(tmpdir, str(error))
 
@@ -52,6 +53,26 @@ class SessionTempDirTests(unittest.TestCase):
             session._make_session_dir(tcp=False)
         mkdtemp.assert_called_once_with(prefix="aelix-acp-", dir="/tmp")
         self.assertEqual(caught.exception.data["kind"], "socket_path_too_long")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX short temp directory")
+    def test_tempdir_lookup_failure_still_tries_tmp(self):
+        with (patch.object(session.tempfile, "gettempdir", side_effect=FileNotFoundError("no usable temp directory")),
+              patch.object(session.tempfile, "mkdtemp", return_value="session-dir") as mkdtemp):
+            self.assertEqual(session._make_session_dir(tcp=False), "session-dir")
+        mkdtemp.assert_called_once_with(prefix="aelix-acp-", dir="/tmp")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX short temp directory")
+    def test_tempdir_lookup_and_fallback_failures_hide_paths(self):
+        with (patch.object(session, "sys", SimpleNamespace(platform="darwin")),
+              patch.object(session.tempfile, "gettempdir", side_effect=FileNotFoundError("/private/default")),
+              patch.object(session.tempfile, "mkdtemp", side_effect=PermissionError("/private/fallback")) as mkdtemp,
+              self.assertRaisesRegex(ProtocolError, "104-byte AF_UNIX limit.*Set TMPDIR") as caught):
+            session._make_session_dir(tcp=False)
+        mkdtemp.assert_called_once_with(prefix="aelix-acp-", dir="/tmp")
+        error = caught.exception
+        self.assertEqual(error.code, SOCKET_PATH_TOO_LONG)
+        self.assertEqual(error.data, {"kind": "socket_path_too_long", "limitBytes": 104, "retryable": False})
+        self.assertNotIn("/private/", str(error))
 
     def test_tcp_uses_default_tempdir_without_socket_path_check(self):
         with (patch.object(session.tempfile, "gettempdir") as gettempdir,

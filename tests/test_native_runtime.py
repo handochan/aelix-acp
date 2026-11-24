@@ -999,12 +999,43 @@ def setup(api):
         self.assertEqual(result["modes"]["currentModeId"], "yolo")
 
     async def test_approved_write_is_real_and_denied_write_is_absent(self):
+        await self.assert_write_approval()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX Unix approval socket")
+    async def test_long_tmpdir_uses_fallback_socket_for_approval_and_close(self):
+        tmpdir = self.root / ("t" * (139 - len(os.fsencode(self.root))))
+        tmpdir.mkdir()
+        self.assertEqual(len(os.fsencode(tmpdir)), 140)
+        extension = self.root / "socket_probe.py"
+        extension.write_text(textwrap.dedent('''\
+            import os
+            from pathlib import Path
+
+            def setup(api):
+                Path("approval-socket.txt").write_text(os.environ["AELIX_ACP_SOCKET"], encoding="utf-8")
+            '''), encoding="utf-8")
+
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE, extensions=[extension],
+                                            extra_env={"TMPDIR": str(tmpdir)})
+        created = await self.client.request("session/new", {"cwd": str(self.root)}, timeout=120)
+        self.session = created["sessionId"]
+        socket_path = Path((self.root / "approval-socket.txt").read_text(encoding="utf-8"))
+        self.assertEqual(socket_path.parent.parent, Path("/tmp"))
+        self.assertTrue(socket_path.is_socket())
+
+        await self.assert_write_approval()
+        self.assertEqual(await self.client.request("session/close", {"sessionId": self.session}), {})
+        self.assertFalse(socket_path.parent.exists())
+
+    async def assert_write_approval(self):
         await self.prompt("WRITE_TEST")
-        self.assertEqual((self.root / "approved.txt").read_text(), "approved write")
-        (self.root / "approved.txt").unlink()
+        self.assertEqual(self.write_path.read_text(encoding="utf-8"), "approved write")
+        self.write_path.unlink()
         self.client.permission = "reject-once"
         await self.prompt("WRITE_TEST")
-        self.assertFalse((self.root / "approved.txt").exists())
+        self.assertFalse(self.write_path.exists())
+        self.assertEqual(sum(req["method"] == "session/request_permission" for req in self.client.requests), 2)
 
     async def test_yolo_skips_client_approval_and_ask_restores_it(self):
         await self.config("permission_mode", "yolo")

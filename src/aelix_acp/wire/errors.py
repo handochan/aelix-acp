@@ -7,6 +7,7 @@ from __future__ import annotations
 SESSION_LOCKED = -33001
 TURN_FAILED_AFTER_DISPATCH = -33002
 FORK_HEAD_CHANGED = -33003
+SOCKET_PATH_TOO_LONG = -33004
 
 # Native's own refusal when another process holds the session's writer lock
 # (aelix-ai cli/entry.py `_session_owned_message` and the runtime's swap path).
