@@ -33,6 +33,47 @@ def marker_variants(marker):
     return {value.encode("utf-8") for value in variants}
 
 
+async def cancel_h1_http_after_handoff(port, path, token, request_body, handoffs, lookup):
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    body = json.dumps(request_body).encode("utf-8")
+    writer.write(
+        f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        f"x-aionui-studio-auth: {token}\r\nContent-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii") + body
+    )
+    await writer.drain()
+    response = asyncio.create_task(reader.read(1))
+    ack_writer = None
+    try:
+        async with asyncio.timeout(10):
+            ack_reader, ack_writer = await handoffs.get()
+            assert await ack_reader.readline() == b"written 1\n"
+            assert not response.done(), "Host returned an HTTP response before ACP settled the receipt"
+            response.cancel()
+            writer.transport.abort()
+            try:
+                await response
+            except asyncio.CancelledError:
+                outcome = "unknown"
+            else:
+                raise AssertionError("The cancelled HTTP request returned a result")
+            await writer.wait_closed()
+            assert await lookup() == {"status": "pending"}
+            ack_writer.write(b"!")
+            await ack_writer.drain()
+            assert await ack_reader.readline() == b"settled 1\n"
+            found = await lookup()
+            assert found["status"] == "completed", found
+            assert found["result"]["accepted"] and found["result"]["captionAdded"], found
+            return outcome, found["result"]
+    finally:
+        response.cancel()
+        writer.close()
+        if ack_writer is not None:
+            ack_writer.close()
+            await ack_writer.wait_closed()
+
+
 async def host_run(root, host_bin, aelix, *, expect_sdk_leak=False):
     from spike_image_window import Probe, sse
     from test_running_images import key
@@ -129,6 +170,11 @@ async def host_run(root, host_bin, aelix, *, expect_sdk_leak=False):
             }
         )
     )
+    handoffs = asyncio.Queue()
+    handoff_listener = await asyncio.start_server(
+        lambda reader, writer: handoffs.put_nowait((reader, writer)), "127.0.0.1", 0
+    )
+    handoff_port = handoff_listener.sockets[0].getsockname()[1]
     source = Path(__file__).resolve().parents[1] / "src"
     policy = {
         "route": ["fixture", "one", "openai-completions", url],
@@ -142,11 +188,37 @@ async def host_run(root, host_bin, aelix, *, expect_sdk_leak=False):
         "outputTokens": 4096,
     }
     launcher = root / "launch.py"
-    launcher.write_text(f"""import json
+    launcher.write_text(f"""import asyncio
+import json
 import sys
 from pathlib import Path
 sys.path.insert(0, {str(source)!r})
 import aelix_acp.server as server
+
+rpc = server.Session.rpc
+image_writes = 0
+settlement = {{}}
+
+async def hold_image_receipt(self, command, *, _image_write=None, **kwargs):
+    if _image_write is None:
+        return await rpc(self, command, **kwargs)
+    current, issued = _image_write
+
+    def count_write():
+        global image_writes
+        issued()
+        image_writes += 1
+
+    # A real native ACK proves the grant was acquired and stdin consumed.
+    result = await rpc(self, command, _image_write=(current, count_write), **kwargs)
+    reader, writer = await asyncio.open_connection("127.0.0.1", {handoff_port})
+    settlement[asyncio.current_task()] = writer
+    writer.write(f"written {{image_writes}}\\n".encode("ascii"))
+    await writer.drain()
+    assert await reader.readexactly(1) == b"!"
+    return result
+
+server.Session.rpc = hold_image_receipt
 
 class TestServer(server.Server):
     def __init__(self, args):
@@ -162,6 +234,12 @@ class TestServer(server.Server):
             await super().handle(message)
         finally:
             self.fixture_prompt_ids.discard(identifier)
+            writer = settlement.pop(asyncio.current_task(), None)
+            if writer is not None:
+                writer.write(f"settled {{image_writes}}\\n".encode("ascii"))
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
 
     async def send(self, message, **kwargs):
         # Positive control at the ACP/Host boundary, after normal ACP sanitization.
@@ -336,15 +414,24 @@ server.main()
             "message": "",
             "grants": [original["grants"][0]["id"]],
         }
-        result = await call("input/steer-images", data)
-        assert result["captionAdded"] and result["accepted"], result
-        assert await call("input/steer-images", data) == result
-        assert (await call("requests/lookup", {"requestId": key(1)}))["result"] == result
+        async def lookup():
+            return await call("requests/lookup", {"requestId": key(1)})
+
+        outcome, result = await cancel_h1_http_after_handoff(
+            port,
+            scope + "/acp-extensions",
+            token,
+            {"bindingId": binding, "method": "_aelix/session/input/steer-images", "payload": data},
+            handoffs,
+            lookup,
+        )
+        assert outcome == "unknown"
+        assert result["inputKind"] == "pixels" and result["turnId"] == running["turnId"], result
         probe.gate.set()
         async with asyncio.timeout(10):
             while len(probe.requests) < 2:
                 await asyncio.sleep(0.05)
-        assert "private-file-marker.png" in probe.requests[-1]["images"]
+        assert probe.requests[-1]["images"] == ["private-file-marker.png"]
         async with asyncio.timeout(5):
             while (await call("input/image-state", {}))["status"] != "available":
                 await asyncio.sleep(0.05)
@@ -372,6 +459,8 @@ server.main()
                 await asyncio.sleep(0.05)
     finally:
         probe.gate.set()
+        handoff_listener.close()
+        await handoff_listener.wait_closed()
         listener.close()
         await listener.wait_closed()
         proc.terminate()
@@ -403,6 +492,9 @@ server.main()
                 "hostBytes": True,
                 "idempotentPrepare": True,
                 "providerImages": 1,
+                "httpCancelledOutcome": outcome,
+                "originalKeyRecovered": True,
+                "nativeImageWrites": 1,
                 "observedStandardFrames": sorted(observed),
                 "loggedStandardMarkers": leaked,
             }

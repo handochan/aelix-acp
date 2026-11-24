@@ -312,14 +312,71 @@ class RunningImages(Probe):
         sample = await self.state()
         assert sample["keptCount"] == 20 and "image_count" in sample["reasons"]
 
-    async def request_boundaries(self):
-        async def fresh(binding):
-            await self.server.dispatch("session/close", {"sessionId": self.session_id})
-            self.binding = self.server.binding = binding
-            opened = await self.server.dispatch("session/new", self.open_params())
-            self.session_id = self.server.session_id = opened["sessionId"]
+    async def fresh(self, binding):
+        await self.server.dispatch("session/close", {"sessionId": self.session_id})
+        self.binding = self.server.binding = binding
+        opened = await self.server.dispatch("session/new", self.open_params())
+        self.session_id = self.server.session_id = opened["sessionId"]
+        await self.config("autoRetryEnabled", "false")
 
-        await fresh("twenty-plus-queue")
+    async def final_request_budgets(self):
+        for side in (8000, 8001):
+            await self.fresh(f"dimension-{side}")
+            label = f"dimension-{side}"
+            self.add_image(f"{label}.png", dimensions=(side, 1))
+            start = len(self.requests)
+            await self.prompt(label)
+            assert len(self.requests) == start + 1
+            kept = side == 8000
+            self.assert_request(start, [f"{label}.png"] if kept else [], omitted=int(not kept))
+            state = await self.state()
+            assert state["reasons"] == ({} if kept else {"image-dimensions": 1}), state
+
+        (policy,) = self.server.image_policies
+        observed = self.root / "provider-body.jsonl"
+        prompt = '1c 몸체 "quote" \\ slash\n next\t tab \x01 control'
+        images = ["tool.png", "tool-added.png"]
+
+        async def request(binding, *, fail=False, **budget):
+            self.server.image_policies = ({**policy, **budget},)
+            await self.fresh(binding)
+            observed.write_text("", encoding="ascii")
+            start = len(self.requests)
+            self.additional_tool_calls = 1
+            result = await self.prompt(prompt, fail=fail)
+            measurements = [json.loads(row) for row in observed.read_text(encoding="ascii").splitlines()]
+            assert len(measurements) == 2, measurements
+            if fail:
+                assert result == -33002
+                assert len(self.requests) == start + 1
+                self.assert_request(start, [], omitted=0)
+            else:
+                assert len(self.requests) == start + 2
+                body = self.assert_request(start + 1, images, omitted=0)
+                assert any(prompt in message["blocks"] for message in body["messages"]), body["messages"]
+                assert measurements[-1] == [body["httpBytes"], body["httpSha256"]], (measurements, body)
+            return measurements[-1]
+
+        try:
+            measured = await request("calibrate-body")
+            row = self.requests[-1]
+            wire_size = row["httpBytes"]
+            context_cost = (
+                wire_size - row["base64Bytes"] + len(images) * policy["imageTokens"]
+                + max(policy["outputTokens"], row["outputTokens"])
+            )
+            assert await request("body-at-limit", bodyBytes=wire_size) == measured
+            assert await request("body-over-limit", bodyBytes=wire_size - 1, fail=True) == measured
+            assert await request("tokens-at-limit", contextTokens=context_cost) == measured
+            assert await request("tokens-over-limit", contextTokens=context_cost - 1, fail=True) == measured
+            self.results["finalRequestBudgets"] = {"bodyBytes": wire_size, "contextCost": context_cost}
+        finally:
+            self.server.image_policies = (policy,)
+            observed.unlink(missing_ok=True)
+
+    async def request_boundaries(self):
+
+        await self.fresh("twenty-plus-queue")
         await self.prompt("twenty ordinary images", ["f0.png"] * 20)
         assert len(self.requests[-1]["images"]) == 20 and self.requests[-1]["placeholders"] == 0
         self.gate.clear()
@@ -346,12 +403,12 @@ class RunningImages(Probe):
         assert self.requests[-1]["images"] == ["f0.png"] * 19 + ["f1.png"]
         assert self.requests[-1]["placeholders"] == 1
 
-        await fresh("twenty-six")
+        await self.fresh("twenty-six")
         await self.prompt("twenty-six ordinary images", ["f0.png"] * 26)
         assert len(self.requests[-1]["images"]) == 20
         assert self.requests[-1]["placeholders"] == 6
 
-        await fresh("raw-boundary")
+        await self.fresh("raw-boundary")
         large_labels = [f"boundary-{index}.png" for index in range(3)]
         for label in large_labels:
             self.add_image(label, 3_303_999)
@@ -364,6 +421,48 @@ class RunningImages(Probe):
             "twentySix": 20,
             "threeLargeRawBytes": 6_607_998,
         }
+
+    async def image_after_last_drain(self):
+        await self.fresh("image-after-last-drain")
+        self.server.grants = {"late-drain": "f2.png"}
+        reached = asyncio.Queue()
+        listener = await asyncio.start_server(lambda _, writer: reached.put_nowait(writer), "127.0.0.1", 0)
+        gate = self.root / "hold-after-drain"
+        gate.write_text(str(listener.sockets[0].getsockname()[1]), encoding="ascii")
+        start = len(self.requests)
+        writes = self.native_writes["steer"]
+        first = asyncio.create_task(self.prompt("explicit first prompt"))
+        writer = None
+        lookup = {"requestId": key(32)}
+        async with listener:
+            try:
+                # The pinned native emits agent_end only after the final drains.
+                writer = await asyncio.wait_for(reached.get(), 10)
+                active = await self.relay("input/state", {})
+                assert active["active"], active
+                receipt = await self.relay(
+                    "input/steer-images",
+                    {**lookup, "turnId": active["turnId"], "message": "late image", "grants": ["late-drain"]},
+                )
+                assert receipt["accepted"] and receipt["inputKind"] == "pixels", receipt
+                assert len(self.requests) == start + 1
+                self.assert_request(start, [], omitted=0)
+            finally:
+                gate.unlink(missing_ok=True)
+                if writer is not None:
+                    writer.write(b"!")
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                await first
+        assert len(self.requests) == start + 1
+        await self.prompt("explicit next prompt")
+        assert len(self.requests) == start + 2
+        # The loopback maps each decoded body image to its fixture SHA-256.
+        self.assert_request(start + 1, ["f2.png"], omitted=0)
+        assert await self.relay("requests/lookup", lookup) == {"status": "completed", "result": receipt}
+        assert self.native_writes["steer"] == writes + 1
+        self.results["imageAfterLastDrain"] = {"firstPrompt": 0, "nextPrompt": 1, "nativeWrites": 1}
 
     async def normal_image_comparison(self):
         # Compare the previous empty production route list with the candidate
@@ -467,6 +566,8 @@ class RunningImages(Probe):
                 await self.startup()
                 await self.exercise()
                 await self.request_boundaries()
+                await self.final_request_budgets()
+                await self.image_after_last_drain()
                 # All requests so far are for the negotiated, verified route.
                 assert all(
                     row["rawBytes"] <= 8 * MIB and len(row["images"]) <= 20 and row["httpBytes"] <= 12 * MIB
