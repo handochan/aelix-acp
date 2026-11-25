@@ -415,6 +415,73 @@ def setup(api):
         self.assertEqual(result["modes"]["currentModeId"], "yolo")
         self.assertEqual(result["models"]["currentModelId"], "fixture/two")
 
+    async def no_default_model_session(self):
+        """A new adapter and session with a configured provider but no default model (ACP #62)."""
+        await self.client.close()
+        (self.root / "agent/settings.json").write_text(json.dumps({"compaction": {"keepRecentTokens": 0}}))
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        created = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []}, timeout=120)
+        self.session = created["sessionId"]
+        return created
+
+    def published_options(self):
+        return [event["params"]["update"]["configOptions"] for event in self.client.updates
+                if event.get("method") == "session/update"
+                and event["params"]["update"]["sessionUpdate"] == "config_option_update"]
+
+    async def test_no_default_model_advertises_available_models_and_applies_the_choice(self):
+        created = await self.no_default_model_session()
+        options = {option["id"]: option for option in created["configOptions"]}
+        self.assertEqual((options["model"]["category"], options["model"]["currentValue"]), ("model", ""))
+        self.assertEqual([entry["value"] for entry in options["model"]["options"]], ["fixture/one", "fixture/two"])
+        self.assertEqual(created["models"]["currentModelId"], "")
+        self.assertNotIn("thinking_level", options)
+        self.assertNotIn("synthetic-fixture-key", json.dumps(created))
+
+        with self.assertRaises(RuntimeError) as refused:
+            await self.prompt("Respond")
+        error = json.loads(str(refused.exception))
+        self.assertEqual(error["code"], -32602)
+        self.assertEqual(error["data"], {"kind": "model_selection_required", "configId": "model",
+                                         "availableModels": 2, "retryable": False})
+        self.assertEqual(self.model_requests, [])
+
+        result = await self.config("model", "fixture/one")
+        options = {option["id"]: option for option in result["configOptions"]}
+        self.assertEqual(options["model"]["currentValue"], "fixture/one")
+        self.assertEqual((options["thinking_level"]["category"], options["thinking_level"]["currentValue"]),
+                         ("thought_level", "off"))
+        self.assertEqual([entry["value"] for entry in options["thinking_level"]["options"]],
+                         ["off", "minimal", "low", "medium", "high"])
+        self.assertEqual(self.published_options()[-1], result["configOptions"])
+        await self.config("thinking_level", "high")
+        self.assertEqual(await self.prompt("Respond"), {"stopReason": "end_turn"})
+        self.assertEqual([request["model"] for request in self.model_requests], ["one"])
+
+    async def test_no_default_model_choice_survives_load_worker_restart_and_fork(self):
+        await self.no_default_model_session()
+        await self.config("model", "fixture/two")
+        await self.client.close()
+
+        # Native resumes a file with no messages on its placeholder; ACP restores the choice.
+        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        loaded = await self.client.request(
+            "session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}, timeout=120)
+        self.assertEqual(loaded["models"]["currentModelId"], "fixture/two")
+        self.assertNotIn("aelix/recoveryWarnings", loaded["_meta"])
+
+        await self.manage("agents/enable", {"enabled": True})  # Replaces the native worker.
+        runtime = await self.client.request("_aelix/capabilities", {"sessionId": self.session})
+        self.assertEqual({option["id"]: option["currentValue"] for option in runtime["configOptions"]}["model"],
+                         "fixture/two")
+
+        self.assertEqual(await self.prompt("NO_DEFAULT_PARENT", fork_head="no-default"), {"stopReason": "end_turn"})
+        forked = await self.client.request("session/fork", self.fork_params("no-default"), timeout=120)
+        self.assertEqual(forked["models"]["currentModelId"], "fixture/two")
+        await self.client.request("session/prompt", {"sessionId": forked["sessionId"],
+                                                     "prompt": [{"type": "text", "text": "Respond"}]})
+        self.assertEqual([request["model"] for request in self.model_requests], ["two", "two"])
+
     async def test_native_file_selectors_win_over_saved_adapter_preferences(self):
         await self.config("thinking_level", "low")
         await self.prompt("Seed the native session")

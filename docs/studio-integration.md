@@ -18,6 +18,17 @@ Aelix lacks these operations. Advertise client actions only after implementing t
    use string `true`/`false`. Replace the catalog after model changes.
    `permission_mode` is `default` (Ask) or `yolo`. A `current_mode_update`
    follows every new/load response with the restored mode.
+   Native can run with no current model (no `defaultProvider`/`defaultModel`
+   and no `--model`). `model` is then still offered with the available models,
+   with `currentValue: ""` and `models.currentModelId: ""`; `""` is never a
+   selectable value. `thinking_level` appears once a model is current, in the
+   `config_option_update` that follows the selection. Model input (and
+   `/compact`) is refused before it reaches native with `-32602` and
+   `{kind:"model_selection_required", configId:"model", availableModels, retryable:false}`.
+   With `availableModels: 0` there is no `model` option: configure a provider
+   first. Slash commands still run, including `/model provider/id`. Native RPC
+   `set_model` does not store a default model, so each new session starts
+   unselected; load, worker restart and fork restore the session's own choice.
 5. Render available commands, text/thought chunks, tool calls, updates, status,
    raw input/output and file locations. Answer `session/request_permission`
    with a listed option ID. Dismissal denies/cancels.

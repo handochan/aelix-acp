@@ -178,7 +178,10 @@ history as sensitive user data.
 The native `agent_end` closes a provider attempt. ACP prompt completion instead
 waits for native `get_state.isStreaming` to become false, including retries and
 closing compaction. A missing saved model or other setting recovers to the
-native choice with a warning. A saved agent profile that cannot be applied
+native choice with a warning. When native resumes without a current model, the
+saved model and reasoning choice apply; a session that never chose a model stays
+unselected, and ACP refuses its model input before native (`model_selection_required`)
+instead of returning native's CLI advice. A saved agent profile that cannot be applied
 refuses the session (`-32004`, `profile_unavailable`): the profile's tool and
 posture limits would be lost, and AionCore v0.2.2 does not show warnings sent
 during `session/load`. A saved tool selection the runtime cannot enforce

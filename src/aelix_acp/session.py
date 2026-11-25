@@ -441,8 +441,8 @@ class Session:
         # them. The empty branch still relies on its cached pre-turn choices.
         native_has_history = resume_file and self.state.get("messageCount", self.state.get("message_count")) != 0
         restored_selectors = {
-            option["id"]: option["currentValue"] for option in self.controls.options()
-            if option["id"] in NATIVE_SESSION_SELECTORS
+            config_id: value for config_id, value in self.controls.selections().items()
+            if config_id in NATIVE_SESSION_SELECTORS
         } if native_has_history else {}
         # A saved profile or tool selection restricts authority. Refuse rather
         # than resume with the runtime's broader defaults; check before client
@@ -492,7 +492,9 @@ class Session:
                 if not option or config[config_id] not in [entry["value"] for entry in option["options"]]:
                     self.recovery_warnings.append({"kind": "config_unavailable", "configId": config_id,
                         "previousValue": config[config_id], "message": f"Saved {config_id} is unavailable; using the native runtime's current selection."})
-                elif not (native_has_history and config_id in NATIVE_SESSION_SELECTORS):
+                elif config_id not in restored_selectors:
+                    # A selection native's history restored wins. With none (no
+                    # history, or native resumed without a model) the saved one applies.
                     await self.controls.set(config_id, config[config_id], publish=False)
         metadata = getattr(self.server, "client_capabilities", {}).get("_meta", {})
         if metadata.get("aelix/clientActions") is True and "ui/enable" in methods:
@@ -652,7 +654,7 @@ class Session:
         row = (self.id, self.cwd, self.server.args.profile, self.state.get("sessionFile"),
                self.state.get("sessionName") or f"Aelix {self.server.args.profile}", int(time.time()))
         preferences = {"permission_mode": self.controls.permission_mode, "extensions": self.extra_extensions,
-            "config": {option["id"]: option["currentValue"] for option in self.controls.options()},
+            "config": self.controls.selections(),
             **({"extensionOverrides": self.extension_overrides} if self.extension_overrides else {}),
             "lastContextMeasurement": self.context.last_measurement,
             "agent": self.controls.capabilities.get("activeAgent"),
@@ -1688,6 +1690,10 @@ class Session:
                 not text_only or "[[AION_FILES]]" in map(str.strip, instructions.splitlines())):
             raise ProtocolError("/compact accepts text instructions only")
         command = text.partition(" ")[0].removeprefix("/") if text_only and text.startswith("/") else ""
+        if instructions is not None or not (text_only and text.startswith("/")):
+            # Model input (and /compact) without a model is refused before the
+            # input is recorded; slash commands run, as /model can select one.
+            await self.controls.require_model()
         adapter_input = instructions is not None or ALIASES.get(command, command) in BUILTINS
         tracked_input = transcript.supported(self.controls.capabilities) and (adapter_input or bool(command))
         first_input = self.adapter_event_sequence + 1
@@ -1726,6 +1732,7 @@ class Session:
                 text = prepared
         if self.cancelled:
             return {"stopReason": "cancelled"}
+        await self.controls.require_model()  # A template or skill expansion is model input too.
         return await self.drive_turn(
             lambda: self.rpc("prompt", message=text, **({"images": images} if images else {})),
             input_relay=self.input_relay,
