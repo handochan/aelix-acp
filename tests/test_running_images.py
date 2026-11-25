@@ -704,6 +704,9 @@ class ImageRelayTests(unittest.IsolatedAsyncioTestCase):
                     self.session.permission_connections = self.session.permissions = self.session.ui_tasks = set()
                     self.session.controls = SimpleNamespace(capabilities={})
                     self.session.abort = AsyncMock()
+                    self.session.cancel_generation = 0
+                    self.session.begin_cancel = Session.begin_cancel.__get__(self.session)
+                    self.session.cancel_native = Session.cancel_native.__get__(self.session)
                     await Session.cancel(self.session)
                 elif boundary == "middle":
                     self.session.image_generation = "replacement"

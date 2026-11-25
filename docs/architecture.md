@@ -55,9 +55,56 @@ Unicode, nonfinite numbers and excess requests are rejected. Stderr drains in
 chunks. Cancellation reaches native control tasks without waiting for their
 mutation lock and cancels pending dialogs.
 
-Stdout and forwarded native stderr use bounded daemon writers on raw descriptors. A client that stops
-reading cannot block the event loop or Python's buffered-stdout shutdown lock.
-EOF can cancel queued replies; disconnected clients must recover through history.
+Stdout writes complete frames in order on a daemon. Stdin keeps processing
+cancellation and permission replies while output is blocked. To stop a native
+turn, ACP sends `commands/cancel` when available, followed by `abort`
+without waiting for the first response. When stdout stalls, the reader
+pauses at the in-flight notification and the bounded native pipe applies
+backpressure to later frames.
+
+`session/cancel` is an [ACP notification](https://agentclientprotocol.com/protocol/v1/prompt-turn#cancellation).
+The reader starts handlers in input order. A new prompt establishes its cancel
+generation before its first wait and keeps it through compaction recovery.
+Stop applies to that admitted turn immediately. Duplicate Stops share the
+native cancel. A Stop for newer work retires the older native acknowledgement
+wait, whose ID-bearing requests receive a superseded error.
+
+Each addressable request receives one result or error with the original ID
+while the connection stays open. Stop admission is independent of the 64
+ordinary requests. Up to 64 ID-bearing Stops can wait for native outcomes,
+with a 4 KiB storage allowance per reserved ID. At either limit the Stop
+still takes effect, and ACP queues a serialized overload error with the full ID.
+Duplicate active IDs receive a correlated invalid-request error for each
+duplicate frame.
+
+A separate writer for identified errors holds up to 4,096 frames and 512 KiB,
+including its active write. A larger error can occupy this buffer alone. Its
+size is bounded by the input frame limit plus its error envelope. At capacity
+the reader waits with one staged error until stdout drains. The two-frame
+stdin queue then backpressures the client. Control already admitted continues
+running, and later input resumes in wire order. Unidentifiable input retains
+a separate best-effort budget of 16 error replies.
+
+Each of up to 256 outstanding child approval requests reserves its own
+withdrawal slot until the client answers or the withdrawal is delivered.
+At capacity, ACP denies a new child approval before opening a client dialog.
+
+Native stderr drains continuously into a shared best-effort sink. A full
+inherited stderr queue can discard whole chunks and diagnostics.
+
+Stdin EOF or a terminal read error starts one shutdown deadline on the event
+loop. While a frame waits for space in the two-slot input queue, the reader
+checks the pipe for hangup or error at 100 ms intervals. This detects a
+writer disconnect even with bytes left in the kernel. POSIX sockets also
+report a write-half close. An open writer retains ordinary backpressure and
+all queued bytes.
+
+End of input wakes a dispatcher waiting for error-reply space. Shutdown
+discards queued frames and gives the active stdout write the remainder of
+the one-second deadline to finish. A closed stdout reader ends the connection,
+even with stdin open. An EOF drain timeout exits with status 2. A client that never
+resumes reading can see a truncated final line and must recover through
+history.
 
 Changing extensions, trust or delegation restarts the child, preserving the
 transcript and ACP identity. Client MCP configuration and UI support rebind
@@ -299,7 +346,7 @@ aborted again only when 2 s (native's own re-abort grace) have passed since the
 previous abort sent by any path, not at every 50 ms poll; `drive_turn`'s
 re-cancel after native accepted a prompt obeys the same cadence. Each client
 `session/cancel` sends one abort at once: its own after `commands/cancel`, or
-none if the turn's poll aborted while `commands/cancel` waited (fix round 1,
+none if the turn's poll aborted while the native stdin write drained (fix round 1,
 Codex C-M2: those two were 0.3 ms apart).
 
 How it is held, against native aelix-ai `83714045` on macOS (the Windows paths

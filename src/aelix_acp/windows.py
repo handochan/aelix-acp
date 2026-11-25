@@ -1,10 +1,58 @@
-"""Owned Windows worker jobs; closing the ACP process kills its worker descendants."""
+"""Windows pipe state and owned worker jobs."""
 import ctypes
 from ctypes import wintypes
+from functools import cache
 import os
 import subprocess
 import sys
 import threading
+
+
+class _IoStatusBlock(ctypes.Structure):
+    # The first field is a union of NTSTATUS and a pointer.
+    _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+
+class _PipeLocalInformation(ctypes.Structure):
+    _fields_ = [(name, wintypes.ULONG) for name in (
+        "type", "configuration", "maximum_instances", "current_instances",
+        "inbound_quota", "read_data_available", "outbound_quota", "write_quota_available",
+        "state", "end",
+    )]
+
+
+@cache
+def _query_file_information():
+    query = ctypes.WinDLL("ntdll").NtQueryInformationFile
+    query.argtypes = [wintypes.HANDLE, ctypes.POINTER(_IoStatusBlock), ctypes.c_void_p,
+                      wintypes.ULONG, ctypes.c_int]
+    query.restype = wintypes.DWORD
+    return query
+
+
+def pipe_input_ended(fd):
+    """Read the pipe connection state even when unread bytes remain."""
+    import _winapi
+    import msvcrt
+
+    handle = msvcrt.get_osfhandle(fd)
+    io_status = _IoStatusBlock()
+    info = _PipeLocalInformation()
+    status = _query_file_information()(handle, ctypes.byref(io_status), ctypes.byref(info),
+                                       ctypes.sizeof(info), 24)  # FilePipeLocalInformation
+    if status == 0:
+        return info.state in (1, 4)  # FILE_PIPE_DISCONNECTED_STATE / FILE_PIPE_CLOSING_STATE
+    if status in (0xC00000B0, 0xC00000B1, 0xC000014B):  # Disconnected, closing, broken
+        return True
+    # A pipe provider may not implement this information class. A failing
+    # peek still reports a read-side error; zero available bytes can be live.
+    try:
+        _winapi.PeekNamedPipe(handle, 0)
+    except OSError as error:
+        if error.winerror == 233:  # ERROR_PIPE_NOT_CONNECTED
+            return True
+        raise
+    return False
 
 
 class _BasicLimits(ctypes.Structure):

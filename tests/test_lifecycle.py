@@ -230,12 +230,12 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
         payload = {'jsonrpc':'2.0','id':1,'method':'x' * 1024 * 1024,'params':{}}
         self.proc.stdin.write((json.dumps(payload)+'\n').encode())
         await self.proc.stdin.drain()
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(self.proc.stdout.readexactly(16 * 1024), 5)
         self.proc.stdin.close()
         async with asyncio.timeout(10):
             while self.proc.returncode is None:
                 await asyncio.sleep(0.02)
-        self.assertEqual(self.proc.returncode, 0)
+        self.assertEqual(self.proc.returncode, 2)
         await self.proc.stdout.read()
         await self.proc.wait()
 
@@ -254,12 +254,12 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
             'sessionId':result['result']['sessionId'],'prompt':[{'type':'text','text':'Flood'}]}}
         self.proc.stdin.write((json.dumps(payload)+'\n').encode())
         await self.proc.stdin.drain()
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(self.proc.stdout.readexactly(16 * 1024), 5)
         self.proc.stdin.close()
         async with asyncio.timeout(10):
             while self.proc.returncode is None:
                 await asyncio.sleep(0.02)
-        self.assertEqual(self.proc.returncode, 0)
+        self.assertEqual(self.proc.returncode, 2)
         await asyncio.gather(self.proc.stdout.read(), self.proc.stderr.read())
 
 
