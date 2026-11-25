@@ -86,26 +86,37 @@ signal; the native transcript path is never copied into the error.
 
 ### Native provider failures (ACP #64, Host #71)
 
-A failed native assistant message with `stop_reason: "error"` and an error
-message adds `data.cause = {kind, retryable}` to the `-33002` error. The
-provider cause vocabulary is `provider_auth`, `provider_rate_limit`,
-`provider_unavailable`, `provider_bad_request`, `provider_network` and
-`unknown`. Specific categories require a structured provider status or error
-type from native. The `83714045` pin acknowledges the prompt and then reports
-a generic assistant error in `message_end`. On that wire, HTTP status and
-provider error type survive only in display text, if present at all. The
-adapter emits `unknown` for the following cases on that pin.
+A failed native assistant `message_end` with `stop_reason: "error"` and an
+error diagnostic adds `data.cause = {kind, retryable}` to the `-33002` error.
+If native supplies a structured `message.error` object, ACP reads its integer
+`status` and then its `type` when the status has no mapping. The structured
+object is authoritative, including when the resulting cause is `unknown`.
+See [native #921](https://github.com/handochan/aelix-ai/issues/921).
 
-| Provider outcome | ACP `data.cause.kind` |
-|---|---|
-| HTTP 400, 401, 403, 429 or 5xx | `unknown` |
-| Provider error in an HTTP 200 stream | `unknown` |
-| Unreachable provider endpoint | `unknown` |
+With native pin `83714045`, ACP falls back to the anchored status prefixes
+`Error code: NNN` and `OpenAI Codex request failed (NNN)`, the type at
+`error.type` in a complete SDK error envelope, or native's `Connection error.`
+prefix with its optional ` — ` cause suffix.
+The status takes precedence over the type. For example, the pinned Anthropic
+SDK exposes the type envelope in an HTTP 200 error stream. An OpenAI-compatible
+stream error may carry only display prose and map to `unknown`.
+
+| HTTP status | Error type or native phrase | ACP `data.cause.kind` |
+|---|---|---|
+| 400, 404, 422 | `invalid_request_error` | `provider_bad_request` |
+| 401, 403 | `authentication_error`, `permission_error` | `provider_auth` |
+| 429 | `rate_limit_error` | `provider_rate_limit` |
+| 500–599, including 529 | `overloaded_error`, `api_error` | `provider_unavailable` |
+| No mapped status | Structured `connection_error` or native `Connection error.` | `provider_network` |
+| No mapped status | No recognized type or native phrase | `unknown` |
 
 The cause contains only the enum and a boolean. Both `retryable` fields are
 `false` because replaying a dispatched turn could repeat model calls or tool
-effects. The ACP error message retains its existing behavior. A protected
-Studio Host connection receives this error object for each case above.
+effects. Direct replies to standard clients keep the native diagnostic.
+ACP records a generic `Request failed.` entry for dispatched failures and
+redacts legacy failure entries during protected replay. `session/prompt`
+requires an ID. An ID-less prompt has no effect. This is the protected Studio
+Host error for an authentication failure.
 
 ```json
 {
@@ -114,7 +125,7 @@ Studio Host connection receives this error object for each case above.
   "data": {
     "kind": "turn_failed_after_dispatch",
     "retryable": false,
-    "cause": {"kind": "unknown", "retryable": false}
+    "cause": {"kind": "provider_auth", "retryable": false}
   }
 }
 ```

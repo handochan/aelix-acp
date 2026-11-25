@@ -602,20 +602,24 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((caught.exception.code, str(caught.exception)), (TURN_FAILED_AFTER_DISPATCH, "Aelix turn timed out"))
         self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False})
 
-    async def test_native_assistant_error_classification_ignores_provider_text(self):
+    async def test_native_assistant_error_classifies_without_copying_provider_details(self):
         self.session.socket_dir = self.tmp.name
         for private, stop_key, error_key in ((False, "stop_reason", "error_message"),
                                               (True, "stopReason", "errorMessage")):
             with self.subTest(private=private):
                 detail = 'Error code: 401 - {"type":"authentication_error","key":"fixture-secret"}'
                 self.session.private_host = private
-                self.native(failure={"role": "assistant", stop_key: "error", error_key: detail})
+                failure = {"role": "assistant", stop_key: "error", error_key: detail}
+                if private:
+                    failure["error"] = {"status": 429, "type": "authentication_error", "retryable": True,
+                                        "url": "https://example.invalid/fixture-secret"}
+                self.native(failure=failure)
                 with self.assertRaises(ProtocolError) as caught:
                     await self.session.prompt([{"type": "text", "text": "Respond"}])
                 self.assertEqual(caught.exception.code, TURN_FAILED_AFTER_DISPATCH)
                 self.assertEqual(str(caught.exception), "Native model request failed" if private else detail)
                 self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False,
-                                                         "cause": {"kind": "unknown", "retryable": False}})
+                    "cause": {"kind": "provider_rate_limit" if private else "provider_auth", "retryable": False}})
 
     async def test_bookkeeping_failure_keeps_the_not_retryable_marking(self):
         self.native(failure={"role": "assistant", "stop_reason": "error", "error_message": "provider rejected the request"})

@@ -30,6 +30,7 @@ from . import image_policy
 from .runtime import native_frames, native_history, transcript
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
+from .runtime.provider_errors import provider_failure_kind
 from .runtime.store import (LiveHistory, PROMPT_FAILURE_PREFIX, PROMPT_FAILURE_TEXT, begin_turn, confirm_adapter_input,
                             finish_turn, legacy_permission_mode, load_preferences, recorded_turn, save_session, write_store)
 from .runtime.commands import (ALIASES, BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND,
@@ -184,7 +185,7 @@ def profile_unavailable(name):
 @dataclass(frozen=True)
 class TurnFailure:
     message: str
-    assistant_error: bool = False
+    cause_kind: str | None = None
 
 
 class Session:
@@ -937,10 +938,13 @@ class Session:
         elif kind == "message_end":
             message = event.get("message") or {}
             error = message.get("errorMessage") or message.get("error_message")
-            if error:
-                detail = "Native model request failed" if self.private_host else error
-                stop_reason = message.get("stopReason") or message.get("stop_reason")
-                self.failure = TurnFailure(detail, assistant_error=message.get("role") == "assistant" and stop_reason == "error")
+            structured = message.get("error")
+            stop_reason = message.get("stopReason") or message.get("stop_reason")
+            assistant_error = message.get("role") == "assistant" and stop_reason == "error"
+            if error or (assistant_error and isinstance(structured, dict)):
+                detail = "Native model request failed" if self.private_host or not error else error
+                cause_kind = provider_failure_kind(structured, error) if assistant_error else None
+                self.failure = TurnFailure(detail, cause_kind)
                 self.clear_image_sample()
             await self.settle_message(event, message)
         elif kind == "aelix_subagent":
@@ -1813,8 +1817,8 @@ class Session:
             await self.context.finish_compaction("failed")
             await self.publish_context_usage()
             if self.failure and not self.cancelled:
-                if self.failure.assistant_error:
-                    raise NativeAssistantError(self.failure.message)
+                if self.failure.cause_kind is not None:
+                    raise NativeAssistantError(self.failure.message, self.failure.cause_kind)
                 raise ProtocolError(self.failure.message, -32603)
             stop_reason = "cancelled" if self.cancelled else "end_turn"
             await self.save()
