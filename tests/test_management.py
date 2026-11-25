@@ -224,7 +224,7 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
             readline = staticmethod(reader.readline)
             def close(self):
                 pass
-        with patch("aelix_acp.server.StdinReader", Input):
+        with patch("aelix_acp.server.StdinReader", return_value=Input()):
             await self.server.run()
         error = future.exception()
         self.assertEqual(error.code, -32603)

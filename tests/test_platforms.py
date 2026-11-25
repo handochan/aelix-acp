@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import json
 import os
+import socket
 from pathlib import Path
 import sys
 import tempfile
@@ -55,6 +56,68 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                 os.close(write)
             await asyncio.to_thread(reader.thread.join, 1)
             os.close(read)
+
+    @unittest.skipIf(os.name == "nt", "Requires a POSIX socket file descriptor")
+    async def test_half_closed_input_socket_signals_eof_with_unread_data(self):
+        loop = asyncio.get_running_loop()
+        blocked = asyncio.Event()
+        ended = asyncio.Event()
+        notifications = []
+
+        class Reader(StdinReader):
+            def _deliver(self, item):
+                if item == b"third\n" and self.queue.full():
+                    loop.call_soon_threadsafe(blocked.set)
+                return super()._deliver(item)
+
+        def end_input():
+            notifications.append(True)
+            ended.set()
+
+        source, peer = socket.socketpair()
+        with source, peer:
+            reader = Reader(fd=source.fileno(), on_eof=end_input)
+            try:
+                peer.sendall(b"first\nsecond\nthird\n")
+                await asyncio.wait_for(blocked.wait(), 3)
+                peer.sendall(b"still in kernel")
+                peer.shutdown(socket.SHUT_WR)
+                await asyncio.wait_for(ended.wait(), 3)
+                self.assertEqual(reader.queue.qsize(), 2)
+                async with asyncio.timeout(3):
+                    frames = [await reader.readline() for _ in range(5)]
+                self.assertEqual(frames, [b"first\n", b"second\n", b"third\n", b"still in kernel", b""])
+                self.assertEqual(notifications, [True])
+            finally:
+                reader.close()
+                await asyncio.to_thread(reader.thread.join, 1)
+
+    async def test_slow_progress_through_full_queue_does_not_postpone_eof(self):
+        ended = asyncio.Event()
+        with contextlib.ExitStack() as stack:
+            read, write = os.pipe()
+            stack.callback(os.close, read)
+            writer = stack.enter_context(os.fdopen(write, "wb", buffering=0))
+            reader = StdinReader(fd=read, on_eof=ended.set)
+            try:
+                writer.write(b"x\n" * 256)
+                writer.close()
+                # No individual put needs to wait through an entire probe interval.
+                consumed = 0
+                async with asyncio.timeout(1):
+                    while not ended.is_set():
+                        self.assertEqual(await reader.readline(), b"x\n")
+                        consumed += 1
+                        await asyncio.sleep(0.01)
+                # EOF was reported while frames were still pending delivery, and
+                # reporting it early must not drop any of them.
+                self.assertLess(consumed, 256)
+                async with asyncio.timeout(3):
+                    rest = [await reader.readline() for _ in range(256 - consumed + 1)]
+                self.assertEqual(rest, [b"x\n"] * (256 - consumed) + [b""])
+            finally:
+                reader.close()
+                await asyncio.to_thread(reader.thread.join, 1)
 
     async def test_oversized_line_fails_before_a_delimiter_arrives(self):
         read, write = os.pipe()

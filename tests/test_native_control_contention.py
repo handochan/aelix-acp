@@ -35,7 +35,7 @@ def adapter():
 
     native_event = Session.event
     native_rpc = Session.rpc
-    handle = Server.handle
+    admit_cancel = Server.admit_cancel
     request = Server.client_request
 
     async def observe_event(session, event):
@@ -54,10 +54,9 @@ def adapter():
             report("native_abort_ack")
         return answer
 
-    async def observe_handle(server, message):
-        if message.get("method") == "session/cancel":
-            report("stop_received")
-        return await handle(server, message)
+    def observe_cancel(server, request_id, params):
+        report("stop_received")
+        return admit_cancel(server, request_id, params)
 
     async def observe_request(server, method, *args, **kwargs):
         answer = await request(server, method, *args, **kwargs)
@@ -68,7 +67,7 @@ def adapter():
     with contextlib.ExitStack() as patches:
         patches.enter_context(patch.object(Session, "event", observe_event))
         patches.enter_context(patch.object(Session, "rpc", observe_rpc))
-        patches.enter_context(patch.object(Server, "handle", observe_handle))
+        patches.enter_context(patch.object(Server, "admit_cancel", observe_cancel))
         patches.enter_context(patch.object(Server, "client_request", observe_request))
         main()
 

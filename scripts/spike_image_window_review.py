@@ -18,7 +18,7 @@ from aelix_acp.runtime import session_relay
 from aelix_acp.wire.errors import ProtocolError
 
 from fixtures import image_window_extension as window
-from spike_image_window import MIB, Probe
+from spike_image_window import MIB, Probe, ProbeServer
 
 
 UNAVAILABLE = {"status": "unavailable"}
@@ -298,15 +298,11 @@ async def measure_large_file_session(probe):
 
 
 class StderrCapture:
-    def __init__(self, fd):
-        assert fd == 2
+    def __init__(self):
         self.data = bytearray()
 
     async def write(self, data):
         self.data.extend(data)
-
-    def close(self):
-        pass
 
 
 async def trace_controls(probe):
@@ -338,7 +334,7 @@ class ReviewProbe(Probe):
             self.reader_limit = 64 * MIB
         if case is trace_controls:
             self.native_env["OPENAI_LOG"] = "debug"
-            self.stderr = StderrCapture(2)
+            self.stderr = StderrCapture()
 
     async def exercise(self):
         self.results.update(await self.case(self))
@@ -355,7 +351,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix="acp43-review-", dir="/tmp" if os.name != "nt" else None) as directory:
             probe = ReviewProbe(Path(directory).resolve(), args.aelix.resolve(), case)
             if case is trace_controls:
-                with patch.object(session, "StdoutWriter", new=lambda fd: probe.stderr):
+                with patch.object(ProbeServer, "forward_stderr", new=lambda _server, raw: probe.stderr.write(raw)):
                     result = asyncio.run(probe.run())
             else:
                 result = asyncio.run(probe.run())

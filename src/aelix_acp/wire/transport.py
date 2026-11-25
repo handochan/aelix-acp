@@ -9,16 +9,67 @@ import threading
 import os
 import queue
 
+from ..stdio import write_all
 from .errors import ProtocolError
 
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 
 
+class ErrorReplies:
+    """Lossless ID-bearing rejections, bounded across queue and active write."""
+    def __init__(self, byte_limit=512 * 1024, item_limit=4096):
+        self.byte_limit = byte_limit
+        self.item_limit = item_limit
+        self.bytes = 0
+        self.count = 0
+        self.queue = asyncio.Queue(maxsize=item_limit)
+        self.space = asyncio.Event()
+        self.eof = False
+
+    def end_input(self):
+        self.eof = True
+        self.space.set()
+
+    async def put(self, raw):
+        # One frame larger than the byte budget can occupy the lane alone.
+        # The input frame limit bounds its ID. Only the stdin producer waits.
+        while self.count and (self.count >= self.item_limit or self.bytes + len(raw) > self.byte_limit):
+            if self.eof:
+                raise EOFError
+            self.space.clear()
+            await self.space.wait()
+        self.count += 1
+        self.bytes += len(raw)
+        self.queue.put_nowait(raw)
+
+    async def run(self, send):
+        while True:
+            raw = await self.queue.get()
+            try:
+                await send(raw)
+            finally:
+                self.count -= 1
+                self.bytes -= len(raw)
+                del raw
+                self.space.set()
+
+
+class InvalidFrame(ProtocolError):
+    """Preserve a usable JSON-RPC ID when rejecting a decoded frame."""
+    def __init__(self, message, code, envelope=None):
+        super().__init__(message, code)
+        key = envelope.get("id") if isinstance(envelope, dict) and "method" in envelope else None
+        self.request_id = key if (type(key) is int or (
+            isinstance(key, str) and key and not any(0xD800 <= ord(c) <= 0xDFFF for c in key)
+        )) else None
+
+
 class StdoutWriter:
     """Bounded daemon writes without blocking the loop or Python buffer locks."""
-    def __init__(self, fd=None):
+    def __init__(self, fd=None, *, on_failure=None):
         self.loop = asyncio.get_running_loop()
         self.fd = sys.stdout.fileno() if fd is None else fd
+        self.on_failure = on_failure
         if sys.platform == "win32":
             import msvcrt
             msvcrt.setmode(self.fd, os.O_BINARY)
@@ -26,6 +77,7 @@ class StdoutWriter:
         self.credit = asyncio.Semaphore(2)
         self.pending = set()
         self.stopped = threading.Event()
+        self.finished = asyncio.Event()
         threading.Thread(target=self.pump, name="acp-stdout", daemon=True).start()
 
     async def write(self, raw, *, before_queue=None):
@@ -41,7 +93,9 @@ class StdoutWriter:
         self.queue.put_nowait((raw, future, before_queue is not None))
         await future
 
-    def settle(self, future, error):
+    def settle(self, future, error, first_failure):
+        if first_failure and self.on_failure is not None:
+            self.on_failure(error)
         self.pending.discard(future)
         self.credit.release()
         if not future.done():
@@ -51,37 +105,55 @@ class StdoutWriter:
                 future.set_exception(error)
 
     def pump(self):
-        while not self.stopped.is_set():
-            item = self.queue.get()
-            if item is None:
-                return
-            raw, future, withdrawable = item
-            error = None
+        failed = None
+        try:
+            while True:
+                item = self.queue.get()
+                if item is None or self.stopped.is_set():
+                    return
+                raw, future, withdrawable = item
+                error = None
+                first_failure = False
+                if failed is None:
+                    try:
+                        # A reverse pull cancelled in the queue can be dropped
+                        # before any bytes reach the descriptor.
+                        if not (withdrawable and future.cancelled()):
+                            write_all(self.fd, raw)
+                    except OSError as failure:
+                        error = failure
+                        first_failure = True
+                        # An incomplete line cannot be followed by another frame.
+                        failed = type(failure), failure.args
+                else:
+                    error_type, args = failed
+                    error = error_type(*args)
+                self.loop.call_soon_threadsafe(self.settle, future, error, first_failure)
+        except RuntimeError:  # The event loop may already have closed.
+            return
+        finally:
             try:
-                # A reverse pull cancelled while waiting in the writer queue
-                # can still be dropped before any bytes reach the descriptor.
-                view = memoryview(b"" if withdrawable and future.cancelled() else raw)
-                while view:
-                    written = os.write(self.fd, view)
-                    if not written:
-                        raise BrokenPipeError("Client stdout closed")
-                    view = view[written:]
-            except OSError as failure:
-                error = failure
-            try:
-                self.loop.call_soon_threadsafe(self.settle, future, error)
+                self.loop.call_soon_threadsafe(self.finished.set)
             except RuntimeError:
-                return
+                pass
 
-    def close(self):
+    def stop(self):
         self.stopped.set()
-        for future in self.pending:
-            if not future.done():
-                future.cancel()
         try:
             self.queue.put_nowait(None)
         except queue.Full:
             pass
+
+    async def drain(self, timeout):
+        """Stop accepting queued frames and give the active write time to finish."""
+        self.stop()
+        await asyncio.wait_for(self.finished.wait(), timeout)
+
+    def close(self):
+        self.stop()
+        for future in self.pending:
+            if not future.done():
+                future.cancel()
 
 
 def encode_frame(message: dict) -> bytes:
@@ -90,7 +162,8 @@ def encode_frame(message: dict) -> bytes:
 
 def decode_frame(raw: bytes) -> dict:
     if len(raw) > MAX_FRAME_BYTES:
-        raise ProtocolError("JSON-RPC frame exceeds the byte limit", -32600)
+        raise InvalidFrame("JSON-RPC frame exceeds the byte limit", -32600)
+    value = None
     try:
         value = json.loads(raw, parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()))
         pending = [value]
@@ -110,19 +183,19 @@ def decode_frame(raw: bytes) -> dict:
             elif isinstance(entry, list):
                 pending.extend(entry)
     except (UnicodeDecodeError, ValueError, RecursionError):
-        raise ProtocolError("Invalid JSON", -32700) from None
+        raise InvalidFrame("Invalid JSON", -32700, value) from None
     if not isinstance(value, dict) or value.get("jsonrpc") != "2.0":
-        raise ProtocolError("Invalid JSON-RPC envelope", -32600)
+        raise InvalidFrame("Invalid JSON-RPC envelope", -32600, value)
     request_id = value.get("id")
     if request_id is not None and (type(request_id) not in (int, str) or (isinstance(request_id, str) and not request_id)):
-        raise ProtocolError("Invalid JSON-RPC id", -32600)
+        raise InvalidFrame("Invalid JSON-RPC id", -32600, value)
     if "method" in value:
         if "id" in value and request_id is None:
-            raise ProtocolError("ACP request ids cannot be null", -32600)
+            raise InvalidFrame("ACP request ids cannot be null", -32600, value)
         if not isinstance(value["method"], str) or not value["method"]:
-            raise ProtocolError("Invalid JSON-RPC method", -32600)
+            raise InvalidFrame("Invalid JSON-RPC method", -32600, value)
         if not isinstance(value.get("params", {}), dict):
-            raise ProtocolError("ACP params must be an object", -32602)
+            raise InvalidFrame("ACP params must be an object", -32602, value)
     elif "id" not in value or ("result" in value) == ("error" in value):
-        raise ProtocolError("Invalid JSON-RPC response", -32600)
+        raise InvalidFrame("Invalid JSON-RPC response", -32600, value)
     return value

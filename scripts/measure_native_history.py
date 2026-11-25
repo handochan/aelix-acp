@@ -47,11 +47,13 @@ async def adapter(aelix, root, target_bytes, contended):
     in_load = False
 
     class InstrumentedServer(server_module.Server):
+        def admit_cancel(self, request_id, params):
+            emit("stop_input")
+            return super().admit_cancel(request_id, params)
+
         async def handle(self, message):
             nonlocal in_load
             method = message.get("method")
-            if method == "session/cancel":
-                emit("stop_input")
             if method == "session/load":
                 in_load = True
                 try:

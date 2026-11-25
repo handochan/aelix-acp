@@ -9,10 +9,10 @@ from itertools import islice
 import os
 from pathlib import Path
 import sqlite3
-import sys
 from threading import Event
 from time import monotonic
 
+from ..stdio import write_diagnostic
 from ..wire.errors import ProtocolError
 from .transcript import META as TRANSCRIPT_META
 
@@ -193,7 +193,7 @@ class LiveHistory:
 
     def fail(self, code):
         if self.failure != code:
-            print(code, file=sys.stderr)
+            write_diagnostic(code)
         self.failure = code
 
     async def drain(self):

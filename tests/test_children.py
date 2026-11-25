@@ -751,7 +751,7 @@ class VoidQuestionTests(Base):
             def close(self):
                 pass
         before = len(self.events)
-        with patch("aelix_acp.server.StdinReader", Input):
+        with patch("aelix_acp.server.StdinReader", return_value=Input()):
             await asyncio.wait_for(self.server.run(), 10)
         self.assertEqual((self.server.closing, self.session.questions, "session" in self.server.sessions),
                          (True, {}, False))
@@ -936,6 +936,37 @@ class ClientRequestTests(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         self.assertEqual(self.withdrawn(), [request_id])
+
+    async def test_child_approval_keeps_its_slot_until_withdrawal_is_sent(self):
+        self.server.withdrawal_slots = asyncio.BoundedSemaphore(1)
+        started, release = asyncio.Event(), asyncio.Event()
+        send = self.server.send
+
+        async def blocked_send(event):
+            if event.get("method") == "$/cancel_request":
+                started.set()
+                await release.wait()
+            await send(event)
+
+        self.server.send = blocked_send
+        task, request_id = await self.request(withdraw=True)
+        try:
+            for state in ("displayed", "withdrawing"):
+                with self.subTest(state=state), self.assertRaisesRegex(ProtocolError, "Too many outstanding"):
+                    await self.server.client_request("session/request_permission", {}, withdraw=True, timeout=0.1)
+                if state == "displayed":
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    await asyncio.wait_for(started.wait(), 5)
+        finally:
+            release.set()
+            await asyncio.gather(task, *self.server.withdrawals, return_exceptions=True)
+        self.assertEqual(self.withdrawn(), [request_id])
+
+        next_task, next_id = await self.request(withdraw=True)
+        self.server.pending[next_id].set_result({})
+        self.assertEqual(await next_task, {})
+        self.assertFalse(self.server.withdrawal_slots.locked())
 
     async def test_a_question_the_client_answered_is_not_taken_back(self):
         """Guard (passes on 91c4ed1): kills S3 on Python 3.12 and later.
@@ -1330,16 +1361,22 @@ class CadenceTests(Base):
         self.assertEqual(await asyncio.wait_for(turn, 10), {"stopReason": "cancelled"})
         self.assertEqual((sent.count("abort"), sent.count("commands/cancel")), (1, 1), sent)
 
-    async def test_a_poll_that_aborts_while_commands_cancel_waits_is_the_cancels_one_abort(self):
-        """Fix round 1, Codex C-M2: the poll's abort and cancel()'s own were 0.3 ms apart (the real rpc and reader)."""
+    async def test_poll_abort_during_native_stdin_backpressure_prevents_a_duplicate(self):
         self.session.controls.capabilities = {"methods": ["commands/cancel"]}
         self.server.sessions[self.session.id] = self.session
-        pipe, stdout = Pipe(), asyncio.StreamReader()
+        release_drain = asyncio.Event()
+        cancel = None
+
+        class BackpressuredPipe(Pipe):
+            async def drain(self):
+                if asyncio.current_task() is cancel:
+                    await release_drain.wait()
+
+        pipe, stdout = BackpressuredPipe(), asyncio.StreamReader()
         self.session.proc = SimpleNamespace(stdin=pipe, stdout=stdout, returncode=None)
         self.session._close_task = asyncio.get_running_loop().create_future()  # The test owns the teardown.
         reader = asyncio.create_task(self.session.read_rpc())
         turn = asyncio.create_task(self.session._prompt([{"type": "text", "text": "hold"}]))
-        cancel = None
         try:
             prompt = await pipe.read()
             self.assertEqual(prompt["type"], "prompt")
@@ -1349,10 +1386,12 @@ class CadenceTests(Base):
             cancel = asyncio.create_task(self.server.dispatch("session/cancel", {"sessionId": "session"}))
             control = await pipe.read()
             self.assertEqual(control.get("method"), "commands/cancel")
-            # The poll already in flight answers while commands/cancel waits: the poll aborts.
+            # The poll can dispatch its abort before the cancel's stdin drain finishes.
             stdout.feed_data(answer_line(poll, {"isStreaming": True}))
             first = await pipe.read()
             self.assertEqual(first["type"], "abort")
+            self.assertFalse(cancel.done())
+            release_drain.set()
             stdout.feed_data(answer_line(control, {"cancelled": False}) + answer_line(first, {}))
             following = await pipe.read()
             self.assertEqual(following["type"], "get_state", following)  # not a second abort
@@ -1367,6 +1406,30 @@ class CadenceTests(Base):
             for task in (reader, turn, *([cancel] if cancel else [])):
                 task.cancel()
             await asyncio.gather(reader, turn, *([cancel] if cancel else []), return_exceptions=True)
+
+    async def test_old_cancel_cannot_abort_a_new_turn_after_native_stdin_drain(self):
+        self.session.controls.capabilities = {"methods": ["commands/cancel"]}
+        draining, release = asyncio.Event(), asyncio.Event()
+        sent = []
+
+        async def rpc(command, **params):
+            method = params.get("method", command)
+            sent.append(method)
+            if method == "commands/cancel":
+                draining.set()
+                await release.wait()
+            return {}
+
+        self.session.rpc = rpc
+        stop = asyncio.create_task(self.session.cancel())
+        try:
+            await asyncio.wait_for(draining.wait(), 2)
+            self.session.reset_cancellation()
+        finally:
+            release.set()
+            await asyncio.wait_for(stop, 2)
+        self.assertEqual(sent, ["commands/cancel"])
+        self.assertFalse(self.session.cancelled)
 
     async def test_a_second_client_cancel_is_obeyed_at_once(self):
         """Guard: each client cancel aborts at once, as on a78db59."""

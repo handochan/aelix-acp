@@ -22,7 +22,8 @@ import uuid
 from .wire.errors import (ProtocolError, BackendError, SOCKET_PATH_TOO_LONG, after_dispatch, delivery_unknown, fork_head_changed,
                           is_native_session_locked, require_object, require_string, session_changing, session_locked)
 from .wire.process import terminate_owned
-from .wire.transport import StdoutWriter, encode_frame
+from .stdio import write_diagnostic
+from .wire.transport import encode_frame
 from . import image_policy
 from .runtime import native_frames, native_history, transcript
 from .runtime.controls import SessionControls, MODE_IDS
@@ -190,6 +191,7 @@ class Session:
         self.failure = None
         self.rpc_closed = False
         self.cancelled = False
+        self.cancel_generation = 0
         self.turn_active = False
         self.input_relay = None
         self.private_host = getattr(server, "host_bytes", None) is not None
@@ -718,12 +720,13 @@ class Session:
                 try:
                     await self.save()
                 except ProtocolError as error:
-                    print(error.data["kind"], file=sys.stderr)
+                    write_diagnostic(error.data["kind"])
 
-    async def rpc(self, command, *, _timeout=45, _image_write=None, _project_history=False, **kwargs):
+    async def rpc(self, command, *, _timeout=45, _image_write=None, _project_history=False, _await_response=True, **kwargs):
         request_id = uuid.uuid4().hex
-        future = asyncio.get_running_loop().create_future()
-        self.pending[request_id] = future
+        future = asyncio.get_running_loop().create_future() if _await_response else None
+        if future is not None:
+            self.pending[request_id] = future
         if _project_history:
             self.history_requests.add(request_id)
         if (task := asyncio.current_task()) in self.interventions:
@@ -751,6 +754,8 @@ class Session:
             if self.turn_active and command not in ("steer", "follow_up") and command not in READ_ONLY_COMMANDS and not (
                     command == "aelix_control" and kwargs.get("method") in READ_ONLY_CONTROLS | CONCURRENT_CONTROLS):
                 self.dispatched = True
+            if future is None:
+                return
             try:
                 return await asyncio.wait_for(future, _timeout)
             except TimeoutError:
@@ -768,17 +773,12 @@ class Session:
 
     async def read_stderr(self):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        writer = None if self.private_host else StdoutWriter(sys.stderr.fileno())
-        try:
-            while chunk := await self.proc.stderr.read(4096):
-                # Bounded copy for native refusals reported only on stderr.
-                self.stderr_tail = (self.stderr_tail + chunk)[-STDERR_TAIL:]
-                if writer is not None:
-                    text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
-                    await writer.write(text.encode("utf-8"))
-        finally:
-            if writer is not None:
-                writer.close()
+        while chunk := await self.proc.stderr.read(4096):
+            # Bounded copy for native refusals reported only on stderr.
+            self.stderr_tail = (self.stderr_tail + chunk)[-STDERR_TAIL:]
+            if not self.private_host:
+                text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
+                await self.server.forward_stderr(text.encode("utf-8"))
 
     async def read_native_history(self):
         try:
@@ -822,7 +822,7 @@ class Session:
                     if not isinstance(event, dict):
                         raise ValueError("RPC frame must be an object")
                 except ValueError:
-                    print("[aelix-acp] Ignored non-JSON child stdout", file=sys.stderr)
+                    write_diagnostic("[aelix-acp] Ignored non-JSON child stdout")
                     continue
                 future = self.pending.get(event.get("id"))
                 if event.get("type") == "response" and future is not None:
@@ -913,7 +913,7 @@ class Session:
                                 "text": f"\n[AionUi 분석 미리보기]({preview})\n"}})
                         except (OSError, ValueError) as exc:
                             detail = type(exc).__name__ if self.private_host else str(exc)
-                            print(f"[aelix-acp] Standalone preview unavailable: {detail}", file=sys.stderr)
+                            write_diagnostic(f"[aelix-acp] Standalone preview unavailable: {detail}")
         elif kind == "message_end":
             message = event.get("message") or {}
             error = message.get("errorMessage") or message.get("error_message")
@@ -1247,19 +1247,26 @@ class Session:
                         allowed = outcome.get("outcome") == "selected" and outcome.get("optionId") == "allow-once"
                     finally:
                         self.permissions.discard(permission_task)
-                if allowed and not self.cancelled:
-                    await self.update({"sessionUpdate": "tool_call_update",
-                                       "toolCallId": request["toolCallId"], "status": "in_progress"})
         except (Exception, asyncio.CancelledError):
             allowed = False
         finally:
-            self.permission_connections.discard(owner)
-            with contextlib.suppress(ConnectionError):
-                writer.write((json.dumps({"allow": allowed and not self.cancelled}) + "\n").encode())
+            try:
+                granted = allowed and not self.cancelled
+                writer.write((json.dumps({"allow": granted}) + "\n").encode())
+                # This socket carries only this tiny reply. Send it before
+                # publishing progress, which can wait on the ACP stdout pipe.
                 await writer.drain()
-            writer.close()
-            with contextlib.suppress(ConnectionError):
-                await writer.wait_closed()
+                writer.close()
+                if granted:
+                    await self.update({"sessionUpdate": "tool_call_update",
+                                       "toolCallId": request["toolCallId"], "status": "in_progress"})
+            except (ConnectionError, OSError):
+                pass
+            finally:
+                self.permission_connections.discard(owner)
+                writer.close()
+                with contextlib.suppress(ConnectionError):
+                    await writer.wait_closed()
 
     async def commands(self):
         data = await self.rpc("get_commands")
@@ -1401,10 +1408,13 @@ class Session:
                 await asyncio.gather(request, return_exceptions=True)
         return None if void.done() else request.result()
 
-    async def restart(self, *, extensions=None, trust_project=None, agents_enabled=None, preserve_history=False):
+    async def restart(self, *, extensions=None, trust_project=None, agents_enabled=None, preserve_history=False,
+                      preserve_cancellation=False):
         if self.id in self.server.starting_ids:
             raise ProtocolError("Session is already starting", -32000)
         self.server.starting_ids.add(self.id)
+        if preserve_cancellation:
+            self.server.pending_stop_sessions[self.id] = self
         # Children actions are refused until this returns; close() below ends those in flight.
         self.changing += 1
         self.invalidate_image_acceptance()
@@ -1436,7 +1446,8 @@ class Session:
             self._close_task = None
             self.failure = None
             self.rpc_closed = False
-            self.cancelled = False
+            if not preserve_cancellation:
+                self.reset_cancellation()
             if extensions is not None:
                 self.extra_extensions = extensions
             if trust_project is not None:
@@ -1541,8 +1552,7 @@ class Session:
                 await self.restart(preserve_history=True)
                 recovered = True
             except Exception as recovery_error:
-                print(f"[aelix-acp] Extension selection recovery failed: {type(recovery_error).__name__}",
-                      file=sys.stderr)
+                write_diagnostic(f"[aelix-acp] Extension selection recovery failed: {type(recovery_error).__name__}")
             finally:
                 self._verifying_extension_recovery = False
             details = {
@@ -1557,11 +1567,11 @@ class Session:
                 -32003 if cancelled else -32004, details,
             ) from failure
 
-    async def recover_after_compaction(self):
+    async def recover_after_compaction(self, *, for_prompt=False):
         if not self.compaction_recovery_needed:
             return
         try:
-            await self.restart(preserve_history=True)
+            await self.restart(preserve_history=True, preserve_cancellation=for_prompt)
         finally:
             self.server.sessions[self.id] = self
         self.compaction_recovery_needed = False
@@ -1575,10 +1585,11 @@ class Session:
         prior = recorded_turn(self.server.db, self.id, key, fingerprint)
         if prior is not None:
             return prior
+        # Establish the turn before its first suspension. A later wire Stop
+        # addresses this generation throughout recovery and receipt admission.
+        self.reset_cancellation()
         if self.compaction_recovery_needed:
-            # Claim the key only after recovery holds the lease.
-            await self.recover_after_compaction()
-        self.cancelled = False
+            await self.recover_after_compaction(for_prompt=True)
         prior = await write_store(self.server.args.state_dir, begin_turn, self.id, key, fingerprint,
                                   diagnostic="turn_receipt_write_failed")
         if prior is not None:
@@ -1610,7 +1621,7 @@ class Session:
                 await write_store(self.server.args.state_dir, finish_turn, self.id, key, result, error,
                                   diagnostic="turn_receipt_write_failed")
             except Exception:
-                print("turn_receipt_write_failed", file=sys.stderr)
+                write_diagnostic("turn_receipt_write_failed")
 
     async def record_fork_head(self, anchor):
         def capture(filename):
@@ -1630,7 +1641,7 @@ class Session:
         except (OSError, ProtocolError) as error:
             self.fork_head = None
             if isinstance(error, ProtocolError) and (error.data or {}).get("kind") == "session_store_write_failed":
-                print("session_store_write_failed", file=sys.stderr)
+                write_diagnostic("session_store_write_failed")
 
     async def _prompt(self, blocks):
         if self.done and not self.done.done():
@@ -1733,7 +1744,7 @@ class Session:
         if self.done and not self.done.done():
             raise ProtocolError("A prompt is already running in this session")
         # A cancel of an earlier turn must not deny this turn's tools (the bridge reads it).
-        self.cancelled = False
+        self.reset_cancellation()
         answer, sent = {}, []
 
         async def send():
@@ -1806,6 +1817,10 @@ class Session:
                 await self.abort()
             await asyncio.sleep(0.05)
 
+    def reset_cancellation(self):
+        self.cancelled = False
+        self.cancel_generation += 1
+
     def abort_due(self):
         return self.last_abort is None or time.monotonic() - self.last_abort >= REABORT_SECONDS
 
@@ -1815,15 +1830,15 @@ class Session:
         with contextlib.suppress(ProtocolError, TimeoutError):
             await self.rpc("abort", _timeout=5)
 
-    async def cancel(self, *, again=False):
-        """Cancel the turn. `again`: the turn's own re-cancel, sent only once an abort is due."""
+    def begin_cancel(self):
+        """Apply Stop to the admitted turn and its dialogs before any I/O."""
         # Every open child question ends, during a manual /compact too (fix round 1, P-LOW-3).
         # An extension's dialog opened during /compact stays open: the compaction goes on.
         self.void_questions(lambda key: True)
         if self.context.manual_compaction:
             # Classic RPC abort only interrupts native turns and retries.
             # Keep waiting for the actual manual compaction outcome.
-            return
+            return False
         self.cancelled = True
         self.invalidate_image_acceptance()
         self.image_epoch = None
@@ -1832,15 +1847,26 @@ class Session:
             self.management_task.cancel()
         for task in [*self.permission_connections, *self.permissions, *self.ui_tasks]:
             task.cancel()
+        return True
+
+    async def cancel(self, *, again=False):
+        if self.begin_cancel():
+            await self.cancel_native(again=again)
+
+    async def cancel_native(self, *, again=False):
+        generation = self.cancel_generation
         if again and not self.abort_due():
             return
         aborts = self.aborts
         if "commands/cancel" in self.controls.capabilities.get("methods", []) and self.proc and self.proc.returncode is None:
             with contextlib.suppress(ProtocolError, TimeoutError):
-                await self.rpc("aelix_control", method="commands/cancel", params={}, _timeout=5)
-        # The turn's poll may have aborted while commands/cancel waited: that was
-        # this cancel's one abort (fix round 1, Codex C-M2).
-        if self.proc and self.proc.returncode is None and self.aborts == aborts:
+                # Native output may be held behind an ACP notification. Send
+                # both controls in order without requiring the first reply.
+                await self.rpc("aelix_control", method="commands/cancel", params={}, _await_response=False)
+        # The turn's poll may have aborted while the native stdin buffer drained.
+        # That was this cancel's one abort.
+        if (self.proc and self.proc.returncode is None and self.aborts == aborts
+                and self.cancel_generation == generation):
             await self.abort()
 
     async def close(self):
@@ -1907,7 +1933,7 @@ class Session:
         try:
             await self.end_children()
         except Exception as failure:  # A card left open must not keep the worker's resources.
-            print(f"[aelix-acp] Could not close the children's cards: {type(failure).__name__}", file=sys.stderr)
+            write_diagnostic(f"[aelix-acp] Could not close the children's cards: {type(failure).__name__}")
         await self.live_history.flush()
         if self.worker_job:
             self.worker_job.close()
