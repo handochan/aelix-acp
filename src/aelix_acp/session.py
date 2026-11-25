@@ -32,7 +32,8 @@ from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
 from .runtime.provider_errors import provider_failure_kind
 from .runtime.store import (LiveHistory, PROMPT_FAILURE_PREFIX, PROMPT_FAILURE_TEXT, begin_turn, confirm_adapter_input,
-                            finish_turn, legacy_permission_mode, load_preferences, recorded_turn, save_session, write_store)
+                            finish_turn, legacy_permission_mode, load_preferences, recorded_turn, save_session,
+                            with_assistant_origin, write_store)
 from .runtime.commands import (ALIASES, BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND,
                                compact_instructions, execute as execute_slash)
 from .runtime.extensions import extension_reference
@@ -562,7 +563,7 @@ class Session:
         path = Path(self.socket_dir) / "fork-history.jsonl"
         with path.open(encoding="utf-8") as stream:
             for line in stream:
-                yield json.loads(line)
+                yield with_assistant_origin(json.loads(line), "model")
         path.unlink()
 
     async def listen(self, socket_path, *, tcp):
@@ -1169,7 +1170,7 @@ class Session:
                         **coordinates, "previousChildren": sorted(previous_children)}
             recorded_meta[transcript.TOOL_ORIGIN_META] = origin
         recorded = {**update, "_meta": {**update.get("_meta", {}), **recorded_meta}} if recorded_meta else None
-        await self.record_update(update, recorded=recorded)
+        await self.record_update(update, recorded=recorded, origin="model")
 
     async def settle_message(self, event, message):
         role = message.get("role")
@@ -1206,8 +1207,9 @@ class Session:
             update = self.adapter_message(update)
         await self.record_update(update)
 
-    async def record_update(self, update, *, recorded=None):
-        self.live_history.append(update if recorded is None else recorded)
+    async def record_update(self, update, *, recorded=None, origin="adapter"):
+        saved = update if recorded is None else recorded
+        self.live_history.append(with_assistant_origin(saved, origin))
         await self.notify("session/update", {"sessionId": self.id, "update": update})
 
     async def notify(self, method, params):
@@ -1635,7 +1637,9 @@ class Session:
             history_text = PROMPT_FAILURE_TEXT if self.dispatched else PROMPT_FAILURE_PREFIX + str(error)
             update = {"sessionUpdate": "agent_message_chunk",
                       "content": {"type": "text", "text": history_text}}
-            self.live_history.append(self.adapter_message(update) if transcript.supported(self.controls.capabilities) else update)
+            if transcript.supported(self.controls.capabilities):
+                update = self.adapter_message(update)
+            self.live_history.append(with_assistant_origin(update, "prompt_failure"))
             if error is failure:
                 raise
             raise error from None

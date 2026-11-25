@@ -112,7 +112,10 @@ The cause contains only the enum and a boolean. Both `retryable` fields are
 `false` because replaying a dispatched turn could repeat model calls or tool
 effects. Direct replies to standard clients keep the native diagnostic.
 ACP records a generic `Request failed.` entry for dispatched failures and
-redacts legacy failure entries during protected replay. `session/prompt`
+records whether new assistant chunks came from model output, adapter output,
+or a prompt failure. Protected replay uses that origin for new entries and
+uses the old `Request failed:` prefix only for ambiguous legacy entries.
+The origin marker is private to ACP storage. `session/prompt`
 requires an ID. An ID-less prompt has no effect. This is the protected Studio
 Host error for a structured authentication failure.
 

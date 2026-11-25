@@ -172,12 +172,15 @@ class HistoryReplayTests(unittest.IsolatedAsyncioTestCase):
             session = SimpleNamespace(id="fixture", read_native_history=AsyncMock(return_value=[
                 {"role": "user", "content": "before"},
                 {"role": "toolResult", "tool_call_id": "call", "content": [{"type": "text", "text": "x" * 256}]},
-                {"role": "assistant", "content": "after"},
+                {"role": "assistant", "content": "Request failed: ordinary recovered text"},
             ]))
             with contextlib.closing(server.db), patch.object(native_history, "TOOL_CONTENT_BYTES", 128):
                 updates = await server.native_history(session)
-                self.assertEqual(list(history(server.db, session.id)), updates)
-                self.assertEqual([updates[0]["content"]["text"], updates[2]["content"]["text"]], ["before", "after"])
+                recorded = list(history(server.db, session.id))
+                self.assertEqual(recorded[2]["_meta"], {store.ASSISTANT_ORIGIN_META: "model"})
+                self.assertEqual([store.display_recorded_update(update, protected=True) for update in recorded], updates)
+                self.assertEqual([updates[0]["content"]["text"], updates[2]["content"]["text"]],
+                                 ["before", "Request failed: ordinary recovered text"])
                 self.assertEqual(updates[1]["toolCallId"], "call")
                 self.assertEqual(updates[1]["content"][0]["content"]["text"], native_history.TOOL_RESULT_OMITTED)
 

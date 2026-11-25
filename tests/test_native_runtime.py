@@ -14,7 +14,7 @@ import unittest
 from support import AcpClient, process_alive
 from aelix_acp.runtime import host_bytes, session_relay
 from aelix_acp.runtime.leases import acquire as acquire_lease
-from aelix_acp.runtime.store import append_event
+from aelix_acp.runtime.store import ASSISTANT_ORIGIN_META, append_event
 from aelix_acp.wire.errors import ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH
 
 EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
@@ -102,6 +102,7 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.http_error = None
         self.anthropic_error = None
         self.stream_error_message = None
+        self.model_reply = "NATIVE_OK"
         self.model_gate = None
         self.prompt_tokens = 23
         self.listener = await asyncio.start_server(self.model, "127.0.0.1", 0)
@@ -165,7 +166,7 @@ def setup(api):
                         "path": str(self.write_path), "content": "approved write"})}}]}
                 stop = "tool_calls"
             else:
-                delta, stop = {"role": "assistant", "content": "NATIVE_OK"}, "stop"
+                delta, stop = {"role": "assistant", "content": self.model_reply}, "stop"
             def event(delta, finish):
                 return "data: " + json.dumps({"id": "fixture", "object": "chat.completion.chunk", "created": 0,
                     "model": request.get("model", "one"), "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
@@ -1595,6 +1596,27 @@ def setup(api):
         await self.client.close()
         self.assertEqual(self.client.stderr, b"")
 
+    async def test_protected_legacy_replay_preserves_recorded_model_failure_prefix(self):
+        self.model_reply = "Request failed: ordinary assistant prose"
+        self.assertEqual(await self.prompt("Respond"), {"stopReason": "end_turn"})
+        self.assertEqual(self.client.text(), self.model_reply)
+        await self.client.close()
+
+        self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities=PROTECTED_HOST)
+        loaded = await self.client.request("session/load", {
+            "sessionId": self.session, "cwd": str(self.root), "mcpServers": [],
+        })
+        self.assertNotIn("aelix/transcriptCapability", loaded.get("_meta", {}))
+        replayed = [frame["params"]["update"] for frame in self.client.updates
+                    if frame.get("method") == "session/update"
+                    and frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"]
+        self.assertEqual(replayed, [{"sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": self.model_reply}}])
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            row, = db.execute("SELECT value FROM events WHERE session_id=? ORDER BY sequence DESC LIMIT 1",
+                              (self.session,)).fetchone()
+        self.assertEqual(json.loads(row)["_meta"][ASSISTANT_ORIGIN_META], "model")
+
     async def test_private_host_keeps_unverified_http_and_network_causes_unknown(self):
         await self.open_protected_provider_session()
         for rejection in (
@@ -1675,8 +1697,9 @@ def setup(api):
 
         with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
             rows = db.execute("SELECT value FROM events WHERE session_id=? ORDER BY sequence", (self.session,))
-            entries = [json.loads(value)["content"]["text"] for value, in rows]
-            self.assertEqual(entries, ["Respond", "Request failed."])
+            entries = [json.loads(value) for value, in rows]
+            self.assertEqual([entry["content"]["text"] for entry in entries], ["Respond", "Request failed."])
+            self.assertEqual(entries[-1]["_meta"][ASSISTANT_ORIGIN_META], "prompt_failure")
             self.assertEqual(db.execute("SELECT state,result FROM turns WHERE session_id=? AND request_key=?",
                                         (self.session, request_key)).fetchone(), ("interrupted", None))
             append_event(db, self.session, {"sessionUpdate": "agent_message_chunk", "content": {

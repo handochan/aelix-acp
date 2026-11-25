@@ -19,6 +19,7 @@ from .transcript import META as TRANSCRIPT_META
 WRITE_TIMEOUT = 10
 PROMPT_FAILURE_PREFIX = "Request failed: "
 PROMPT_FAILURE_TEXT = "Request failed."
+ASSISTANT_ORIGIN_META = "aelix/assistantOrigin"  # SQLite only
 
 
 def open_store(directory: str) -> sqlite3.Connection:
@@ -318,17 +319,35 @@ def history(db: sqlite3.Connection, session_id: str):
         yield json.loads(value)
 
 
-def redact_legacy_prompt_failure(update: dict) -> dict:
-    """Strip old failure diagnostics from recorded ACP display events."""
-    if update.get("sessionUpdate") == "agent_message_chunk":
-        content = update.get("content")
-        if isinstance(content, dict) and content.get("type") == "text":
-            text = content.get("text")
-            if isinstance(text, str) and text.startswith(PROMPT_FAILURE_PREFIX):
-                meta = update.get("_meta")
-                coordinates = meta.get(TRANSCRIPT_META) if isinstance(meta, dict) else None
-                if not isinstance(coordinates, dict) or coordinates.get("source") in (None, "adapter"):
-                    return {**update, "content": {"type": "text", "text": PROMPT_FAILURE_TEXT}}
+def with_assistant_origin(update: dict, origin: str) -> dict:
+    if update.get("sessionUpdate") != "agent_message_chunk":
+        return update
+    return {**update, "_meta": {**update.get("_meta", {}), ASSISTANT_ORIGIN_META: origin}}
+
+
+def _ambiguous_legacy_failure(update: dict, meta: object) -> bool:
+    coordinates = meta.get(TRANSCRIPT_META) if isinstance(meta, dict) else None
+    if isinstance(coordinates, dict) and coordinates.get("source") not in (None, "adapter"):
+        return False
+    content = update.get("content")
+    if not isinstance(content, dict) or content.get("type") != "text":
+        return False
+    text = content.get("text")
+    return isinstance(text, str) and text.startswith(PROMPT_FAILURE_PREFIX)
+
+
+def display_recorded_update(update: dict, *, protected: bool) -> dict:
+    """Project stored display events and consume the private origin marker."""
+    if update.get("sessionUpdate") != "agent_message_chunk":
+        return update
+    meta = update.get("_meta")
+    origin = None
+    if isinstance(meta, dict) and ASSISTANT_ORIGIN_META in meta:
+        origin = meta.pop(ASSISTANT_ORIGIN_META)
+        if not meta:
+            del update["_meta"]
+    if protected and (origin == "prompt_failure" or (origin is None and _ambiguous_legacy_failure(update, meta))):
+        return {**update, "content": {"type": "text", "text": PROMPT_FAILURE_TEXT}}
     return update
 
 
