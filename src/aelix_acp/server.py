@@ -695,11 +695,13 @@ class Server:
             lease = live.lease if live and live.lease else acquire_lease(self.args.state_dir, session_id)
             if live:
                 live.lease = None  # Hold the lease across native close and SQL deletion.
+            close_completed = False
             self.starting_ids.add(session_id)
             try:
                 async with (live.mutation_lock if live else asyncio.Lock()):
                     if live:
                         await live.close()
+                        close_completed = True
                     def delete_records(db):
                         db.execute("DELETE FROM preferences WHERE session_id=?", (session_id,))
                         db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
@@ -711,7 +713,8 @@ class Server:
                     if live is not None and self.sessions.get(session_id) is live:
                         self.sessions.pop(session_id)
             except BaseException:
-                if live and self.sessions.get(session_id) is live:
+                # A retained handle with a completed close cannot release a returned lease.
+                if live and not close_completed and self.sessions.get(session_id) is live:
                     live.lease, lease = lease, None
                 raise
             finally:

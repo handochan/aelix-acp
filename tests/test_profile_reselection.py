@@ -1,5 +1,6 @@
 """D16 decision 2 through ACP stdio and a synthetic guarded native worker."""
 import asyncio
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -663,6 +664,34 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.request("session/list", {}))["sessions"], [])
         opened = await self.client.request("session/new", self.open_params("b-new"))
         self.assertNotEqual(opened["sessionId"], self.session)
+
+    async def test_delete_rollback_releases_closed_session_lease_for_load_and_retry(self):
+        await self.start_with_gates()
+        await self.fail_compaction_restart()
+        saved = self.preferences()
+        with closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            with db:
+                db.execute("""
+                    CREATE TRIGGER fail_partial_session_delete BEFORE DELETE ON sessions
+                    WHEN NOT EXISTS (SELECT 1 FROM preferences WHERE session_id = OLD.id)
+                    BEGIN SELECT RAISE(ABORT, 'fixture delete failure'); END
+                """)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "session_store_write_failed"):
+                    await self.client.request("session/delete", {"sessionId": self.session})
+            finally:
+                with db:
+                    db.execute("DROP TRIGGER fail_partial_session_delete")
+
+        self.assertEqual(self.preferences(), saved)
+        listed = await self.client.request("session/list", {})
+        self.assertEqual([row["sessionId"] for row in listed["sessions"]], [self.session])
+        opened = await self.client.request("session/load", {
+            **self.open_params("b-after-rollback"), "sessionId": self.session,
+        })
+        self.assertEqual(opened["_meta"][META], {"bindingId": "b-after-rollback"})
+        self.assertEqual(await self.client.request("session/delete", {"sessionId": self.session}), {})
+        self.assertEqual((await self.client.request("session/list", {}))["sessions"], [])
 
     async def test_close_retires_tool_write_during_inventory_preflight(self):
         await self.start_with_gates()
