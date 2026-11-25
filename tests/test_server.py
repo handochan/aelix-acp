@@ -523,7 +523,13 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                     crash_reader.feed_eof()
                     return
                 data = {"isStreaming": streaming} if self.command == "get_state" else {}
-                asyncio.get_running_loop().call_soon(session.pending[payload["id"]].set_result, data)
+                future = session.pending[payload["id"]]
+
+                def reply():
+                    if not future.done():
+                        future.set_result(data)
+
+                asyncio.get_running_loop().call_soon(reply)
             async def drain(self):
                 if self.command == "prompt" and failure:
                     await session.event({"type": "message_end", "message": failure})
@@ -598,7 +604,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         written = self.native(streaming=True)
         with self.assertRaises(ProtocolError) as caught:
             await self.session.prompt([{"type": "text", "text": "Respond"}])
-        self.assertEqual(written, ["prompt", "get_state", "abort"])
+        # The deadline can expire before the first idle-state poll.
+        self.assertEqual([command for command in written if command in ("prompt", "abort")], ["prompt", "abort"])
         self.assertEqual((caught.exception.code, str(caught.exception)), (TURN_FAILED_AFTER_DISPATCH, "Aelix turn timed out"))
         self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False})
 
