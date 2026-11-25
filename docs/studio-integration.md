@@ -256,6 +256,57 @@ gets up to 45 s to end before it is killed, so `{}` can take that long (see
 [Delegated children](#delegated-children) and the close latency measured in
 [product validation](product-validation.md)).
 
+## Studio session profiles and tools
+
+Offer `clientCapabilities._meta["aelix/sessionRelay"] = {version:1, notifications:false}`
+and use the binding echoed by `session/new` or `session/load`. The host sends
+`{sessionId,bindingId,payload}` on each advertised `_aelix/session/` method.
+The session methods in [Studio #7 D16 v1](https://github.com/handochan/aelix-studio/issues/7#issuecomment-7164048476)
+are available through the same conversation extension route as running input.
+
+| Method suffix | Payload | Result |
+|---|---|---|
+| `profiles/list` | `{}`, `{limit}`, or `{cursor}` | Winning profiles sorted by UTF-8 name, active name and saved ref, diagnostics and next cursor |
+| `profiles/show` | `{name}` | Current winner's ref, relative source, prompt preview, and model, tool, skill and policy fields |
+| `profiles/use` | `{profile,requestId}` | On success, active name and ref with `toolOverride:null`. A null profile clears the selection. |
+| `tools/set-active` | `{names,requestId}` | On success, persisted `toolOverride` and native `activeTools`. An empty array explicitly enables zero tools. |
+| `requests/lookup` | `{requestId}` | Receipt in the original binding, with `pending`, `completed`, `unknown`, or `unavailable` status |
+
+A `ProfileRef` contains `name`, `scope` and `revision`. Its SHA-256 includes the
+scope, resolved file URI and original Markdown bytes. Lists use a default page
+size of 40, accept limits from 1 to 100, and keep a 60-second snapshot. Start
+again when a cursor is stale. Each response fits the 256 KiB relay envelope.
+Prompt previews are cleaned and limited to 512 Unicode scalars.
+`approvalMode` describes the profile's delegation policy.
+
+An idle write uses a UUIDv7 and shares the binding's 256 receipts with running
+input. Identical requests share the result for up to 600 seconds. Reusing an
+ID for different content returns `-32602`. A completed write is accepted once
+native application and SQLite persistence succeed. `-33100` means the effect
+could not be confirmed. Look up the original receipt and read current state.
+Reopen the session before mutating again when the worker and saved preferences
+may have diverged.
+
+ACP saves `agentRef` and `agentPreview` with each explicit named selection,
+including `/agents use` and direct management. On load, a matching ref
+restores with the saved model, permission mode and explicit tool override.
+Name-only records use the existing restoration path. For drift, ACP asks
+once through `session/request_permission`, including the original and
+candidate source, revision and changed fields in the card. A stale explicit
+pick returns `profile-changed` before the card. Decline, cancellation, 45-second
+timeout, and a candidate that changes again during apply require restoring
+the original profile and reopening the same conversation. A load refusal
+uses `-32004` and `kind:"profile_reselection_required"`. Project trust and
+native launch requirements still apply.
+
+Integration requires native to advertise `profileRefGuard:1`, provide
+`profile.ref` on `agents/show` from the same bytes it parsed for the preview,
+and support `agents/use({name,expectedProfile})`. It must compare the expected
+ref against the immutable parse it applies and return its `activeRef`.
+The pin in `runtime-reference.json` supports catalog reads, explicit clears,
+tool writes and legacy name-only restores. A named explicit selection or
+recorded-ref load issues zero native `agents/use` calls on that pin.
+
 ## Management
 
 For app defaults and conversation-specific extension selection, Studio uses the
@@ -286,7 +337,7 @@ defines both the launcher snapshot and the versioned ACP management actions.
 | `extensions/list` | `{}` | Installed distribution/version/entry reference |
 | `extensions/action` | `{action,target?}` | list/verify/discover/install/remove/update/enable/disable/reload |
 | `agents/list` / `agents/show` | `{}` / `{name}` | Native profiles and diagnostics |
-| `agents/use` | `{name}` | Persistent selection; `--none` clears |
+| `agents/use` | `{name}` | Revision-bound selection on a supporting runtime. `--none` clears. |
 | `agents/run` | `{name,task,allowProject?}` | Native delegation, enabled explicitly |
 | `agents/enable` | `{enabled:bool}` | Consent + restart |
 | `workspace/trust` | `{trusted:bool}` | Consent + restart |

@@ -498,8 +498,10 @@ class Server:
             await session.close()
         return {}
 
-    async def dispatch(self, method, params):
+    async def dispatch(self, method, params, *, response_id=None):
         require_object(params)
+        if handler := session_relay.RESOURCE_REQUESTS.get(method):
+            return await self.relay_request(handler, params, response_id=response_id)
         if handler := session_relay.REQUESTS.get(method):
             return await self.relay_request(handler, params)
         if self.host_bytes is not None and (handler := session_relay.IMAGE_REQUESTS.get(method)):
@@ -518,12 +520,16 @@ class Server:
                 "SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
             if registered:
                 with acquire_lease(self.args.state_dir, session_id, purpose="activity"):
+                    live = self.sessions.get(session_id)
+                    if (live is not None and live.studio_resources.uncertain
+                            and method not in {"session/load", "session/close", "session/delete"}):
+                        raise ProtocolError("Reopen the session to recover its profile and tool state.", -32004)
                     return await self.dispatch_request(method, params)
             if method == "session/fork":
                 raise ProtocolError("Saved session does not match this workspace and profile")
         return await self.dispatch_request(method, params)
 
-    async def relay_request(self, handler, params):
+    async def relay_request(self, handler, params, **kwargs):
         if not self.relay_enabled:
             raise ProtocolError("Session relay was not negotiated.", -32601)
         session_relay.require_fields(params, {"sessionId", "bindingId", "payload"})
@@ -533,7 +539,7 @@ class Server:
         relay = session.input_relay if session is not None else None
         if relay is None or relay.binding_id != binding_id or session_id in self.starting_ids:
             raise ProtocolError("Session relay binding is unavailable.", session_relay.SCOPE_DENIED)
-        return await handler(relay, params["payload"])
+        return await handler(relay, params["payload"], **kwargs)
 
     async def intervene(self, params):
         session_id = require_string(params.get("sessionId"), "sessionId")
@@ -778,6 +784,11 @@ class Server:
                     raise ProtocolError("Unsupported management action")
                 if action == "children/notices":
                     return await session.notice_turn()
+                if action == "agents/use":
+                    if set(arguments) != {"name"}:
+                        raise ProtocolError("Invalid profile selection arguments")
+                    session.reset_cancellation()
+                    return await session.studio_resources.select_name(arguments["name"])
                 if action == "mcp/configure":
                     result = await session.configure_mcp(arguments.get("servers"))
                 else:
@@ -785,16 +796,14 @@ class Server:
                         _timeout=(getattr(self.args, "command_timeout", 600) or None) if action in LONG_CONTROLS else 60)
                 if action == "tools/set_active":
                     session.active_tools = result["activeTools"]
+                    session.studio_resources.invalidate_pages()
                     await session.save()
                 if action == "resources/reload":
                     await session.restore_tools()
+                    session.studio_resources.invalidate_pages()
                     await session.commands()
-                if action == "agents/use":
-                    await session.commands()
-                if action in {"auth/set_api_key", "auth/login", "auth/logout", "resources/reload", "settings/set", "agents/use"}:
+                if action in {"auth/set_api_key", "auth/login", "auth/logout", "resources/reload", "settings/set"}:
                     await session.controls.refresh()
-                    if action == "agents/use":
-                        await session.sync_profile_tools()
                     await session.save()
                     await session.update({"sessionUpdate": "config_option_update", "configOptions": session.controls.options()})
                 return result
@@ -809,11 +818,14 @@ class Server:
             method = message["method"]
             if request_id is None and method.startswith(session_relay.METHOD_PREFIX):
                 return  # v1 has no client-to-agent session relay notifications.
-            result = await self.dispatch(method, message.get("params") or {})
+            kwargs = {"response_id": request_id} if method in session_relay.RESOURCE_REQUESTS else {}
+            result = await self.dispatch(method, message.get("params") or {}, **kwargs)
             if request_id is not None:
                 response = {"jsonrpc": "2.0", "id": request_id, "result": result}
                 if method == session_relay.LOOKUP_METHOD:
                     response = session_relay.bounded_lookup_response(response)
+                elif method in session_relay.RESOURCE_REQUESTS and not session_relay.fits_resource(result, request_id):
+                    response["result"] = {"accepted": False, "reason": "result-too-large"}
                 await self.send(response)
                 replied = True
                 if message["method"] in ("session/new", "session/load", "session/fork"):
@@ -829,7 +841,10 @@ class Server:
                 return
             if request_id is not None and not replied:
                 error = {"code": getattr(exc, "code", -32603), "message": str(exc)}
-                if isinstance(exc, ProtocolError) and exc.data is not None:
+                if method in session_relay.RESOURCE_REQUESTS or (
+                        method.startswith(session_relay.METHOD_PREFIX) and error["code"] == -32601):
+                    error["message"] = "Outcome unknown." if error["code"] == -33100 else "Request refused."
+                elif isinstance(exc, ProtocolError) and exc.data is not None:
                     error["data"] = exc.data
                 await self.send({"jsonrpc": "2.0", "id": request_id, "error": error})
             else:

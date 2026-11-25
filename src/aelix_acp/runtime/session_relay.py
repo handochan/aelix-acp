@@ -12,6 +12,9 @@ import uuid
 
 from .. import image_policy
 from . import host_bytes
+from .leases import acquire as acquire_lease
+from .profile_refs import text_list, valid_name, valid_ref
+from .studio_resources import refusal
 from ..wire.errors import ProtocolError, require_object, require_string
 from ..wire.transport import encode_frame
 
@@ -21,11 +24,10 @@ LOOKUP_METHOD = METHOD_PREFIX + "requests/lookup"
 OUTCOME_UNKNOWN = -33100
 SCOPE_DENIED = -33102
 RECEIPT_TTL = 600
-# Every stage-one result has a fixed shape and a generated 32-character turn
-# ID at most. This limits stored result bytes as well as the number of keys.
 MAX_RECEIPTS = 256
 MAX_RELAY_FRAME = 256 * 1024
 IMAGE_REQUEST_SECONDS = 120
+PROFILE_CURSOR_TTL = 60
 
 
 def advertisement(capabilities):
@@ -86,7 +88,7 @@ def request_key(value):
 
 def bounded_lookup_response(response):
     if (response["result"]["status"] == "completed"
-            and len(encode_frame(response)) - 1 > MAX_RELAY_FRAME):
+            and not fits_resource(response["result"], response["id"])):
         return {**response, "result": {"status": "unavailable", "reason": "result-too-large"}}
     return response
 
@@ -95,6 +97,30 @@ def write_result(outcome):
     if outcome["status"] == "unknown":
         raise ProtocolError("Native queue delivery is unknown.", OUTCOME_UNKNOWN)
     return outcome["result"]
+
+
+def resource_write_result(outcome):
+    if outcome["status"] == "unknown":
+        raise ProtocolError("Outcome unknown.", OUTCOME_UNKNOWN)
+    if "rpcCode" in outcome:
+        raise ProtocolError("Request refused.", outcome["rpcCode"])
+    return outcome["result"]
+
+
+def fits_resource(result, response_id):
+    return all(len(encode_frame(envelope)) - 1 <= MAX_RELAY_FRAME for envelope in (
+        {"jsonrpc": "2.0", "id": response_id, "result": result},
+        {"success": True, "data": {"result": result}},
+    ))
+
+
+@dataclass
+class ProfilePage:
+    expires: float
+    snapshot: dict
+    limit: int
+    start: int
+    result: dict | None = None
 
 
 @dataclass
@@ -121,6 +147,12 @@ class SessionRelay:
         self.queue_order = {command: asyncio.Lock() for command in ("steer", "follow_up")}
         self.image_acceptances = {}
         self.receipts: dict[str, Receipt] = {}
+        self.profile_pages: dict[str, ProfilePage] = {}
+        self.profile_generation = 0
+
+    def invalidate_profile_pages(self):
+        self.profile_pages.clear()
+        self.profile_generation += 1
 
     def invalidate_images(self):
         # Each entry belongs to the original request, never a duplicate waiter.
@@ -221,21 +253,12 @@ class SessionRelay:
             # Reserve before reverse reads, then bind the verified digests.
             fingerprint_fields.extend((1, image_policy.CAPTION_VERSION, refs))
         fingerprint = hashlib.sha256(json.dumps(fingerprint_fields).encode("utf-8")).digest()
-        now = self.clock()
-        # A pending write retains its slot until it settles, even after lookup
-        # expires. Duplicate waiters never cancel the original write.
-        for old_key, receipt in tuple(self.receipts.items()):
-            if receipt.outcome.done() and now - receipt.first_seen >= RECEIPT_TTL:
-                del self.receipts[old_key]
-        if prior := self.receipts.get(key):
-            if not prior.matches(fingerprint):
-                raise ProtocolError("Conflicting requestId.")
-            return write_result(await asyncio.shield(prior.outcome))
-        if len(self.receipts) >= MAX_RECEIPTS:
-            return {"accepted": False, "reason": "dedup-capacity"}
-
-        outcome = asyncio.get_running_loop().create_future()
-        receipt = self.receipts[key] = Receipt(now, fingerprint, outcome)
+        receipt, owned = self.reserve(key, fingerprint)
+        if receipt is None:
+            return refusal("dedup-capacity")
+        if not owned:
+            return write_result(await asyncio.shield(receipt.outcome))
+        outcome = receipt.outcome
         issued = locked = False
         task = asyncio.current_task()
         lock = self.queue_order[native_command]
@@ -300,6 +323,140 @@ class SessionRelay:
             self.image_acceptances.pop(task, None)
             release_order()
         return write_result(outcome.result())
+
+    def reserve(self, key, fingerprint):
+        now = self.clock()
+        # A pending write retains its slot until it settles, even after lookup
+        # expires. Duplicate waiters never cancel the original write.
+        for old_key, receipt in tuple(self.receipts.items()):
+            if receipt.outcome.done() and now - receipt.first_seen >= RECEIPT_TTL:
+                del self.receipts[old_key]
+        if prior := self.receipts.get(key):
+            if not prior.matches(fingerprint):
+                raise ProtocolError("Conflicting requestId.")
+            return prior, False
+        if len(self.receipts) >= MAX_RECEIPTS:
+            return None, False
+        outcome = asyncio.get_running_loop().create_future()
+        receipt = self.receipts[key] = Receipt(now, fingerprint, outcome)
+        return receipt, True
+
+    async def profiles_list(self, payload, *, response_id):
+        payload = require_object(payload)
+        now = self.clock()
+        for token, page in tuple(self.profile_pages.items()):
+            if now >= page.expires:
+                del self.profile_pages[token]
+        if set(payload) == {"cursor"}:
+            cursor = require_string(payload["cursor"], "cursor")
+            page = self.profile_pages.get(cursor)
+            if page is None:
+                return refusal("cursor-stale")
+        else:
+            if set(payload) not in (set(), {"limit"}):
+                raise ProtocolError("Invalid profile page fields")
+            limit = payload.get("limit", 40)
+            if type(limit) is not int or not 1 <= limit <= 100:
+                raise ProtocolError("Invalid profile page limit")
+            generation = self.profile_generation
+            snapshot = await self.session.studio_resources.catalog()
+            if generation != self.profile_generation:
+                return refusal("cursor-stale")
+            if snapshot.get("accepted") is False:
+                return snapshot
+            page = ProfilePage(self.clock() + PROFILE_CURSOR_TTL, snapshot, limit, 0)
+        if page.result is not None:
+            return page.result
+        profiles = page.snapshot["profiles"]
+        end = min(page.start + page.limit, len(profiles))
+        cursor = "p." + uuid.uuid4().hex
+        while end >= page.start:
+            following = cursor if end < len(profiles) else None
+            result = {**page.snapshot, "profiles": profiles[page.start:end], "nextCursor": following}
+            if fits_resource(result, response_id):
+                break
+            end -= 1
+        if end < page.start or (end == page.start and end < len(profiles)):
+            return refusal("result-too-large")
+        if following is not None:
+            self.profile_pages[following] = ProfilePage(page.expires, page.snapshot, page.limit, end)
+        page.result = result
+        return result
+
+    async def profiles_show(self, payload, *, response_id):
+        require_fields(payload, {"name"})
+        if not valid_name(payload["name"]):
+            raise ProtocolError("Invalid profile name")
+        return await self.session.studio_resources.show(payload["name"], lambda result: fits_resource(result, response_id))
+
+    async def profiles_use(self, payload, *, response_id):
+        require_fields(payload, {"profile", "requestId"})
+        profile = payload["profile"]
+        if profile is not None and not valid_ref(profile):
+            raise ProtocolError("Invalid profile reference")
+        return await self.resource_write("profiles/use", profile, payload["requestId"], response_id)
+
+    async def tools_set_active(self, payload, *, response_id):
+        require_fields(payload, {"names", "requestId"})
+        names = payload["names"]
+        if not text_list(names) or any(not name.strip() for name in names) or len(set(names)) != len(names):
+            raise ProtocolError("Expected unique tool names")
+        return await self.resource_write("tools/set-active", names, payload["requestId"], response_id)
+
+    async def resource_write(self, method, value, request_id, response_id):
+        key = request_key(request_id)
+        fingerprint = hashlib.sha256(
+            json.dumps([method, value], sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).digest()
+        receipt, owned = self.reserve(key, fingerprint)
+        if receipt is None:
+            return refusal("dedup-capacity")
+        if not owned:
+            return resource_write_result(await asyncio.shield(receipt.outcome))
+        session = self.session
+        try:
+            result = await self.apply_resource(method, value, response_id)
+        except asyncio.CancelledError:
+            receipt.outcome.set_result({"status": "unknown"} if session.studio_resources.uncertain else
+                                       {"status": "completed", "rpcCode": -32603})
+            raise
+        except Exception as error:
+            outcome = ({"status": "unknown"} if session.studio_resources.uncertain else
+                       {"status": "completed", "rpcCode": getattr(error, "code", -32603)})
+        else:
+            outcome = {"status": "completed", "result": result}
+        receipt.outcome.set_result(outcome)
+        settled = resource_write_result(outcome)
+        if method == "profiles/use" and settled["accepted"]:
+            await session.studio_resources.publish()
+        return settled
+
+    async def apply_resource(self, method, value, response_id):
+        session = self.session
+        resources = session.studio_resources
+        if (session.mutation_lock.locked() or session.changing or session.turn_active or session.rpc_closed
+                or session.proc is None or session.proc.returncode is not None
+                or session.compaction_recovery_needed):
+            return refusal("busy")
+        try:
+            lease = acquire_lease(session.server.args.state_dir, session.id, purpose="activity")
+        except ProtocolError as error:
+            if error.code == -32000:
+                return refusal("busy")
+            raise
+        with lease:
+            async with session.mutation_lock:
+                if resources.uncertain:
+                    return refusal("busy")
+                if method == "profiles/use":
+                    session.reset_cancellation()
+                    expected = {"accepted": True, "activeAgent": value["name"] if value else None,
+                                "activeRef": value, "toolOverride": None}
+                    if not fits_resource(expected, response_id):
+                        return refusal("result-too-large")
+                    result, _ = await resources.select(value)
+                    return result if fits_resource(result, response_id) else refusal("result-too-large")
+                return await resources.set_tools(value, lambda result: fits_resource(result, response_id))
 
     async def _write_images(self, command, turn, message, refs, receipt, issued, fence):
         session = self.session
@@ -371,3 +528,11 @@ IMAGE_REQUESTS = {
     METHOD_PREFIX + "input/follow-up-images": SessionRelay.follow_up_images,
     METHOD_PREFIX + "input/image-state": SessionRelay.image_state,
 }
+
+RESOURCE_REQUESTS = {
+    METHOD_PREFIX + "profiles/list": SessionRelay.profiles_list,
+    METHOD_PREFIX + "profiles/show": SessionRelay.profiles_show,
+    METHOD_PREFIX + "profiles/use": SessionRelay.profiles_use,
+    METHOD_PREFIX + "tools/set-active": SessionRelay.tools_set_active,
+}
+REQUESTS.update(RESOURCE_REQUESTS)

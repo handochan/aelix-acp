@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from aelix_acp.runtime import session_relay
+from test_studio_resources import CASES
 from aelix_acp.server import Server
 from aelix_acp.wire.errors import ProtocolError
 from aelix_acp.wire.transport import encode_frame
@@ -22,6 +23,8 @@ AD = {
 }
 META = "aelix/sessionRelay"
 STATE, STEER, FOLLOW_UP, LOOKUP = AD["requests"]
+AD["requests"] += [name for name in CASES["relay-discovery"]["response"]["body"]["data"]["requests"]
+                   if not name.startswith("_aelix/session/selections/") and name not in AD["requests"]]
 
 
 def request_id(number):
@@ -43,6 +46,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.server.send = AsyncMock()
         self.session = SimpleNamespace(
             input_relay=None, cancelled=False, changing=0, rpc_closed=False,
+            studio_resources=SimpleNamespace(uncertain=False),
             proc=SimpleNamespace(returncode=None), rpc=AsyncMock(return_value={}),
             state={"steeringMode": "one-at-a-time", "followUpMode": "all"},
         )

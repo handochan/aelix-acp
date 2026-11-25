@@ -33,6 +33,7 @@ from .runtime.store import (LiveHistory, begin_turn, confirm_adapter_input, fini
 from .runtime.commands import (ALIASES, BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND,
                                compact_instructions, execute as execute_slash)
 from .runtime.extensions import extension_reference
+from .runtime.studio_resources import StudioResources, tool_lock_key
 from .runtime.managed_extensions import managed_preferences
 from .runtime.leases import acquire as acquire_lease, lease_path
 from .runtime.subagents import SubagentTracker
@@ -234,6 +235,7 @@ class Session:
         self.stderr_task = None
         self.stderr_tail = bytearray()
         self.controls = SessionControls(self)
+        self.studio_resources = StudioResources(self)
         self.adapter_event_binding = uuid.uuid4().hex
         self.adapter_event_sequence = 0
         self.tool_origin = None
@@ -303,6 +305,7 @@ class Session:
         # Re-read under the acquired lease, not the constructor's stale snapshot.
         preferences = load_preferences(self.server.db, self.id) if fork_preferences is None else fork_preferences
         saved_agent = preferences.get("agent")
+        self.studio_resources.reset(preferences)
         resume_file = session_file if fork_source is None else fork_source["target"]
         self.restore_launch_preferences(preferences)
         if managed_change is not None:
@@ -427,7 +430,7 @@ class Session:
         if not ready_file.is_file() or ready_file.read_text() != nonce:
             raise ProtocolError("The tool approval bridge did not load; refusing this session", -32603)
         if fork_source is not None:
-            if saved_agent:
+            if saved_agent and self.studio_resources.recorded is None:
                 try:
                     await self.rpc("aelix_control", method="agents/show", params={"name": saved_agent})
                 except BackendError:
@@ -446,6 +449,7 @@ class Session:
             config_id: value for config_id, value in self.controls.selections().items()
             if config_id in NATIVE_SESSION_SELECTORS
         } if native_has_history else {}
+        self.studio_resources.require_restore_guard()
         # A saved profile or tool selection restricts authority. Refuse rather
         # than resume with the runtime's broader defaults; check before client
         # MCP setup, which already needs tools/set_active.
@@ -461,14 +465,18 @@ class Session:
         if guard_selectors:
             await self.selector_startup(nonce, "begin")
         if saved_agent:
-            try:
-                await self.rpc("aelix_control", method="agents/use", params={"name": saved_agent})
-            except BackendError:
-                # The profile's tool and posture limits cannot be applied, and a
-                # warning during session/load is not shown by AionCore v0.2.2.
-                # Refuse instead of resuming with broader defaults.
-                raise profile_unavailable(saved_agent) from None
+            if self.studio_resources.recorded is not None:
+                if not await self.studio_resources.restore():
+                    raise ProtocolError("Restore or recreate that profile, then open the session again.",
+                                        -32004, {"kind": "profile_unavailable", "profile": saved_agent})
+            else:
+                try:
+                    await self.rpc("aelix_control", method="agents/use", params={"name": saved_agent})
+                except BackendError:
+                    raise profile_unavailable(saved_agent) from None
             await self.controls.refresh()
+            if self.studio_resources.recorded is not None and self.controls.capabilities.get("activeAgent") != saved_agent:
+                raise ProtocolError("Aelix did not restore the recorded profile", -32004)
         restored = self.launch_mode
         await self.controls.observe_permission()
         if self.controls.native_mode != restored:
@@ -627,11 +635,6 @@ class Session:
         except (ProtocolError, KeyError, TypeError):
             return False
 
-    async def sync_profile_tools(self):
-        # Only explicit GUI/slash tool choices are persistent overrides.
-        # A profile owns its live filter and must be re-evaluated after edits.
-        self.active_tools = None
-
     def require_live_worker(self, expected=None, *, committed=False):
         proc, lease = self.proc, self.lease
         if (proc is None or proc.returncode is not None or lease is None or lease.closed
@@ -666,6 +669,7 @@ class Session:
             **({"extensionOverrides": self.extension_overrides} if self.extension_overrides else {}),
             "lastContextMeasurement": self.context.last_measurement,
             "agent": self.controls.capabilities.get("activeAgent"),
+            **self.studio_resources.preferences(),
             "activeTools": self.active_tools,
             "forkProjection": self.fork_projection,
             "forkHead": self.fork_head,
@@ -844,7 +848,9 @@ class Session:
                             future.set_exception(session_locked(self.id, "native"))
                         else:
                             detail = "Native RPC failed" if self.private_host else str(event.get("error", "RPC failed"))
-                            future.set_exception(BackendError(detail, event.get("command", "unknown")))
+                            error = BackendError(detail, event.get("command", "unknown"))
+                            error.studio_tool_lock = tool_lock_key(event.get("error"))
+                            future.set_exception(error)
                 else:
                     await self.event(event)
         except Exception as exc:
@@ -1895,6 +1901,7 @@ class Session:
 
     async def _close(self):
         self.raise_fence()
+        self.studio_resources.invalidate_pages()
         self.ending = True
         try:
             await self._end_worker()
