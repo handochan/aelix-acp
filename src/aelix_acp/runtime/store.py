@@ -313,7 +313,11 @@ def history(db: sqlite3.Connection, session_id: str):
     if db.execute("SELECT 1 FROM recovered_history WHERE session_id=? AND position=-1", (session_id,)).fetchone():
         for (value,) in db.execute("SELECT value FROM recovered_history WHERE session_id=? AND position>=0 "
                                    "ORDER BY position", (session_id,)):
-            yield json.loads(value)
+            update = json.loads(value)
+            if update.get("sessionUpdate") == "agent_message_chunk":
+                # Cache membership establishes native origin for pre-upgrade rows.
+                update.setdefault("_meta", {}).setdefault(ASSISTANT_ORIGIN_META, "model")
+            yield update
     for (value,) in db.execute("SELECT value FROM events WHERE session_id=? AND sequence<=? ORDER BY sequence",
                                (session_id, last)):
         yield json.loads(value)
