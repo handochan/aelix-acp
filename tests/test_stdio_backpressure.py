@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 
+from aelix_acp.server import MAX_CANCEL_RESPONSES, MAX_CANCEL_RESPONSE_ID_BYTES
 from aelix_acp.wire.transport import encode_frame
 from test_lifecycle import FAKE_CHILD
 
@@ -18,7 +19,9 @@ from test_lifecycle import FAKE_CHILD
 FIXTURE = """
 from pathlib import Path
 import asyncio
+import json
 import os
+import sys
 
 import aelix_acp.server as entry
 from aelix_acp.session import Session, tool_call
@@ -35,16 +38,52 @@ def observe_write(fd, data):
     return write(fd, data)
 os.write = observe_write
 
+rpc = Session.rpc
+async def hold_abort_wait(self, command, **kwargs):
+    if command == "abort" and Path("extend-abort-wait").exists():
+        kwargs["_timeout"] = 60
+    return await rpc(self, command, **kwargs)
+Session.rpc = hold_abort_wait
+
+def snapshot(name):
+    server = FixtureServer.instance
+    metrics = {
+        "tasks": len(asyncio.all_tasks()),
+        "requests": len(server.tasks),
+        "cancelTasks": len(getattr(server, "cancel_tasks", {})),
+        "cancelResponses": len(getattr(server, "cancel_reply_ids", ())),
+        "nativePending": sum(len(session.pending) for session in server.sessions.values()),
+    }
+    try:
+        import resource
+    except ImportError:
+        pass  # Windows still asserts the task and native RPC counts.
+    else:
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        metrics["rssBytes"] = rss if sys.platform == "darwin" else rss * 1024
+    path = Path(name)
+    pending = path.with_suffix(".tmp")
+    pending.write_text(json.dumps(metrics), encoding="utf-8")
+    pending.replace(path)
+
 readline = StdinReader.readline
 async def observe_eof(self):
     line = await readline(self)
     if not line:
         Path('stdin-eof').touch()
+    elif b'"method": "fixture/snapshot"' in line:
+        snapshot(json.loads(line)["params"]["name"])
     return line
 StdinReader.readline = observe_eof
 
 class FixtureServer(entry.Server):
+    def __init__(self, args):
+        super().__init__(args)
+        type(self).instance = self
+
     async def dispatch(self, method, params):
+        if method == 'fixture/snapshot':
+            return {}
         if method == 'fixture/large':
             return {'text': 'x' * 2**20}
         if method == 'fixture/wait':
@@ -54,14 +93,18 @@ class FixtureServer(entry.Server):
             return {}
         if method == 'fixture/permission':
             worker = Session(self, 'fixture', os.getcwd())
+            cancel = worker.cancel
+
+            async def observe_cancel():
+                await cancel()
+                Path('cancel-received').touch()
+
+            worker.cancel = observe_cancel
             worker.tools['tool'] = tool_call('tool', 'write', {}, worker.cwd, 'pending')
             worker.socket_server = await asyncio.start_server(worker.permission, '127.0.0.1', 0)
             self.sessions[worker.id] = worker
             return {'port': worker.socket_server.sockets[0].getsockname()[1]}
-        result = await super().dispatch(method, params)
-        if method == 'session/cancel':
-            Path('cancel-received').touch()
-        return result
+        return await super().dispatch(method, params)
 
 entry.Server = FixtureServer
 entry.main()
@@ -95,6 +138,12 @@ NATIVE_PROMPT = FAKE_CHILD.replace(
     if request["type"] == "abort":
         streaming = False
         Path("native-abort").touch()
+        if Path("hold-first-abort-reply").exists():
+            marker = Path("first-abort-reply-held")
+            if not marker.exists():
+                marker.touch()
+                continue
+            Path("native-second-abort").touch()
     if request.get("method") == "commands/cancel":
         Path("native-commands-cancel").touch()
     if request["type"] == "get_state":
@@ -198,8 +247,8 @@ class BackpressureTests(unittest.TestCase):
         self.send("session/prompt", 4, {"sessionId": session, "prompt": [{"type": "text", "text": text}]})
         return session
 
-    def reply_until(self, match, *, seen=None):
-        for _ in range(32):
+    def reply_until(self, match, *, seen=None, limit=32):
+        for _ in range(limit):
             frame = self.reply()
             if match(frame):
                 return frame
@@ -236,6 +285,136 @@ class BackpressureTests(unittest.TestCase):
         self.assertEqual([frame["error"]["code"] for frame in seen if "error" in frame], [-32700] * 16)
         self.assertIn({"jsonrpc": "2.0", "method": "$/cancel_request",
                        "params": {"requestId": permission["id"]}}, seen)
+        self.proc.stdin.close()
+        self.assertEqual(self.proc.wait(timeout=10), 0)
+
+    def snapshot(self, name):
+        self.send("fixture/snapshot", params={"name": name})
+        self.wait_for(name)
+        return json.loads((self.root / name).read_text(encoding="utf-8"))
+
+    def exercise_cancel_flood(self, count, *, with_ids):
+        (self.root / "extend-abort-wait").touch()
+        session = self.start_native_prompt("stream")
+        self.wait_for("stdout-active")
+        before = self.snapshot("before-flood")
+        params = {"sessionId": session}
+        if with_ids:
+            params["padding"] = "x" * 4096
+        for index in range(count):
+            self.send("session/cancel", 1000 + index if with_ids else None, params)
+        after = self.snapshot("after-flood")
+        self.wait_for("native-abort", timeout=2)
+        self.assertLessEqual(after["tasks"] - before["tasks"], 2, (before, after))
+        self.assertLessEqual(after["nativePending"] - before["nativePending"], 1, (before, after))
+        self.assertEqual(after["cancelTasks"], 1)
+        self.assertEqual(after["cancelResponses"], MAX_CANCEL_RESPONSES if with_ids else 0)
+        if "rssBytes" in after:
+            # The old ID flood retained about 23–33 MiB. Allow allocator noise.
+            self.assertLess(after["rssBytes"] - before["rssBytes"], 12 * 1024**2, (before, after))
+        requests = (self.root / "child.requests").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(requests.count("abort None"), 1)
+        self.assertEqual(requests.count("aelix_control commands/cancel"), 1)
+
+        seen = []
+        result = self.reply_until(lambda frame: frame.get("id") == 4, seen=seen, limit=80)
+        self.assertEqual(result["result"], {"stopReason": "cancelled"})
+        if with_ids:
+            expected = set(range(1000, 1000 + MAX_CANCEL_RESPONSES))
+            answered = {frame["id"]: frame for frame in seen if frame.get("id") in expected}
+            for _ in range(len(expected - answered.keys())):
+                answer = self.reply()
+                answered[answer["id"]] = answer
+            self.assertEqual(set(answered), expected)
+            rejected = answered[max(expected)]
+            self.assertEqual(rejected["error"]["code"], -32000)
+            self.assertTrue(all(frame.get("result") == {} for key, frame in answered.items() if key != max(expected)))
+        self.proc.stdin.close()
+        self.assertEqual(self.proc.wait(timeout=10), 0)
+        self.assertEqual(self.proc.stdout.read(), b"")
+
+    def test_cancel_notification_flood_is_coalesced_under_backpressure(self):
+        self.exercise_cancel_flood(1536, with_ids=False)
+
+    def test_ided_cancel_flood_bounds_replies_tasks_and_memory(self):
+        self.exercise_cancel_flood(4096, with_ids=True)
+
+    def test_first_stop_at_both_limits_preserves_prompt_reply_and_withdrawal(self):
+        session = self.start_native_prompt("ask")
+        permission = self.reply_until(lambda frame: frame.get("method") == "session/request_permission")
+        self.large_reply()
+        for request_id in range(100, 162):  # Prompt + large frame + 62 held requests.
+            self.send("fixture/wait", request_id)
+        for request_id in range(1000, 1000 + MAX_CANCEL_RESPONSES):
+            self.send("session/cancel", request_id, {"sessionId": "missing"})
+        saturated = self.snapshot("saturated")
+        self.assertEqual(saturated["requests"], 64)
+        self.assertEqual(saturated["cancelResponses"], MAX_CANCEL_RESPONSES)
+
+        # The compatibility response budget is full, but this is the live session's first Stop.
+        self.send("session/cancel", 8000, {"sessionId": session})
+        self.wait_for("native-abort", timeout=2)
+        self.wait_for("native-approval-answer")
+        denial = json.loads((self.root / "native-approval-answer").read_text(encoding="utf-8"))
+        self.assertTrue(denial["cancelled"])
+        expected = set(range(1000, 1000 + MAX_CANCEL_RESPONSES))
+        seen = {}
+        withdrawn = False
+        for _ in range(MAX_CANCEL_RESPONSES + 12):
+            frame = self.reply()
+            if frame.get("method") == "$/cancel_request":
+                self.assertEqual(frame["params"], {"requestId": permission["id"]})
+                withdrawn = True
+            if frame.get("id") is not None:
+                seen[frame["id"]] = frame
+            if withdrawn and expected | {3, 4} <= seen.keys():
+                break
+        self.assertTrue(withdrawn)
+        self.assertEqual(seen[4]["result"], {"stopReason": "cancelled"})
+        self.assertEqual(seen[max(expected)]["error"]["code"], -32000)
+        self.assertEqual(len(seen[3]["result"]["text"]), 2**20)
+        self.assertEqual(set(seen), expected | {3, 4})
+        self.assertTrue(all(seen[identifier]["error"]["message"] == "Unknown session; use session/load before prompting"
+                            for identifier in expected - {max(expected)}))
+        self.send("session/cancel", 8001, {"sessionId": session})
+        self.assertEqual(self.reply_until(lambda frame: frame.get("id") == 8001)["result"], {})
+
+        # The response limit also applies to oversized IDs, even with free slots.
+        (self.root / "native-abort").unlink()
+        oversized = "x" * (MAX_CANCEL_RESPONSE_ID_BYTES + 1)
+        self.send("session/cancel", oversized, {"sessionId": session})
+        self.wait_for("native-abort", timeout=2)
+        self.assertEqual(self.snapshot("oversized-id")["cancelResponses"], 0)
+        self.send("session/list", 8002)
+        intervening = []
+        self.reply_until(lambda frame: frame.get("id") == 8002, seen=intervening)
+        self.assertNotIn(oversized, [frame.get("id") for frame in intervening])
+        self.proc.stdin.close()
+        self.assertEqual(self.proc.wait(timeout=10), 0)
+
+    def test_first_stop_for_a_new_prompt_replaces_an_old_native_wait(self):
+        (self.root / "hold-first-abort-reply").touch()
+        (self.root / "extend-abort-wait").touch()
+        session = self.start_native_prompt("stream")
+        self.wait_for("stdout-active")
+        self.send("session/cancel", 5, {"sessionId": session})
+        self.wait_for("first-abort-reply-held")
+        self.assertEqual(self.reply_until(lambda frame: frame.get("id") == 4)["result"], {"stopReason": "cancelled"})
+
+        (self.root / "stdout-active").unlink()
+        self.send("session/prompt", 6, {"sessionId": session, "prompt": [{"type": "text", "text": "stream"}]})
+        self.wait_for("stdout-active")
+        self.send("session/cancel", 7, {"sessionId": session})
+        self.wait_for("native-second-abort", timeout=2)
+        seen = []
+        result = self.reply_until(lambda frame: frame.get("id") == 6, seen=seen)
+        self.assertEqual(result["result"], {"stopReason": "cancelled"})
+        replies = {frame.get("id"): frame for frame in seen}
+        while not {5, 7} <= replies.keys():
+            frame = self.reply()
+            replies[frame.get("id")] = frame
+        self.assertEqual(replies[5]["error"]["code"], -32000)
+        self.assertEqual(replies[7]["result"], {})
         self.proc.stdin.close()
         self.assertEqual(self.proc.wait(timeout=10), 0)
 

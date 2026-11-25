@@ -187,6 +187,7 @@ class Session:
         self.failure = None
         self.rpc_closed = False
         self.cancelled = False
+        self.cancel_generation = 0
         self.turn_active = False
         self.input_relay = None
         self.private_host = getattr(server, "host_bytes", None) is not None
@@ -1351,7 +1352,7 @@ class Session:
             self._close_task = None
             self.failure = None
             self.rpc_closed = False
-            self.cancelled = False
+            self.reset_cancellation()
             if extensions is not None:
                 self.extra_extensions = extensions
             if trust_project is not None:
@@ -1492,7 +1493,7 @@ class Session:
         if self.compaction_recovery_needed:
             # Claim the key only after recovery holds the lease.
             await self.recover_after_compaction()
-        self.cancelled = False
+        self.reset_cancellation()
         prior = await write_store(self.server.args.state_dir, begin_turn, self.id, key, fingerprint,
                                   diagnostic="turn_receipt_write_failed")
         if prior is not None:
@@ -1632,7 +1633,7 @@ class Session:
         if self.done and not self.done.done():
             raise ProtocolError("A prompt is already running in this session")
         # A cancel of an earlier turn must not deny this turn's tools (the bridge reads it).
-        self.cancelled = False
+        self.reset_cancellation()
         answer, sent = {}, []
 
         async def send():
@@ -1703,6 +1704,10 @@ class Session:
                 # next one (aelix-ai #800 K5: every poll was one more abort).
                 await self.abort()
             await asyncio.sleep(0.05)
+
+    def reset_cancellation(self):
+        self.cancelled = False
+        self.cancel_generation += 1
 
     def abort_due(self):
         return self.last_abort is None or time.monotonic() - self.last_abort >= REABORT_SECONDS

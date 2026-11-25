@@ -62,6 +62,19 @@ without waiting for the first response. When stdout stalls, the reader
 pauses at the in-flight notification and the bounded native pipe applies
 backpressure to later frames.
 
+`session/cancel` is an [ACP notification](https://agentclientprotocol.com/protocol/v1/prompt-turn#cancellation).
+The first Stop for each session runs through the dedicated cancel path even
+when all 64 ordinary request slots are occupied. Duplicate Stops for the same
+work join the outstanding native cancel. A Stop for newer work supersedes
+the old response wait before sending the new cancel to native. An
+ID attached to the superseded wait receives a `-32000` response.
+
+For clients that attach an ID, one writer handles up to 63 pending Stop
+responses globally and one reserved overload error (`-32000`). Each retained
+ID has a 4 KiB storage limit. When both budgets are full or an ID is oversized,
+the Stop has notification semantics. The original prompt response
+still reports the turn outcome, and approval withdrawals keep their slots.
+
 Validation errors use a backlog of 16 replies. At capacity, ACP discards new
 validation replies before writing any bytes. Each of up to 256 outstanding
 child approval requests reserves its own withdrawal slot until the client
@@ -317,7 +330,7 @@ aborted again only when 2 s (native's own re-abort grace) have passed since the
 previous abort sent by any path, not at every 50 ms poll; `drive_turn`'s
 re-cancel after native accepted a prompt obeys the same cadence. Each client
 `session/cancel` sends one abort at once: its own after `commands/cancel`, or
-none if the turn's poll aborted while `commands/cancel` waited (fix round 1,
+none if the turn's poll aborted while the native stdin write drained (fix round 1,
 Codex C-M2: those two were 0.3 ms apart).
 
 How it is held, against native aelix-ai `83714045` on macOS (the Windows paths

@@ -6,6 +6,7 @@ import base64
 import sqlite3
 import asyncio
 import contextlib
+from dataclasses import dataclass
 import errno
 import json
 from itertools import chain
@@ -53,6 +54,16 @@ MANAGE_ACTIONS = frozenset({"resources/list", "resources/reload", "settings/get"
 CLIENT_REQUEST_SECONDS = 290
 STDOUT_DRAIN_SECONDS = 1
 MAX_WITHDRAWABLE_REQUESTS = 256
+MAX_CANCEL_RESPONSES = 64  # Includes one overload reply.
+MAX_CANCEL_RESPONSE_ID_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class PendingCancel:
+    session: Session
+    generation: int
+    management_task: asyncio.Task | None
+    task: asyncio.Task
 
 
 class Server:
@@ -73,6 +84,10 @@ class Server:
         self.response_limits = {}
         self.tasks = set()
         self.validation_replies = set()
+        self.cancel_tasks = {}
+        self.cancel_replies = asyncio.Queue(MAX_CANCEL_RESPONSES)
+        self.cancel_reply_ids = set()
+        self.cancel_overload_id = None
         self.withdrawals = set()
         self.withdrawal_slots = asyncio.BoundedSemaphore(MAX_WITHDRAWABLE_REQUESTS)
         self.cleanup_tasks = set()
@@ -115,6 +130,100 @@ class Server:
             task = asyncio.create_task(self.send(message))
             self.validation_replies.add(task)
             task.add_done_callback(lambda done: self.task_done(self.validation_replies, done))
+
+    def stop_session(self, params):
+        session_id = require_string(params.get("sessionId"), "sessionId")
+        return self.pending_stop_sessions.get(session_id) or self.session(params)
+
+    def admit_cancel(self, request_id, params):
+        try:
+            session = self.stop_session(params)
+        except ProtocolError as error:
+            self.reserve_cancel_reply(request_id, error=error)
+            return
+
+        pending = self.cancel_tasks.get(session.id)
+        generation = session.cancel_generation
+        management = session.management_task
+        if (pending is None or pending.task.done() or pending.session is not session
+                or pending.generation != generation
+                or (management is not None and pending.management_task is not management)):
+            previous = pending.task if pending is not None and not pending.task.done() else None
+            if previous is not None:
+                previous.cancel()
+            task = asyncio.create_task(self.run_cancel(session, generation, previous))
+            self.cancel_tasks[session.id] = PendingCancel(session, generation, management, task)
+            task.add_done_callback(lambda done: self.cancel_done(session.id, done))
+        else:
+            task = pending.task
+        self.reserve_cancel_reply(request_id, task=task)
+
+    async def run_cancel(self, session, generation, previous):
+        if previous is not None:
+            # Release the previous turn's RPC wait before issuing the new Stop.
+            await asyncio.gather(previous, return_exceptions=True)
+        if session.cancel_generation == generation:
+            await session.cancel()
+
+    def cancel_done(self, session_id, task):
+        pending = self.cancel_tasks.get(session_id)
+        if pending is not None and pending.task is task:
+            self.cancel_tasks.pop(session_id)
+        if not task.cancelled() and (error := task.exception()) is not None and not self.closing:
+            write_diagnostic(f"[aelix-acp] Native cancel failed: {type(error).__name__}")
+
+    def reserve_cancel_reply(self, request_id, *, task=None, error=None):
+        # ACP Stop is a notification. Its optional compatibility reply has a
+        # separate budget, so the Stop itself and other notifications can proceed.
+        if request_id is None or sys.getsizeof(request_id) > MAX_CANCEL_RESPONSE_ID_BYTES:
+            return
+        occupied = len(self.cancel_reply_ids) - (self.cancel_overload_id is not None)
+        if occupied >= MAX_CANCEL_RESPONSES - 1:
+            if self.cancel_overload_id is not None:
+                return
+            self.cancel_overload_id = request_id
+            error = ProtocolError("Too many pending cancel responses", -32000)
+            task = None
+
+        self.active_request_ids.add(request_id)
+        self.cancel_reply_ids.add(request_id)
+        if task is None:
+            self.queue_cancel_reply(request_id, error)
+        else:
+            task.add_done_callback(lambda done: self.complete_cancel_reply(request_id, done))
+
+    def complete_cancel_reply(self, request_id, task):
+        if task.cancelled():
+            error = ProtocolError("Cancel was superseded by newer session work", -32000)
+        else:
+            error = task.exception()
+        self.queue_cancel_reply(request_id, error)
+
+    def queue_cancel_reply(self, request_id, error):
+        if self.closing:
+            return
+        response = {"jsonrpc": "2.0", "id": request_id}
+        if error is None:
+            response["result"] = {}
+        elif isinstance(error, ProtocolError):
+            response["error"] = {"code": error.code, "message": str(error)}
+        else:
+            response["error"] = {"code": -32603, "message": "Native cancel failed"}
+        self.cancel_replies.put_nowait(response)
+
+    async def write_cancel_replies(self):
+        while True:
+            response = await self.cancel_replies.get()
+            request_id = response["id"]
+            try:
+                await self.send(response)
+            except OSError:
+                return  # The stdout writer has already initiated shutdown.
+            finally:
+                self.active_request_ids.remove(request_id)
+                self.cancel_reply_ids.remove(request_id)
+                if self.cancel_overload_id == request_id:
+                    self.cancel_overload_id = None
 
     def withdrawal_done(self, task):
         self.withdrawal_slots.release()
@@ -575,9 +684,7 @@ class Server:
                     raise ProtocolError("Invalid native fork reference")
                 return await session.prompt(params.get("prompt"), metadata.get("aelix/requestId"), anchor)
         if method == "session/cancel":
-            session_id = require_string(params.get("sessionId"), "sessionId")
-            session = self.pending_stop_sessions.get(session_id) or self.session(params)
-            await session.cancel()
+            await self.stop_session(params).cancel()
             return {}
         if method in ("session/set_mode", "session/set_model", "session/set_config_option"):
             session = self.session(params)
@@ -711,6 +818,7 @@ class Server:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, stop)
                 installed_signals.append(sig)
+        cancel_writer = asyncio.create_task(self.write_cancel_replies())
         eof = False
         try:
             while line := await reader.readline():
@@ -737,17 +845,24 @@ class Server:
                             else:
                                 future.set_exception(ProtocolError("Client response result must be an object"))
                     continue
-                if not self.initialized and message["method"] not in ("initialize",):
+                request_id = message.get("id")
+                if message["method"] == "session/cancel":
+                    if request_id not in self.active_request_ids:
+                        if self.initialized:
+                            self.admit_cancel(request_id, message.get("params", {}))
+                        else:
+                            self.reserve_cancel_reply(request_id, error=ProtocolError("Call initialize first", -32600))
+                    continue
+                if not self.initialized and message["method"] != "initialize":
                     if message.get("id") is not None:
                         self.queue_validation_error({"jsonrpc": "2.0", "id": message["id"],
                                                      "error": {"code": -32600, "message": "Call initialize first"}})
                     continue
-                request_id = message.get("id")
                 if request_id is not None and request_id in self.active_request_ids:
                     self.queue_validation_error({"jsonrpc": "2.0", "id": request_id,
                                                  "error": {"code": -32600, "message": "Duplicate active request id"}})
                     continue
-                if len(self.tasks) >= 64 and message["method"] != "session/cancel":
+                if len(self.tasks) >= 64:
                     if request_id is not None:
                         self.queue_validation_error({"jsonrpc": "2.0", "id": request_id,
                                                      "error": {"code": -32000, "message": "Too many concurrent requests"}})
@@ -765,6 +880,8 @@ class Server:
             reader.close()
             self.closing = True
             tasks = self.tasks | self.validation_replies | self.withdrawals
+            tasks.update(pending.task for pending in self.cancel_tasks.values())
+            tasks.add(cancel_writer)
             for task in tasks:
                 task.cancel()
             if self.output:
