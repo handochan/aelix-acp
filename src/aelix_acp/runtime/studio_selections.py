@@ -69,7 +69,11 @@ def file_label(kind):
 
 
 def project_target(session, kind, scopes):
-    project = scopes["project"]["path"]
+    status = scopes["project"]
+    # In particular, native does not inspect an untrusted project's files.
+    if status["writable"] is not True:
+        return None
+    project = status["path"]
     try:
         target = Path(session.cwd) / file_label(kind)
         if not isinstance(project, str) or Path(project) != target:
@@ -203,7 +207,7 @@ def exposed_scope(kind, scope, status, safe_target):
     if scope == "global":
         return {"exists": exists, "writable": False, "reason": "management-helper"}
     reason = status["reason"]
-    if not safe_target:
+    if writable and not safe_target:
         reason, writable = "scope-readonly", False
     elif writable:
         reason = None

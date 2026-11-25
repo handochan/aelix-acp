@@ -524,6 +524,24 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.call("selections-set-mcp"), CASES["relay-error-scope-readonly"]["result"])
         self.assertFalse(self.mutations)
 
+    async def test_readonly_native_scope_never_opens_project_file(self):
+        project = self.snapshots["skill"]["scopes"]["project"]
+        project.update(writable=False, reason="this folder is not trusted", exists=False)
+        # A project file is physically present even though native declines to inspect it.
+        self.assertTrue(Path(project["path"]).is_file())
+        for case in ("selections-list-skill", "selections-set-skill"):
+            with self.subTest(case=case), patch.object(
+                studio_selections, "target_stamp", wraps=studio_selections.target_stamp
+            ) as probe:
+                result = await self.call(case)
+                probe.assert_not_called()
+                if case == "selections-list-skill":
+                    self.assertEqual(result["scopes"]["project"],
+                                     {"writable": False, "reason": "untrusted-project", "exists": False})
+                else:
+                    self.assertEqual(result, CASES["relay-error-scope-readonly"]["result"])
+        self.assertFalse(self.mutations)
+
     async def test_project_directory_replaced_after_dispatch_is_outcome_unknown(self):
         project = self.root / ".aelix"
         project.mkdir(exist_ok=True)
