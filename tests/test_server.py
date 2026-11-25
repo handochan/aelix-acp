@@ -145,10 +145,15 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(self.session.id, self.server.sessions)
 
     async def test_transcript_tool_with_unresolvable_home_keeps_its_card(self):
-        path = "~aelix_acp_test_user_that_does_not_exist/file.txt"
+        path = "~fixture-user/file.txt"
         message = {"role": "assistant", "content": [{"type": "toolCall", "tool_call_id": "read-1",
                                                      "tool_name": "read", "input": {"path": path}}]}
-        card, = self.server.native_message_updates(self.session, message, canonical=True)
+        with patch.object(
+            Path, "expanduser", autospec=True, side_effect=RuntimeError("Home directory unavailable")
+        ) as expand:
+            card, = self.server.native_message_updates(self.session, message, canonical=True)
+        expand.assert_called_once_with(Path(path))
+        self.assertEqual(card["sessionUpdate"], "tool_call")
         self.assertEqual(card["toolCallId"], "read-1")
         self.assertEqual(card["rawInput"], {"path": path})
         self.assertNotIn("locations", card)
