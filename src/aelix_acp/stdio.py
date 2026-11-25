@@ -14,11 +14,12 @@ import time
 class StdinReader:
     """Read newline frames in a daemon with bounded queue/backpressure on every OS."""
 
-    def __init__(self, limit=16 * 1024 * 1024, fd=None):
+    def __init__(self, limit=16 * 1024 * 1024, fd=None, *, on_eof=None):
         self.loop = asyncio.get_running_loop()
         self.queue = asyncio.Queue(maxsize=2)
         self.stopped = threading.Event()
         self.limit = limit
+        self.on_eof = on_eof
         self.fd = sys.stdin.fileno() if fd is None else fd
         if sys.platform == "win32":
             import msvcrt
@@ -46,15 +47,24 @@ class StdinReader:
         future.cancel()
         return False
 
+    def _end_input(self, tail=b""):
+        # Wake a dispatcher waiting for reply capacity even when the input
+        # queue is full and delivering the terminal marker must wait.
+        if self.on_eof is not None:
+            try:
+                self.loop.call_soon_threadsafe(self.on_eof)
+            except RuntimeError:
+                return
+        if not tail or self._deliver(tail):
+            self._deliver(b"")
+
     def _pump(self):
         buffer = b""
         try:
             while not self.stopped.is_set():
                 chunk = os.read(self.fd, 4096)
                 if not chunk:
-                    if buffer and not self._deliver(buffer):
-                        return
-                    self._deliver(b"")
+                    self._end_input(buffer)
                     return
                 buffer += chunk
                 while b"\n" in buffer:
@@ -68,7 +78,7 @@ class StdinReader:
                     self._deliver(ValueError("ACP input frame exceeds limit"))
                     return
         except OSError:
-            self._deliver(b"")
+            self._end_input()
 
     async def readline(self):
         item = await self.queue.get()

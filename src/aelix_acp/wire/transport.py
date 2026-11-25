@@ -15,6 +15,55 @@ from .errors import ProtocolError
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 
 
+class ErrorReplies:
+    """Lossless ID-bearing rejections, bounded across queue and active write."""
+    def __init__(self, byte_limit=512 * 1024, item_limit=4096):
+        self.byte_limit = byte_limit
+        self.item_limit = item_limit
+        self.bytes = 0
+        self.count = 0
+        self.queue = asyncio.Queue(maxsize=item_limit)
+        self.space = asyncio.Event()
+        self.eof = False
+
+    def end_input(self):
+        self.eof = True
+        self.space.set()
+
+    async def put(self, raw):
+        # One frame larger than the byte budget can occupy the lane alone.
+        # The input frame limit bounds its ID. Only the stdin producer waits.
+        while self.count and (self.count >= self.item_limit or self.bytes + len(raw) > self.byte_limit):
+            if self.eof:
+                raise EOFError
+            self.space.clear()
+            await self.space.wait()
+        self.count += 1
+        self.bytes += len(raw)
+        self.queue.put_nowait(raw)
+
+    async def run(self, send):
+        while True:
+            raw = await self.queue.get()
+            try:
+                await send(raw)
+            finally:
+                self.count -= 1
+                self.bytes -= len(raw)
+                del raw
+                self.space.set()
+
+
+class InvalidFrame(ProtocolError):
+    """Preserve a usable JSON-RPC ID when rejecting a decoded frame."""
+    def __init__(self, message, code, envelope=None):
+        super().__init__(message, code)
+        key = envelope.get("id") if isinstance(envelope, dict) and "method" in envelope else None
+        self.request_id = key if (type(key) is int or (
+            isinstance(key, str) and key and not any(0xD800 <= ord(c) <= 0xDFFF for c in key)
+        )) else None
+
+
 class StdoutWriter:
     """Bounded daemon writes without blocking the loop or Python buffer locks."""
     def __init__(self, fd=None, *, on_failure=None):
@@ -113,7 +162,8 @@ def encode_frame(message: dict) -> bytes:
 
 def decode_frame(raw: bytes) -> dict:
     if len(raw) > MAX_FRAME_BYTES:
-        raise ProtocolError("JSON-RPC frame exceeds the byte limit", -32600)
+        raise InvalidFrame("JSON-RPC frame exceeds the byte limit", -32600)
+    value = None
     try:
         value = json.loads(raw, parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()))
         pending = [value]
@@ -133,19 +183,19 @@ def decode_frame(raw: bytes) -> dict:
             elif isinstance(entry, list):
                 pending.extend(entry)
     except (UnicodeDecodeError, ValueError, RecursionError):
-        raise ProtocolError("Invalid JSON", -32700) from None
+        raise InvalidFrame("Invalid JSON", -32700, value) from None
     if not isinstance(value, dict) or value.get("jsonrpc") != "2.0":
-        raise ProtocolError("Invalid JSON-RPC envelope", -32600)
+        raise InvalidFrame("Invalid JSON-RPC envelope", -32600, value)
     request_id = value.get("id")
     if request_id is not None and (type(request_id) not in (int, str) or (isinstance(request_id, str) and not request_id)):
-        raise ProtocolError("Invalid JSON-RPC id", -32600)
+        raise InvalidFrame("Invalid JSON-RPC id", -32600, value)
     if "method" in value:
         if "id" in value and request_id is None:
-            raise ProtocolError("ACP request ids cannot be null", -32600)
+            raise InvalidFrame("ACP request ids cannot be null", -32600, value)
         if not isinstance(value["method"], str) or not value["method"]:
-            raise ProtocolError("Invalid JSON-RPC method", -32600)
+            raise InvalidFrame("Invalid JSON-RPC method", -32600, value)
         if not isinstance(value.get("params", {}), dict):
-            raise ProtocolError("ACP params must be an object", -32602)
+            raise InvalidFrame("ACP params must be an object", -32602, value)
     elif "id" not in value or ("result" in value) == ("error" in value):
-        raise ProtocolError("Invalid JSON-RPC response", -32600)
+        raise InvalidFrame("Invalid JSON-RPC response", -32600, value)
     return value

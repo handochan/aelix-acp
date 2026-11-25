@@ -29,7 +29,7 @@ from .runtime.controls import MODE_IDS
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
 from .stdio import StdinReader, offer_stderr, write_diagnostic
-from .wire.transport import decode_frame, encode_frame, StdoutWriter
+from .wire.transport import decode_frame, encode_frame, ErrorReplies, InvalidFrame, StdoutWriter
 from .runtime.extensions import run_extension_action, require_consent
 from .runtime.leases import acquire as acquire_lease
 from .runtime.leases import lease_path
@@ -54,7 +54,7 @@ MANAGE_ACTIONS = frozenset({"resources/list", "resources/reload", "settings/get"
 CLIENT_REQUEST_SECONDS = 290
 STDOUT_DRAIN_SECONDS = 1
 MAX_WITHDRAWABLE_REQUESTS = 256
-MAX_CANCEL_RESPONSES = 64  # Includes one overload reply.
+MAX_CANCEL_RESPONSES = 64
 MAX_CANCEL_RESPONSE_ID_BYTES = 4096
 
 
@@ -84,10 +84,10 @@ class Server:
         self.response_limits = {}
         self.tasks = set()
         self.validation_replies = set()
+        self.error_replies = ErrorReplies()
         self.cancel_tasks = {}
         self.cancel_replies = asyncio.Queue(MAX_CANCEL_RESPONSES)
         self.cancel_reply_ids = set()
-        self.cancel_overload_id = None
         self.withdrawals = set()
         self.withdrawal_slots = asyncio.BoundedSemaphore(MAX_WITHDRAWABLE_REQUESTS)
         self.cleanup_tasks = set()
@@ -99,12 +99,15 @@ class Server:
         self.managed_extensions = getattr(args, "managed_extensions", None)
 
     async def send(self, message, *, before_send=None):
+        await self._send_frame(message, before_send=before_send)
+
+    async def _send_frame(self, payload, *, before_send=None):
         async with self.output_lock:
             if self.output_error is not None:
                 raise self.output_error
             if self.closing:
                 raise BrokenPipeError("ACP server is closing")
-            raw = encode_frame(message)
+            raw = payload if isinstance(payload, bytes) else encode_frame(payload)
             if self.output is None:
                 self.output = StdoutWriter(on_failure=self.output_failed)
             if before_send is None:
@@ -123,11 +126,13 @@ class Server:
             if not self.closing and self.output_error is None:
                 write_diagnostic(f"[aelix-acp] Request task failed: {type(error).__name__}")
 
-    def queue_validation_error(self, message):
-        # A bounded reply backlog keeps stdin readable during invalid-input
-        # floods. Its overflow drops whole messages before they reach stdout.
-        if not self.closing and len(self.validation_replies) < 16:
-            task = asyncio.create_task(self.send(message))
+    async def reject(self, request_id, code, message):
+        response = {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+        if request_id is not None:
+            await self.error_replies.put(encode_frame(response))
+        elif not self.closing and len(self.validation_replies) < 16:
+            # Unidentifiable input has its own best-effort error budget.
+            task = asyncio.create_task(self.send(response))
             self.validation_replies.add(task)
             task.add_done_callback(lambda done: self.task_done(self.validation_replies, done))
 
@@ -135,11 +140,11 @@ class Server:
         session_id = require_string(params.get("sessionId"), "sessionId")
         return self.pending_stop_sessions.get(session_id) or self.session(params)
 
-    def admit_cancel(self, request_id, params):
+    async def admit_cancel(self, request_id, params):
         try:
             session = self.stop_session(params)
         except ProtocolError as error:
-            self.reserve_cancel_reply(request_id, error=error)
+            await self.reserve_cancel_reply(request_id, error=error)
             return
 
         pending = self.cancel_tasks.get(session.id)
@@ -148,6 +153,9 @@ class Server:
         if (pending is None or pending.task.done() or pending.session is not session
                 or pending.generation != generation
                 or (management is not None and pending.management_task is not management)):
+            if not session.begin_cancel():
+                await self.reserve_cancel_reply(request_id)
+                return
             previous = pending.task if pending is not None and not pending.task.done() else None
             if previous is not None:
                 previous.cancel()
@@ -156,14 +164,14 @@ class Server:
             task.add_done_callback(lambda done: self.cancel_done(session.id, done))
         else:
             task = pending.task
-        self.reserve_cancel_reply(request_id, task=task)
+        await self.reserve_cancel_reply(request_id, task=task)
 
     async def run_cancel(self, session, generation, previous):
         if previous is not None:
             # Release the previous turn's RPC wait before issuing the new Stop.
             await asyncio.gather(previous, return_exceptions=True)
         if session.cancel_generation == generation:
-            await session.cancel()
+            await session.cancel_native()
 
     def cancel_done(self, session_id, task):
         pending = self.cancel_tasks.get(session_id)
@@ -172,19 +180,17 @@ class Server:
         if not task.cancelled() and (error := task.exception()) is not None and not self.closing:
             write_diagnostic(f"[aelix-acp] Native cancel failed: {type(error).__name__}")
 
-    def reserve_cancel_reply(self, request_id, *, task=None, error=None):
-        # ACP Stop is a notification. Its optional compatibility reply has a
-        # separate budget, so the Stop itself and other notifications can proceed.
-        if request_id is None or sys.getsizeof(request_id) > MAX_CANCEL_RESPONSE_ID_BYTES:
+    async def reserve_cancel_reply(self, request_id, *, task=None, error=None):
+        if request_id is None:
             return
-        occupied = len(self.cancel_reply_ids) - (self.cancel_overload_id is not None)
-        if occupied >= MAX_CANCEL_RESPONSES - 1:
-            if self.cancel_overload_id is not None:
-                return
-            self.cancel_overload_id = request_id
-            error = ProtocolError("Too many pending cancel responses", -32000)
-            task = None
-
+        # Native Stop was admitted first. Even if this producer must now
+        # wait for error-output space, the native operation can proceed.
+        if sys.getsizeof(request_id) > MAX_CANCEL_RESPONSE_ID_BYTES:
+            await self.reject(request_id, -32000, "Cancel response ID exceeds the reservation limit")
+            return
+        if len(self.cancel_reply_ids) >= MAX_CANCEL_RESPONSES:
+            await self.reject(request_id, -32000, "Too many pending cancel responses")
+            return
         self.active_request_ids.add(request_id)
         self.cancel_reply_ids.add(request_id)
         if task is None:
@@ -222,8 +228,6 @@ class Server:
             finally:
                 self.active_request_ids.remove(request_id)
                 self.cancel_reply_ids.remove(request_id)
-                if self.cancel_overload_id == request_id:
-                    self.cancel_overload_id = None
 
     def withdrawal_done(self, task):
         self.withdrawal_slots.release()
@@ -804,8 +808,22 @@ class Server:
         finally:
             self.active_request_ids.discard(request_id)
 
+    async def start_request(self, message):
+        # Starting a handler is ordered, even if readline() can immediately
+        # return another buffered frame. Its I/O and completion run concurrently.
+        started = asyncio.Event()
+
+        async def handle():
+            started.set()
+            await self.handle(message)
+
+        task = asyncio.create_task(handle())
+        self.tasks.add(task)
+        task.add_done_callback(lambda done: self.task_done(self.tasks, done))
+        await started.wait()
+
     async def run(self):
-        reader = StdinReader()
+        reader = StdinReader(on_eof=self.error_replies.end_input)
         loop = asyncio.get_running_loop()
         self.run_task = run_task = asyncio.current_task()
 
@@ -819,14 +837,14 @@ class Server:
                 loop.add_signal_handler(sig, stop)
                 installed_signals.append(sig)
         cancel_writer = asyncio.create_task(self.write_cancel_replies())
+        error_writer = asyncio.create_task(self.error_replies.run(self._send_frame))
         eof = False
         try:
             while line := await reader.readline():
                 try:
                     message = decode_frame(line)
-                except ProtocolError as error:
-                    self.queue_validation_error({"jsonrpc": "2.0", "id": None,
-                                                 "error": {"code": error.code, "message": str(error)}})
+                except InvalidFrame as error:
+                    await self.reject(error.request_id, error.code, str(error))
                     continue
                 if "method" not in message:
                     future = self.pending.get(message.get("id"))
@@ -846,33 +864,26 @@ class Server:
                                 future.set_exception(ProtocolError("Client response result must be an object"))
                     continue
                 request_id = message.get("id")
-                if message["method"] == "session/cancel":
-                    if request_id not in self.active_request_ids:
-                        if self.initialized:
-                            self.admit_cancel(request_id, message.get("params", {}))
-                        else:
-                            self.reserve_cancel_reply(request_id, error=ProtocolError("Call initialize first", -32600))
+                if request_id is not None and request_id in self.active_request_ids:
+                    await self.reject(request_id, -32600, "Duplicate active request id")
                     continue
                 if not self.initialized and message["method"] != "initialize":
-                    if message.get("id") is not None:
-                        self.queue_validation_error({"jsonrpc": "2.0", "id": message["id"],
-                                                     "error": {"code": -32600, "message": "Call initialize first"}})
+                    if request_id is not None:
+                        await self.reject(request_id, -32600, "Call initialize first")
                     continue
-                if request_id is not None and request_id in self.active_request_ids:
-                    self.queue_validation_error({"jsonrpc": "2.0", "id": request_id,
-                                                 "error": {"code": -32600, "message": "Duplicate active request id"}})
+                if message["method"] == "session/cancel":
+                    await self.admit_cancel(request_id, message.get("params", {}))
                     continue
                 if len(self.tasks) >= 64:
                     if request_id is not None:
-                        self.queue_validation_error({"jsonrpc": "2.0", "id": request_id,
-                                                     "error": {"code": -32000, "message": "Too many concurrent requests"}})
+                        await self.reject(request_id, -32000, "Too many concurrent requests")
                     continue
                 if request_id is not None:
                     self.active_request_ids.add(request_id)
-                task = asyncio.create_task(self.handle(message))
-                self.tasks.add(task)
-                task.add_done_callback(lambda done: self.task_done(self.tasks, done))
+                await self.start_request(message)
             eof = True
+        except EOFError:
+            eof = True  # EOF observed while stdin admission was waiting on stdout.
         except asyncio.CancelledError:
             if self.output_error is None:
                 raise
@@ -881,7 +892,7 @@ class Server:
             self.closing = True
             tasks = self.tasks | self.validation_replies | self.withdrawals
             tasks.update(pending.task for pending in self.cancel_tasks.values())
-            tasks.add(cancel_writer)
+            tasks.update((cancel_writer, error_writer))
             for task in tasks:
                 task.cancel()
             if self.output:

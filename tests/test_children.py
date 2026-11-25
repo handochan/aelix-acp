@@ -751,7 +751,7 @@ class VoidQuestionTests(Base):
             def close(self):
                 pass
         before = len(self.events)
-        with patch("aelix_acp.server.StdinReader", Input):
+        with patch("aelix_acp.server.StdinReader", return_value=Input()):
             await asyncio.wait_for(self.server.run(), 10)
         self.assertEqual((self.server.closing, self.session.questions, "session" in self.server.sessions),
                          (True, {}, False))
@@ -1406,6 +1406,30 @@ class CadenceTests(Base):
             for task in (reader, turn, *([cancel] if cancel else [])):
                 task.cancel()
             await asyncio.gather(reader, turn, *([cancel] if cancel else []), return_exceptions=True)
+
+    async def test_old_cancel_cannot_abort_a_new_turn_after_native_stdin_drain(self):
+        self.session.controls.capabilities = {"methods": ["commands/cancel"]}
+        draining, release = asyncio.Event(), asyncio.Event()
+        sent = []
+
+        async def rpc(command, **params):
+            method = params.get("method", command)
+            sent.append(method)
+            if method == "commands/cancel":
+                draining.set()
+                await release.wait()
+            return {}
+
+        self.session.rpc = rpc
+        stop = asyncio.create_task(self.session.cancel())
+        try:
+            await asyncio.wait_for(draining.wait(), 2)
+            self.session.reset_cancellation()
+        finally:
+            release.set()
+            await asyncio.wait_for(stop, 2)
+        self.assertEqual(sent, ["commands/cancel"])
+        self.assertFalse(self.session.cancelled)
 
     async def test_a_second_client_cancel_is_obeyed_at_once(self):
         """Guard: each client cancel aborts at once, as on a78db59."""

@@ -63,23 +63,31 @@ pauses at the in-flight notification and the bounded native pipe applies
 backpressure to later frames.
 
 `session/cancel` is an [ACP notification](https://agentclientprotocol.com/protocol/v1/prompt-turn#cancellation).
-The first Stop for each session runs through the dedicated cancel path even
-when all 64 ordinary request slots are occupied. Duplicate Stops for the same
-work join the outstanding native cancel. A Stop for newer work supersedes
-the old response wait before sending the new cancel to native. An
-ID attached to the superseded wait receives a `-32000` response.
+The reader starts handlers in input order. A new prompt establishes its cancel
+generation before its first wait and keeps it through compaction recovery.
+Stop applies to that admitted turn immediately. Duplicate Stops share the
+native cancel. A Stop for newer work retires the older native acknowledgement
+wait, whose ID-bearing requests receive a superseded error.
 
-For clients that attach an ID, one writer handles up to 63 pending Stop
-responses globally and one reserved overload error (`-32000`). Each retained
-ID has a 4 KiB storage limit. When both budgets are full or an ID is oversized,
-the Stop has notification semantics. The original prompt response
-still reports the turn outcome, and approval withdrawals keep their slots.
+Each addressable request receives one result or error with the original ID
+while the connection stays open. Stop admission is independent of the 64
+ordinary requests. Up to 64 ID-bearing Stops can wait for native outcomes,
+with a 4 KiB storage allowance per reserved ID. At either limit the Stop
+still takes effect, and ACP queues a serialized overload error with the full ID.
+Duplicate active IDs receive a correlated invalid-request error for each
+duplicate frame.
 
-Validation errors use a backlog of 16 replies. At capacity, ACP discards new
-validation replies before writing any bytes. Each of up to 256 outstanding
-child approval requests reserves its own withdrawal slot until the client
-answers or the withdrawal is delivered. At capacity, ACP denies a new child
-approval without opening a client dialog.
+A separate writer for identified errors holds up to 4,096 frames and 512 KiB,
+including its active write. A larger error can occupy this buffer alone. Its
+size is bounded by the input frame limit plus its error envelope. At capacity
+the reader waits with one staged error until stdout drains. The two-frame
+stdin queue then backpressures the client. Control already admitted continues
+running, and later input resumes in wire order. Unidentifiable input retains
+a separate best-effort budget of 16 error replies.
+
+Each of up to 256 outstanding child approval requests reserves its own
+withdrawal slot until the client answers or the withdrawal is delivered.
+At capacity, ACP denies a new child approval before opening a client dialog.
 
 Native stderr drains continuously into a shared best-effort sink. A full
 inherited stderr queue can discard whole chunks and diagnostics.

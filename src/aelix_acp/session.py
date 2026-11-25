@@ -1317,10 +1317,13 @@ class Session:
                 await asyncio.gather(request, return_exceptions=True)
         return None if void.done() else request.result()
 
-    async def restart(self, *, extensions=None, trust_project=None, agents_enabled=None, preserve_history=False):
+    async def restart(self, *, extensions=None, trust_project=None, agents_enabled=None, preserve_history=False,
+                      preserve_cancellation=False):
         if self.id in self.server.starting_ids:
             raise ProtocolError("Session is already starting", -32000)
         self.server.starting_ids.add(self.id)
+        if preserve_cancellation:
+            self.server.pending_stop_sessions[self.id] = self
         # Children actions are refused until this returns; close() below ends those in flight.
         self.changing += 1
         self.invalidate_image_acceptance()
@@ -1352,7 +1355,8 @@ class Session:
             self._close_task = None
             self.failure = None
             self.rpc_closed = False
-            self.reset_cancellation()
+            if not preserve_cancellation:
+                self.reset_cancellation()
             if extensions is not None:
                 self.extra_extensions = extensions
             if trust_project is not None:
@@ -1472,11 +1476,11 @@ class Session:
                 -32003 if cancelled else -32004, details,
             ) from failure
 
-    async def recover_after_compaction(self):
+    async def recover_after_compaction(self, *, for_prompt=False):
         if not self.compaction_recovery_needed:
             return
         try:
-            await self.restart(preserve_history=True)
+            await self.restart(preserve_history=True, preserve_cancellation=for_prompt)
         finally:
             self.server.sessions[self.id] = self
         self.compaction_recovery_needed = False
@@ -1490,10 +1494,11 @@ class Session:
         prior = recorded_turn(self.server.db, self.id, key, fingerprint)
         if prior is not None:
             return prior
-        if self.compaction_recovery_needed:
-            # Claim the key only after recovery holds the lease.
-            await self.recover_after_compaction()
+        # Establish the turn before its first suspension. A later wire Stop
+        # addresses this generation throughout recovery and receipt admission.
         self.reset_cancellation()
+        if self.compaction_recovery_needed:
+            await self.recover_after_compaction(for_prompt=True)
         prior = await write_store(self.server.args.state_dir, begin_turn, self.id, key, fingerprint,
                                   diagnostic="turn_receipt_write_failed")
         if prior is not None:
@@ -1718,15 +1723,15 @@ class Session:
         with contextlib.suppress(ProtocolError, TimeoutError):
             await self.rpc("abort", _timeout=5)
 
-    async def cancel(self, *, again=False):
-        """Cancel the turn. `again`: the turn's own re-cancel, sent only once an abort is due."""
+    def begin_cancel(self):
+        """Apply Stop to the admitted turn and its dialogs before any I/O."""
         # Every open child question ends, during a manual /compact too (fix round 1, P-LOW-3).
         # An extension's dialog opened during /compact stays open: the compaction goes on.
         self.void_questions(lambda key: True)
         if self.context.manual_compaction:
             # Classic RPC abort only interrupts native turns and retries.
             # Keep waiting for the actual manual compaction outcome.
-            return
+            return False
         self.cancelled = True
         self.invalidate_image_acceptance()
         self.image_epoch = None
@@ -1735,6 +1740,14 @@ class Session:
             self.management_task.cancel()
         for task in [*self.permission_connections, *self.permissions, *self.ui_tasks]:
             task.cancel()
+        return True
+
+    async def cancel(self, *, again=False):
+        if self.begin_cancel():
+            await self.cancel_native(again=again)
+
+    async def cancel_native(self, *, again=False):
+        generation = self.cancel_generation
         if again and not self.abort_due():
             return
         aborts = self.aborts
@@ -1745,7 +1758,8 @@ class Session:
                 await self.rpc("aelix_control", method="commands/cancel", params={}, _await_response=False)
         # The turn's poll may have aborted while the native stdin buffer drained.
         # That was this cancel's one abort.
-        if self.proc and self.proc.returncode is None and self.aborts == aborts:
+        if (self.proc and self.proc.returncode is None and self.aborts == aborts
+                and self.cancel_generation == generation):
             await self.abort()
 
     async def close(self):
