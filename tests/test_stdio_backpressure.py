@@ -68,6 +68,41 @@ entry.main()
 """
 
 
+NATIVE_PROMPT = FAKE_CHILD.replace(
+    'for line in sys.stdin:',
+    'METHODS.append("commands/cancel")\nstreaming = False\nfor line in sys.stdin:',
+).replace(
+    '    if request["type"]=="get_commands":',
+    '''    if request["type"] == "prompt":
+        streaming = True
+        print(json.dumps({"type": "response", "id": request["id"], "success": True}), flush=True)
+        if request["message"] == "stream":
+            print(json.dumps({"type": "message_update", "assistantMessageEvent": {
+                "type": "text_delta", "delta": "x" * 2**20,
+            }}), flush=True)
+        else:
+            print(json.dumps({"type": "extension_ui_request", "id": "child-question",
+                "method": "childApproval", "child": {"id": "child", "epoch": "epoch"},
+                "tool": {"callId": "call", "name": "write", "args": {}},
+                "choices": [{"id": "yes", "kind": "allow_once"}],
+            }), flush=True)
+        continue
+    if request["type"] == "extension_ui_response":
+        answer = Path("native-approval-answer.tmp")
+        answer.write_text(json.dumps(request), encoding="utf-8")
+        answer.replace("native-approval-answer")
+        continue
+    if request["type"] == "abort":
+        streaming = False
+        Path("native-abort").touch()
+    if request.get("method") == "commands/cancel":
+        Path("native-commands-cancel").touch()
+    if request["type"] == "get_state":
+        data = {"isStreaming": streaming}
+    elif request["type"]=="get_commands":'''
+)
+
+
 class BackpressureTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -110,8 +145,8 @@ class BackpressureTests(unittest.TestCase):
         except queue.Empty:
             self.fail("ACP stdout did not produce a complete frame")
 
-    def wait_for(self, name):
-        deadline = time.monotonic() + 10
+    def wait_for(self, name, timeout=10):
+        deadline = time.monotonic() + timeout
         marker = self.root / name
         while not marker.exists() and self.proc.poll() is None and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -152,6 +187,57 @@ class BackpressureTests(unittest.TestCase):
             self.assertEqual(self.reply()["error"]["message"], "Too many concurrent requests")
         self.proc.stdin.close()
         self.assertEqual(self.proc.wait(timeout=5), 0)
+
+    def start_native_prompt(self, text):
+        native = self.root / "prompt_native.py"
+        native.write_text(NATIVE_PROMPT, encoding="utf-8")
+        self.start("--aelix", sys.executable, f"--aelix-arg={native}")
+        self.send("session/new", 2, {"cwd": str(self.root), "mcpServers": []})
+        opened = self.reply_until(lambda frame: frame.get("id") == 2)
+        session = opened["result"]["sessionId"]
+        self.send("session/prompt", 4, {"sessionId": session, "prompt": [{"type": "text", "text": text}]})
+        return session
+
+    def reply_until(self, match, *, seen=None):
+        for _ in range(32):
+            frame = self.reply()
+            if match(frame):
+                return frame
+            if seen is not None:
+                seen.append(frame)
+        self.fail("ACP stdout did not produce the expected frame")
+
+    def test_cancel_sends_abort_while_a_native_prompt_update_fills_stdout(self):
+        session = self.start_native_prompt("stream")
+        self.wait_for("stdout-active")
+        self.send("session/cancel", params={"sessionId": session})
+        self.wait_for("native-abort", timeout=2)
+        self.assertTrue((self.root / "native-commands-cancel").exists())
+        update = self.reply_until(lambda frame: frame.get("params", {}).get("update", {}).get("sessionUpdate")
+                                  == "agent_message_chunk")
+        self.assertEqual(update["params"]["update"]["content"]["text"], "x" * 2**20)
+        self.assertEqual(self.reply_until(lambda frame: frame.get("id") == 4)["result"], {"stopReason": "cancelled"})
+        self.proc.stdin.close()
+        self.assertEqual(self.proc.wait(timeout=10), 0)
+
+    def test_child_approval_withdrawal_survives_a_full_validation_backlog(self):
+        session = self.start_native_prompt("ask")
+        permission = self.reply_until(lambda frame: frame.get("method") == "session/request_permission")
+        self.large_reply()
+        self.write(b"{invalid JSON\n" * 16)
+        self.send("session/cancel", params={"sessionId": session})
+        self.wait_for("native-approval-answer")
+        native = json.loads((self.root / "native-approval-answer").read_text(encoding="utf-8"))
+        self.assertEqual(native, {"type": "extension_ui_response", "id": "child-question", "cancelled": True})
+        self.assertEqual(len(self.reply()["result"]["text"]), 2**20)
+        self.send("session/list", 5)
+        seen = []
+        self.reply_until(lambda frame: frame.get("id") == 5, seen=seen)
+        self.assertEqual([frame["error"]["code"] for frame in seen if "error" in frame], [-32700] * 16)
+        self.assertIn({"jsonrpc": "2.0", "method": "$/cancel_request",
+                       "params": {"requestId": permission["id"]}}, seen)
+        self.proc.stdin.close()
+        self.assertEqual(self.proc.wait(timeout=10), 0)
 
     def test_eof_drains_a_started_frame_without_starting_the_next(self):
         self.start()

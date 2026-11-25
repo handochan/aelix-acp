@@ -706,10 +706,11 @@ class Session:
                 except ProtocolError as error:
                     write_diagnostic(error.data["kind"])
 
-    async def rpc(self, command, *, _timeout=45, _image_write=None, _project_history=False, **kwargs):
+    async def rpc(self, command, *, _timeout=45, _image_write=None, _project_history=False, _await_response=True, **kwargs):
         request_id = uuid.uuid4().hex
-        future = asyncio.get_running_loop().create_future()
-        self.pending[request_id] = future
+        future = asyncio.get_running_loop().create_future() if _await_response else None
+        if future is not None:
+            self.pending[request_id] = future
         if _project_history:
             self.history_requests.add(request_id)
         if (task := asyncio.current_task()) in self.interventions:
@@ -737,6 +738,8 @@ class Session:
             if self.turn_active and command not in ("steer", "follow_up") and command not in READ_ONLY_COMMANDS and not (
                     command == "aelix_control" and kwargs.get("method") in READ_ONLY_CONTROLS | CONCURRENT_CONTROLS):
                 self.dispatched = True
+            if future is None:
+                return
             try:
                 return await asyncio.wait_for(future, _timeout)
             except TimeoutError:
@@ -1732,9 +1735,11 @@ class Session:
         aborts = self.aborts
         if "commands/cancel" in self.controls.capabilities.get("methods", []) and self.proc and self.proc.returncode is None:
             with contextlib.suppress(ProtocolError, TimeoutError):
-                await self.rpc("aelix_control", method="commands/cancel", params={}, _timeout=5)
-        # The turn's poll may have aborted while commands/cancel waited: that was
-        # this cancel's one abort (fix round 1, Codex C-M2).
+                # Native output may be held behind an ACP notification. Send
+                # both controls in order without requiring the first reply.
+                await self.rpc("aelix_control", method="commands/cancel", params={}, _await_response=False)
+        # The turn's poll may have aborted while the native stdin buffer drained.
+        # That was this cancel's one abort.
         if self.proc and self.proc.returncode is None and self.aborts == aborts:
             await self.abort()
 

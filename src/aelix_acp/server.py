@@ -52,6 +52,7 @@ MANAGE_ACTIONS = frozenset({"resources/list", "resources/reload", "settings/get"
 # How long the adapter waits for the client's answer to a request it sent, unless the caller says.
 CLIENT_REQUEST_SECONDS = 290
 STDOUT_DRAIN_SECONDS = 1
+MAX_WITHDRAWABLE_REQUESTS = 256
 
 
 class Server:
@@ -71,7 +72,9 @@ class Server:
         self.pending = {}
         self.response_limits = {}
         self.tasks = set()
-        self.replies = set()
+        self.validation_replies = set()
+        self.withdrawals = set()
+        self.withdrawal_slots = asyncio.BoundedSemaphore(MAX_WITHDRAWABLE_REQUESTS)
         self.cleanup_tasks = set()
         self.closing = False  # The client is gone: sessions end without sending.
         self.output_lock = asyncio.Lock()
@@ -105,13 +108,17 @@ class Server:
             if not self.closing and self.output_error is None:
                 write_diagnostic(f"[aelix-acp] Request task failed: {type(error).__name__}")
 
-    def queue_reply(self, message):
+    def queue_validation_error(self, message):
         # A bounded reply backlog keeps stdin readable during invalid-input
         # floods. Its overflow drops whole messages before they reach stdout.
-        if not self.closing and len(self.replies) < 16:
+        if not self.closing and len(self.validation_replies) < 16:
             task = asyncio.create_task(self.send(message))
-            self.replies.add(task)
-            task.add_done_callback(lambda done: self.task_done(self.replies, done))
+            self.validation_replies.add(task)
+            task.add_done_callback(lambda done: self.task_done(self.validation_replies, done))
+
+    def withdrawal_done(self, task):
+        self.withdrawal_slots.release()
+        self.task_done(self.withdrawals, task)
 
     async def forward_stderr(self, raw):
         if sys.stderr is not None:
@@ -126,6 +133,12 @@ class Server:
         answered is taken back with ACP's `$/cancel_request`, which a client may
         ignore; its later answer is then dropped.
         """
+        if withdraw:
+            # Reserve delivery before displaying a question. Validation errors
+            # cannot consume these slots, even while stdout is backed up.
+            if self.withdrawal_slots.locked():
+                raise ProtocolError("Too many outstanding child approval requests", -32000)
+            await self.withdrawal_slots.acquire()
         request_id = "acp-" + uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
@@ -140,9 +153,15 @@ class Server:
             return await asyncio.wait_for(future, timeout or CLIENT_REQUEST_SECONDS)
         except (asyncio.CancelledError, TimeoutError):
             if withdraw and not self.closing and (future.cancelled() or not future.done()):
-                self.queue_reply({"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": request_id}})
+                task = asyncio.create_task(self.send(
+                    {"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": request_id}}))
+                self.withdrawals.add(task)
+                task.add_done_callback(self.withdrawal_done)
+                withdraw = False  # The notification now owns the reserved slot.
             raise
         finally:
+            if withdraw:
+                self.withdrawal_slots.release()
             self.pending.pop(request_id, None)
             self.response_limits.pop(request_id, None)
 
@@ -698,8 +717,8 @@ class Server:
                 try:
                     message = decode_frame(line)
                 except ProtocolError as error:
-                    self.queue_reply({"jsonrpc": "2.0", "id": None,
-                                      "error": {"code": error.code, "message": str(error)}})
+                    self.queue_validation_error({"jsonrpc": "2.0", "id": None,
+                                                 "error": {"code": error.code, "message": str(error)}})
                     continue
                 if "method" not in message:
                     future = self.pending.get(message.get("id"))
@@ -720,18 +739,18 @@ class Server:
                     continue
                 if not self.initialized and message["method"] not in ("initialize",):
                     if message.get("id") is not None:
-                        self.queue_reply({"jsonrpc": "2.0", "id": message["id"],
-                                          "error": {"code": -32600, "message": "Call initialize first"}})
+                        self.queue_validation_error({"jsonrpc": "2.0", "id": message["id"],
+                                                     "error": {"code": -32600, "message": "Call initialize first"}})
                     continue
                 request_id = message.get("id")
                 if request_id is not None and request_id in self.active_request_ids:
-                    self.queue_reply({"jsonrpc": "2.0", "id": request_id,
-                                      "error": {"code": -32600, "message": "Duplicate active request id"}})
+                    self.queue_validation_error({"jsonrpc": "2.0", "id": request_id,
+                                                 "error": {"code": -32600, "message": "Duplicate active request id"}})
                     continue
                 if len(self.tasks) >= 64 and message["method"] != "session/cancel":
                     if request_id is not None:
-                        self.queue_reply({"jsonrpc": "2.0", "id": request_id,
-                                          "error": {"code": -32000, "message": "Too many concurrent requests"}})
+                        self.queue_validation_error({"jsonrpc": "2.0", "id": request_id,
+                                                     "error": {"code": -32000, "message": "Too many concurrent requests"}})
                     continue
                 if request_id is not None:
                     self.active_request_ids.add(request_id)
@@ -745,7 +764,7 @@ class Server:
         finally:
             reader.close()
             self.closing = True
-            tasks = self.tasks | self.replies
+            tasks = self.tasks | self.validation_replies | self.withdrawals
             for task in tasks:
                 task.cancel()
             if self.output:

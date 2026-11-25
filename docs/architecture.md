@@ -56,9 +56,18 @@ chunks. Cancellation reaches native control tasks without waiting for their
 mutation lock and cancels pending dialogs.
 
 Stdout writes complete frames in order on a daemon. Stdin keeps processing
-cancellation and permission replies while output is blocked. Validation errors
-and client-request withdrawals have a separate backlog of 16 replies. If it
-fills, the adapter discards new entries before writing any of their bytes.
+cancellation and permission replies while output is blocked. To stop a native
+turn, ACP sends `commands/cancel` when available, followed by `abort`
+without waiting for the first response. When stdout stalls, the reader
+pauses at the in-flight notification and the bounded native pipe applies
+backpressure to later frames.
+
+Validation errors use a backlog of 16 replies. At capacity, ACP discards new
+validation replies before writing any bytes. Each of up to 256 outstanding
+child approval requests reserves its own withdrawal slot until the client
+answers or the withdrawal is delivered. At capacity, ACP denies a new child
+approval without opening a client dialog.
+
 Native stderr drains continuously into a shared best-effort sink. A full
 inherited stderr queue can discard whole chunks and diagnostics.
 
