@@ -143,14 +143,14 @@ class StudioResources:
         self.selection_operation = operation
         self.invalidate_pages()
         try:
-            return await self._set_selections(value, kind, changes, fits, operation)
+            return await self._set_selections(kind, changes, fits, operation)
         finally:
             if operation.permission is not None:
                 operation.permission.cancel()
             self.selection_operation = None
             self.invalidate_pages()
 
-    async def _set_selections(self, value, kind, changes, fits, operation):
+    async def _set_selections(self, kind, changes, fits, operation):
         try:
             data = await self.rpc(selections.LIST, kind=kind)
             rows = self.selection_rows(kind, data)
@@ -173,8 +173,9 @@ class StudioResources:
             return refusal("scope-readonly", scope="project", written=[])
         if not project["exists"] and (not operation.may_confirm_creation() or not self.supports("ui/enable")):
             return refusal("consent-required", cause="unanswered", scope="project", written=[])
-        operation.target = target
-        native_changes = [{"key": rows[edit["key"]]["key"], "on": edit["on"]} for edit in changes]
+        operation.target, operation.kind = target, kind
+        operation.native_keys = {edit["key"]: rows[edit["key"]]["key"] for edit in changes}
+        native_changes = [{"key": operation.native_keys[edit["key"]], "on": edit["on"]} for edit in changes]
         try:
             native = await self.session.rpc(
                 "aelix_control", method=selections.SET,
@@ -189,8 +190,12 @@ class StudioResources:
             reason = getattr(error, "studio_selection_refusal", None)
             if reason is None or (reason == "cancelled" and operation.confirmation_sent):
                 raise
+            if reason == "selection-missing":
+                result = await self.missing_selections(kind, changes, getattr(error, "studio_selection_key", None))
             target.require_version(target.before)
             operation.no_effect = True
+            if reason == "selection-missing":
+                return result if fits(result) else refusal("result-too-large")
             if reason == "cancelled":
                 if not project["exists"] or operation.confirm_id is not None:
                     return refusal("consent-required", cause="cancelled", scope="project", written=[])
@@ -202,7 +207,7 @@ class StudioResources:
                 return refusal(reason, scope="project", written=[])
             return refusal(reason)
         operation.require_current()
-        result = selections.project_readback(kind, native, rows, target.path, changes)
+        result = selections.project_readback(kind, native, target.path)
         version = target.verify_save(result["written"])
         if kind == "tool" and self.session.active_tools is not None:
             if result["apply"]["deferred"]:
@@ -212,10 +217,30 @@ class StudioResources:
             else:
                 await self.session.restore_tools(operation=operation)
                 operation.require_current()
+        after = self.selection_rows(kind, await self.rpc(selections.LIST, kind=kind))
+        operation.require_current()
         target.require_version(version)
+        changed, mismatches = selections.verified_diff(rows, after, changes, native["mismatches"])
+        if any(mismatch["reason"] == "missing" for mismatch in mismatches):
+            result = refusal("selection-missing", scope="project", written=result["written"], mismatches=mismatches)
+        else:
+            result.update(changed=changed, mismatches=mismatches)
         if not fits(result):
             raise internal_error()
         return result
+
+    async def missing_selections(self, kind, changes, hint):
+        # The pin gives just the first missing row, in a truncated display
+        # message. Read all requested keys and include an unambiguous hint
+        # even if that row has already reappeared.
+        try:
+            after = self.selection_rows(kind, await self.rpc(selections.LIST, kind=kind))
+        except (ProtocolError, OSError, KeyError, TypeError, ValueError):
+            after = None
+        return refusal("selection-missing", scope="project", written=[], mismatches=[
+            {"key": edit["key"], "reason": "missing"} for edit in changes
+            if edit["key"] == hint or (after is not None and edit["key"] not in after)
+        ])
 
     def reset(self, preferences):
         self.recorded = reselection.recorded_profile(preferences)

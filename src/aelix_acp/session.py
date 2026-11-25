@@ -911,7 +911,10 @@ class Session:
                             error.studio_tool_lock = tool_lock_key(event.get("error"))
                             operation = self.studio_resources.selection_operation
                             if operation is not None and operation.reply is future:
-                                error.studio_selection_refusal = studio_selections.native_refusal(event.get("error"))
+                                message = event.get("error")
+                                error.studio_selection_refusal = studio_selections.native_refusal(message)
+                                if error.studio_selection_refusal == "selection-missing":
+                                    error.studio_selection_key = operation.missing_key_hint(message)
                             future.set_exception(error)
                 else:
                     await self.event(event)

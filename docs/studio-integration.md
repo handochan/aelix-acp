@@ -410,6 +410,7 @@ writer resolves and locks its own target later. A path retarget can still
 affect another file before ACP detects it, and a retarget restored before
 readback may be invisible if its effect is outside the observed files. A native
 guard must bind the expected project directory and target to the transaction.
+[Native target guard](https://github.com/handochan/aelix-ai/issues/927)
 
 First-time creation of `.aelix/settings.json` uses one standard
 `session/request_permission` card tied to the native confirm ID, operation,
@@ -430,6 +431,14 @@ verified under the same mutation lock before replying to an immediate tool
 apply. If native defers a tool apply while an override exists, reopen the
 session before prompting so startup can apply that override to the saved
 defaults. The override is still stored in the session preferences.
+
+ACP reads the saved catalog again after a write and compares all requested
+keys. It derives changed values from the keyed snapshots because the pin
+reports display labels that can be shared by multiple rows. A missing
+requested row returns `selection-missing`. Its `written` paths report any
+observed partial save so the client can refresh before taking another action.
+Atomic batch validation requires a native transaction change.
+[Native batch validation and keyed results](https://github.com/handochan/aelix-ai/issues/928)
 
 MCP edits `mcpServers.<name>.enabled` in the project `.aelix/mcp.json` when
 that file is in effect. The project file replaces the global MCP file as a

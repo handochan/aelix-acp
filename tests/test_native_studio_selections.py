@@ -171,6 +171,14 @@ class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"accepted": False, "reason": "selection-locked", "scope": "project",
                                   "mismatches": [{"key": key, "reason": "locked"}], "written": []})
 
+    async def test_duplicate_skill_labels_do_not_hide_the_changed_key(self):
+        self.duplicate_skills()
+        await self.start(trusted=True)
+        result = await self.set_selection("skill", "review", False, 10)
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["changed"], [{"key": "review", "saved": False}])
+        self.assertEqual(result["mismatches"], [])
+
     async def test_mcp_project_file_takes_effect_on_worker_restart(self):
         script = self.root / "docs_server.py"
         script.write_text(

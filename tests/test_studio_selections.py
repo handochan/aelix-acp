@@ -144,7 +144,13 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
             self.finish_set(request)
 
     def finish_set(self, request):
-        result = self.writes[request["params"]["kind"]]
+        kind = request["params"]["kind"]
+        result = self.writes[kind]
+        changed = {row["label"]: row["saved"] for row in result["changed"]}
+        keys = {edit["key"] for edit in request["params"]["changes"]}
+        for row in self.snapshots[kind]["items"]:
+            if row["key"] in keys and row["label"] in changed:
+                row["saved"] = changed[row["label"]]
         for path in map(Path, result["written"]):
             replacement = path.with_suffix(".tmp")
             replacement.write_bytes(b"{}")
@@ -196,6 +202,10 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(case=case):
                 payload = CASES[case]["post"]["payload"]
                 self.writes[payload["kind"]] = self.write_result(case)
+                for row in self.snapshots[payload["kind"]]["items"]:
+                    for edit in payload["changes"]:
+                        if edit["key"] == row["key"]:
+                            row["saved"] = not edit["on"]
                 self.assertEqual(await self.call(case), CASES[case]["result"])
                 expected = {key: payload[key] for key in ("scope", "kind", "changes")}
                 self.assertEqual(self.mutations[-1], expected)
@@ -333,10 +343,12 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
                 payload = {**fixture["post"]["payload"], "requestId": f"019aa123-0001-7000-8000-{index:012d}"}
                 timeout = 0.1 if self.permission_outcome is None else 45
                 self.missing_project_file("skill")
+                self.snapshots["skill"]["items"][0]["saved"] = True
                 with patch.object(profile_reselection, "APPROVAL_SECONDS", timeout):
                     self.assertEqual(await self.call(case if index == 1 else "project-file-consent", payload=payload),
                                      vector["result"])
-                self.assertEqual(self.calls[-1], vector["nativeReply"])
+                self.assertEqual([call for call in self.calls if call["type"] == "extension_ui_response"][-1],
+                                 vector["nativeReply"])
                 card = [frame for frame in self.client_frames if frame["method"] == "session/request_permission"][-1]
                 self.assertEqual(card["params"]["toolCall"]["kind"], "edit")
                 self.assertEqual([(o["optionId"], o["kind"]) for o in card["params"]["options"]],
@@ -377,7 +389,8 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.active, [])
         self.assertEqual(self.session.active_tools, [])
         self.assertEqual(len(self.mutations), 1)
-        self.assertEqual(self.calls[-1]["params"], {"names": []})
+        self.assertEqual([call["params"] for call in self.calls if call.get("method") == "tools/set_active"],
+                         [{"names": []}])
 
     @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)
     async def test_close_and_rebind_while_waiting_for_consent_reject_late_selection(self, _):
@@ -410,6 +423,7 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.mutations)
 
     async def test_delete_and_resource_reload_serialize_with_dispatched_write(self):
+        self.snapshots["mcp"]["items"][0]["saved"] = True
         self.controls["selections/set"] = lambda _: self.requested.set()
         write = asyncio.create_task(self.call("selections-set-mcp"))
         await asyncio.wait_for(self.requested.wait(), 5)
@@ -443,6 +457,35 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.writes["tool"]["mismatches"] = vector["nativeFragments"]["mismatches"]
         result = await self.call("selections-set-tool")
         self.assertEqual(result["mismatches"], vector["dto"]["mismatches"])
+
+    async def test_native_validation_reports_a_row_disappearing_after_preflight(self):
+        def refuse(request):
+            self.snapshots["skill"]["items"].clear()
+            self.reply(request, error="Unknown skill row: review")
+
+        self.controls["selections/set"] = refuse
+        self.assertEqual(await self.call("selections-set-skill"), CASES["relay-error-unknown-row"]["result"])
+
+    async def test_mcp_save_refuses_partial_batch_and_reports_written_project_file(self):
+        case = "selections-set-mcp"
+        snapshot = self.snapshots["mcp"]
+        snapshot["items"].append({**snapshot["items"][0], "key": "gone", "label": "gone", "saved": True})
+        snapshot["items"][0]["saved"] = True
+        payload = deepcopy(CASES[case]["post"]["payload"])
+        payload["changes"].append({"key": "gone", "on": False})
+
+        def partial(request):
+            snapshot["items"].pop()
+            snapshot["items"][0]["saved"] = False
+            self.finish_set(request)
+
+        self.controls["selections/set"] = partial
+        result = await self.call(case, payload=payload)
+        self.assertEqual(result, {"accepted": False, "reason": "selection-missing", "scope": "project",
+                                  "written": [".aelix/mcp.json"],
+                                  "mismatches": [{"key": "gone", "reason": "missing"}]})
+        self.assertEqual(await self.relay.lookup({"requestId": payload["requestId"]}),
+                         {"status": "completed", "result": result})
 
     @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)
     async def test_native_busy_and_dialog_cancellation_are_definite_refusals(self, _):

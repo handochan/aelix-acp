@@ -1,7 +1,6 @@
 """D16 projection of native project selections."""
 from __future__ import annotations
 
-from collections import Counter
 import hmac
 import os
 from pathlib import Path
@@ -28,6 +27,8 @@ class SelectionWrite(profile_reselection.Operation):
         self.consent_cause = None
         self.confirmation_sent = False
         self.target = None
+        self.kind = None
+        self.native_keys = {}
 
     def awaiting_native(self):
         return self.reply is not None and not self.reply.done()
@@ -50,6 +51,17 @@ class SelectionWrite(profile_reselection.Operation):
         self.require_current()
         self.target.require_version(self.target.before)
         super().before_write()
+
+    def missing_key_hint(self, message):
+        prefix = f"Unknown {self.kind} row: "
+        keys = []
+        for public, native in self.native_keys.items():
+            # Pin control_selection._quote truncates the native ID at 120 characters.
+            quoted = native if len(native) <= 120 else native[:120] + "…"
+            candidate = prefix + quoted
+            if message == candidate or message.startswith(candidate + "; "):
+                keys.append(public)
+        return keys[0] if len(keys) == 1 else None
 
 
 def file_label(kind):
@@ -174,8 +186,9 @@ def native_refusal(message):
         return "busy"
     if message.startswith("Cannot save to "):
         return "scope-readonly"
-    if (message.startswith(("Unknown tool row: ", "Unknown skill row: ", "Unknown mcp row: ",
-                            "Not saved: Cannot save to ", "Not saved: Cannot save: "))
+    if message.startswith(("Unknown tool row: ", "Unknown skill row: ", "Unknown mcp row: ")):
+        return "selection-missing"
+    if (message.startswith(("Not saved: Cannot save to ", "Not saved: Cannot save: "))
             or (message.startswith("Not saved: ") and "; nothing written" in message)):
         return "write-failed"
     return None
@@ -231,7 +244,7 @@ def check_snapshot(kind, data, secret):
         raise ValueError("Unreadable selection snapshot")
     rows = {}
     for row in data["items"]:
-        if not isinstance(row["key"], str) or not isinstance(row["label"], str):
+        if not isinstance(row["key"], str) or not isinstance(row["label"], str) or type(row["saved"]) is not bool:
             raise ValueError("Invalid selection row")
         key = public_key(secret, kind, row["key"])
         if key in rows:
@@ -262,30 +275,17 @@ def public_row(kind, key, row, tools):
     return result
 
 
-def project_readback(kind, native, rows, target, changes):
+def project_readback(kind, native, target):
     if (native["scope"] != "project" or native["kind"] != kind or native["effect"] != EFFECTS[kind]
             or not isinstance(native["written"], list)
             or len(native["written"]) > 1
             or any(not isinstance(path, str) or Path(path) != target for path in native["written"])):
         raise ValueError("Invalid selection write response")
-    labels = Counter(row["label"] for row in rows.values())
-    keys = {rows[edit["key"]]["label"]: edit["key"] for edit in changes
-            if labels[rows[edit["key"]]["label"]] == 1}
-    if not isinstance(native["changed"], list) or not isinstance(native["mismatches"], list):
+    if (not isinstance(native["changed"], list) or not isinstance(native["mismatches"], list)
+            or any(not isinstance(change["label"], str) or type(change["saved"]) is not bool
+                   for change in native["changed"])
+            or any(not isinstance(message, str) for message in native["mismatches"])):
         raise ValueError("Invalid selection write response")
-    changed, mismatches = {}, []
-    for change in native["changed"]:
-        label, saved = change["label"], change["saved"]
-        if not isinstance(label, str) or type(saved) is not bool:
-            raise ValueError("Invalid selection write response")
-        if label in keys:
-            changed[keys[label]] = saved
-        elif labels[label] > 1:
-            mismatches.append({"key": None, "reason": "native-mismatch"})
-    for message in native["mismatches"]:
-        label, sep, _ = message.rpartition(": saved, but ")
-        key = keys.get(label) if sep else None
-        mismatches.append({"key": key, "reason": "saved-value-differs" if key else "native-mismatch"})
     apply = native["apply"]
     if kind == "mcp":
         if apply is not None:
@@ -305,6 +305,33 @@ def project_readback(kind, native, rows, target, changes):
     return {
         "accepted": True, "scope": "project", "kind": kind, "effect": EFFECTS[kind],
         "written": [file_label(kind)] if native["written"] else [],
-        "changed": [{"key": key, "saved": changed[key]} for edit in changes if (key := edit["key"]) in changed],
-        "mismatches": mismatches, "apply": apply,
+        "apply": apply,
     }
+
+
+def verified_diff(before, after, changes, native_mismatches):
+    """The pin returns display labels, so identify changed rows from keyed snapshots."""
+    changed, keyed, labels = [], {}, {}
+    for edit in changes:
+        key = edit["key"]
+        labels.setdefault(before[key]["label"], []).append(key)
+        row = after.get(key)
+        if row is None:
+            keyed[key] = "missing"
+            continue
+        saved = row["saved"]
+        if saved != before[key]["saved"]:
+            changed.append({"key": key, "saved": saved})
+        if saved != edit["on"]:
+            keyed[key] = "saved-value-differs"
+
+    unkeyed = []
+    for message in native_mismatches:
+        label, sep, _ = message.rpartition(": saved, but ")
+        keys = labels.get(label, []) if sep else []
+        if len(keys) == 1:
+            keyed.setdefault(keys[0], "saved-value-differs")
+        elif not any(key in keyed for key in keys):
+            unkeyed.append({"key": None, "reason": "native-mismatch"})
+    mismatches = [{"key": edit["key"], "reason": keyed[edit["key"]]} for edit in changes if edit["key"] in keyed]
+    return changed, mismatches + unkeyed
