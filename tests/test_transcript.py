@@ -87,6 +87,25 @@ class TranscriptPageTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TranscriptToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generated_native_card_id_avoids_later_raw_ids(self):
+        call = {"sessionUpdate": "tool_call", "toolCallId": "reused"}
+        snapshot = transcript.Snapshot({"nativeSessionId": "native"}, [
+            transcript.Row(transcript.position(row(1, "first")), "assistant", [call, call]),
+        ])
+
+        async def replay_ids():
+            return [update["toolCallId"] async for update in transcript.reconcile(
+                snapshot, records([]), session_id="acp", nesting=False)]
+
+        first, second = await replay_ids()
+        later_ids = [first, f"{first}-1"]
+        snapshot.rows.append(transcript.Row(transcript.position(row(2, "later")), "assistant", [
+            {**call, "toolCallId": call_id} for call_id in later_ids]))
+        replayed = await replay_ids()
+        self.assertEqual(replayed[1:], [second, *later_ids])
+        self.assertEqual(len(set(replayed)), 4)
+        self.assertEqual(await replay_ids(), replayed)
+
     async def test_nested_replay_links_updates_to_the_correct_recreated_parent(self):
         parent = "aelix-child:child"
         child = "child:tool"

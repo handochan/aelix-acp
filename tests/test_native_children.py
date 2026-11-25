@@ -60,6 +60,7 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
         self.child_waiting = asyncio.Event()
         self.calls = 0
         self.agent_call_id = None
+        self.parent_write_call_id = None
         self.listener = await asyncio.start_server(self.model, "127.0.0.1", 0)
         port = self.listener.sockets[0].getsockname()[1]
         (self.root / "agent/models.json").write_text(json.dumps({"providers": {"fixture": {
@@ -90,9 +91,11 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
 
     # === the scripted model ===
 
-    def call(self, name, arguments):
+    def call(self, name, arguments, *, call_id=None):
         self.calls += 1
-        call_id = self.agent_call_id if name == "agent" and self.agent_call_id else f"call_{name}_{self.calls}"
+        if call_id is None and name == "agent":
+            call_id = self.agent_call_id
+        call_id = call_id or f"call_{name}_{self.calls}"
         return {"role": "assistant", "tool_calls": [{"index": 0, "id": call_id, "type": "function",
                 "function": {"name": name, "arguments": json.dumps(arguments)}}]}, "tool_calls"
 
@@ -110,7 +113,8 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
             if marker in text:
                 return self.call("agent", arguments)
         if "PARENT_WRITE" in text:
-            return self.call("write", {"path": str(self.root / "parent.txt"), "content": "parent"})
+            return self.call("write", {"path": str(self.root / "parent.txt"), "content": "parent"},
+                             call_id=self.parent_write_call_id)
         if "PARENT_HOLD" in text:
             await self.parent_gate.wait()
         if "CHILD_DONE" in text:  # A job notice placed by a notice turn.
@@ -674,25 +678,32 @@ def setup(api):
         self.assertTrue(parent.startswith("aelix-child:"))
         load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
         meta = "aelix/transcript"
-        coordinates = []
-        for attempt in range(3):
-            if attempt == 2:
-                # Reopen from the same ACP database in a new process.
-                await self.client.close()
-                self.clients.remove(self.client)
-                self.client = await AcpClient.start(
-                    self.root, EXECUTABLE, adapter_args=["--enable-agents"],
-                    capabilities={"_meta": {**NESTING, meta: {"version": 1}}})
-                self.clients.append(self.client)
+
+        async def restart_client(*, nesting):
+            await self.client.close()
+            self.clients.remove(self.client)
+            capabilities = {**(NESTING if nesting else {}), meta: {"version": 1}}
+            self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=["--enable-agents"],
+                                                capabilities={"_meta": capabilities})
+            self.clients.append(self.client)
+
+        async def load_display():
             self.client.updates.clear()
             opened = await self.client.request("session/load", load, timeout=120)
-            marker = opened["_meta"]["aelix/transcript"]
-            self.assertEqual(marker["totalMessages"], 0)
+            marker = opened["_meta"][meta]
             replayed = [update for update in self.updates() if update["sessionUpdate"] not in {
                 "available_commands_update", "config_option_update", "current_mode_update",
                 "session_info_update", "usage_update"}]
-            self.assertGreater(len(replayed), 0)
             self.assertEqual(marker["totalFrames"], len(replayed))
+            return marker, replayed
+
+        coordinates = []
+        for attempt in range(3):
+            if attempt == 2:
+                await restart_client(nesting=True)
+            marker, replayed = await load_display()
+            self.assertEqual(marker["totalMessages"], 0)
+            self.assertGreater(len(replayed), 0)
             tagged = [update["_meta"][meta] for update in replayed]
             for coordinate in tagged:
                 self.assertEqual(coordinate["source"], "adapter")
@@ -716,12 +727,38 @@ def setup(api):
             self.assertEqual(original_fields, nested)
         self.assertEqual(coordinates, [coordinates[0]] * 3)
 
-        await self.client.close()
-        self.clients.remove(self.client)
-        self.client = await AcpClient.start(
-            self.root, EXECUTABLE, adapter_args=["--enable-agents"], capabilities={"_meta": {meta: {"version": 1}}})
-        self.clients.append(self.client)
-        await self.client.request("session/load", load, timeout=120)
+        # A later native turn can use the ID previously generated for the second nested card.
+        self.assertTrue(second.startswith("aelix-transcript-nested-"))
+        self.parent_write_call_id = second
+        self.client.updates.clear()
+        self.assertEqual(await self.prompt("PARENT_WRITE"), {"stopReason": "end_turn"})
+        native_live = self.card(second)
+        self.assertEqual(native_live[0]["sessionUpdate"], "tool_call")
+        self.assertEqual(native_live[-1]["status"], "completed")
+
+        collision_replays = []
+        for restart in (False, False, True):
+            if restart:
+                await restart_client(nesting=True)
+            marker, replayed = await load_display()
+            self.assertGreater(marker["totalMessages"], 0)
+            cards = [update["toolCallId"] for update in replayed if update["sessionUpdate"] == "tool_call"]
+            self.assertEqual(len(cards), len(set(cards)))
+            native_replay = self.card(second)
+            self.assertEqual([update["sessionUpdate"] for update in native_replay], ["tool_call", "tool_call_update"])
+            self.assertTrue(all(update["_meta"][meta]["source"] == "replay" for update in native_replay))
+            self.assertEqual(native_replay[-1]["status"], native_live[-1]["status"])
+            replayed_children = [update for update in replayed if "parentToolCallId" in update["_meta"]]
+            nested_ids = [update["toolCallId"] for update in replayed_children]
+            self.assertEqual(nested_ids[:2], [first, first])
+            self.assertEqual(nested_ids[2], nested_ids[3])
+            self.assertEqual([update["_meta"][meta] for update in replayed if update["_meta"][meta]["source"] == "adapter"],
+                             coordinates[0])
+            collision_replays.append((marker, replayed))
+        self.assertEqual(collision_replays, [collision_replays[0]] * 3)
+
+        await restart_client(nesting=False)
+        await load_display()
         self.assertFalse(self.card(parent))
         self.assertFalse(any("parentToolCallId" in update.get("_meta", {}) for update in self.updates()))
 

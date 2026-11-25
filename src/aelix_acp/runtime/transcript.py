@@ -378,8 +378,18 @@ async def reconcile(snapshot, recorded, *, session_id, nesting):
     result_entries = {row.coordinates["entryId"] for row in snapshot.rows if row.role == "toolResult"}
     metadata, auxiliary, associated, links = await _tool_overlay(
         recorded, native_id, set(calls.values()), unique_origins, result_entries, session_id=session_id, nesting=nesting)
-    result_counts = Counter(update["toolCallId"] for row in snapshot.rows for update in row.updates
-                            if update["sessionUpdate"] == "tool_call_update" and row.coordinates["entryId"] not in links)
+    # Leave raw IDs available to their cards, even when those cards are emitted later.
+    reserved_cards = set(call_counts)
+    reserved_cards.update(update["toolCallId"] for update, _ in auxiliary
+                          if isinstance(update.get("toolCallId"), str))
+    result_counts = Counter()
+    for row in snapshot.rows:
+        for update in row.updates:
+            if update["sessionUpdate"] == "tool_call_update":
+                call_id = update["toolCallId"]
+                reserved_cards.add(call_id)
+                if row.coordinates["entryId"] not in links:
+                    result_counts[call_id] += 1
     pending = {}
     used_cards = set()
     current_calls = defaultdict(deque)
@@ -393,7 +403,9 @@ async def reconcile(snapshot, recorded, *, session_id, nesting):
             kind = update["sessionUpdate"]
             call_id = update.get("toolCallId")
             if kind == "tool_call":
-                card_id = call_id if call_counts[call_id] == 1 else _card_id(native_id, row, index)
+                card_id = call_id
+                if call_counts[call_id] > 1:
+                    card_id = _unused_card_id(_card_id(native_id, row, index), reserved_cards, used_cards)
                 occurrence = calls[entry_id, index]
                 pending[occurrence] = card_id
                 current_calls[call_id].append(occurrence)
@@ -421,7 +433,7 @@ async def reconcile(snapshot, recorded, *, session_id, nesting):
                     if original is None and not call_counts[raw_id] and result_counts[raw_id] == 1:
                         card_id = raw_id
                     else:
-                        card_id = _card_id(native_id, row, index)
+                        card_id = _unused_card_id(_card_id(native_id, row, index), reserved_cards, used_cards)
                     used_cards.add(card_id)
                     yield replay_update({"sessionUpdate": "tool_call", "toolCallId": card_id,
                                          "title": "tool", "kind": "other", "status": "in_progress"}, row, native_id, part)
@@ -447,7 +459,8 @@ async def reconcile(snapshot, recorded, *, session_id, nesting):
                 replay_id = call_id
                 if replay_id in used_cards:
                     event = meta[META]["eventId"]
-                    replay_id = "aelix-transcript-nested-" + uuid.uuid5(uuid.NAMESPACE_OID, event).hex
+                    base = "aelix-transcript-nested-" + uuid.uuid5(uuid.NAMESPACE_OID, event).hex
+                    replay_id = _unused_card_id(base, reserved_cards, used_cards)
                 used_cards.add(replay_id)
                 replay_cards[call_id] = replay_id, replay_parent
             else:
@@ -462,3 +475,12 @@ async def reconcile(snapshot, recorded, *, session_id, nesting):
 def _card_id(native_id, row, part):
     name = json.dumps([native_id, row.coordinates["entryId"], part])
     return "aelix-transcript-" + uuid.uuid5(uuid.NAMESPACE_OID, name).hex
+
+
+def _unused_card_id(base, reserved_cards, used_cards):
+    candidate = base
+    suffix = 1
+    while candidate in reserved_cards or candidate in used_cards:
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
