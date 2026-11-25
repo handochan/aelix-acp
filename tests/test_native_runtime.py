@@ -12,10 +12,14 @@ import textwrap
 import unittest
 
 from support import AcpClient, process_alive
+from aelix_acp.runtime import host_bytes, session_relay
 from aelix_acp.runtime.leases import acquire as acquire_lease
+from aelix_acp.runtime.store import ASSISTANT_ORIGIN_META, append_event
 from aelix_acp.wire.errors import ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH
 
 EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
+PROTECTED_HOST = {"_meta": {session_relay.META_KEY: {"version": 1, "notifications": False},
+                           host_bytes.META_KEY: {"version": 1}}}
 SELECTOR_PROFILE = (
     "---\nname: restricted\ndescription: Restricted\nprovider: fixture\nmodel: two\n"
     "thinking: 'off'\ntools: [read]\n---\nRead only.\n"
@@ -95,6 +99,10 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.model_authorizations = []
         self.write_path = self.root / "approved.txt"
         self.failures = 0
+        self.http_error = None
+        self.anthropic_error = None
+        self.stream_error_message = None
+        self.model_reply = "NATIVE_OK"
         self.model_gate = None
         self.prompt_tokens = 23
         self.listener = await asyncio.start_server(self.model, "127.0.0.1", 0)
@@ -158,7 +166,7 @@ def setup(api):
                         "path": str(self.write_path), "content": "approved write"})}}]}
                 stop = "tool_calls"
             else:
-                delta, stop = {"role": "assistant", "content": "NATIVE_OK"}, "stop"
+                delta, stop = {"role": "assistant", "content": self.model_reply}, "stop"
             def event(delta, finish):
                 return "data: " + json.dumps({"id": "fixture", "object": "chat.completion.chunk", "created": 0,
                     "model": request.get("model", "one"), "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
@@ -168,7 +176,17 @@ def setup(api):
             if self.failures:
                 self.failures -= 1
                 body = b'data: {"error":{"message":"overloaded fixture","type":"overloaded_error"}}\n\n'
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: "
+            if self.stream_error_message is not None:
+                body = b"data: " + json.dumps({"error": {"message": self.stream_error_message}}).encode() + b"\n\n"
+            status, mime = "200 OK", "text/event-stream"
+            if self.anthropic_error:
+                body = b"event: error\ndata: " + json.dumps(self.anthropic_error).encode() + b"\n\n"
+            if self.http_error:
+                code, error_type = self.http_error
+                status, mime = f"{code} Fixture Error", "application/json"
+                body = json.dumps({"error": {"type": error_type, "code": error_type,
+                                             "message": "synthetic rejection"}}).encode()
+            writer.write(f"HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nConnection: close\r\nContent-Length: ".encode()
                          + str(len(body)).encode() + b"\r\n\r\n" + body)
             await writer.drain()
         except (ConnectionError, asyncio.IncompleteReadError):
@@ -1533,9 +1551,171 @@ def setup(api):
             await self.prompt("Respond")
         error = json.loads(str(caught.exception))
         self.assertEqual(error["code"], TURN_FAILED_AFTER_DISPATCH)
-        self.assertEqual(error["data"], {"kind": "turn_failed_after_dispatch", "retryable": False})
+        self.assertEqual(error["data"], {"kind": "turn_failed_after_dispatch", "retryable": False,
+                                         "cause": {"kind": "unknown", "retryable": False}})
         self.assertIn("overloaded fixture", error["message"])
         self.assertEqual(len(self.model_requests), 1)
+
+    async def open_protected_provider_session(self):
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities=PROTECTED_HOST)
+        created = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []})
+        self.session = created["sessionId"]
+        await self.config("autoRetryEnabled", "false")
+
+    async def test_http_200_stream_diagnostics_cannot_spoof_provider_causes(self):
+        await self.open_protected_provider_session()
+        for diagnostic in (
+            "Error code: 401",
+            "Error code: 401 - " + repr({"error": {"type": "authentication_error", "code": "authentication_error",
+                                                   "message": "synthetic rejection"}}),
+            "OpenAI Codex request failed (401): diagnostic",
+            "Error code: 429",
+            "Connection error.",
+            "Connection error. — All connection attempts failed",
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                self.stream_error_message = diagnostic
+                before = len(self.model_requests)
+                with self.assertRaises(RuntimeError) as caught:
+                    await self.prompt("Respond")
+                self.assertEqual(json.loads(str(caught.exception)), {
+                    "code": TURN_FAILED_AFTER_DISPATCH, "message": "Native model request failed",
+                    "data": {"kind": "turn_failed_after_dispatch", "retryable": False,
+                             "cause": {"kind": "unknown", "retryable": False}},
+                })
+                self.assertEqual(len(self.model_requests), before + 1)
+
+    async def test_malformed_stream_error_leaves_protected_stderr_clean(self):
+        await self.open_protected_provider_session()
+        self.stream_error_message = r"{'error': {'message': 'probe \q'}}"
+        with self.assertRaises(RuntimeError) as caught:
+            await self.prompt("Respond")
+        self.assertEqual(json.loads(str(caught.exception))["data"]["cause"],
+                         {"kind": "unknown", "retryable": False})
+        await self.client.close()
+        self.assertEqual(self.client.stderr, b"")
+
+    async def test_protected_legacy_replay_preserves_recorded_model_failure_prefix(self):
+        self.model_reply = "Request failed: ordinary assistant prose"
+        self.assertEqual(await self.prompt("Respond"), {"stopReason": "end_turn"})
+        self.assertEqual(self.client.text(), self.model_reply)
+        await self.client.close()
+
+        self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities=PROTECTED_HOST)
+        loaded = await self.client.request("session/load", {
+            "sessionId": self.session, "cwd": str(self.root), "mcpServers": [],
+        })
+        self.assertNotIn("aelix/transcriptCapability", loaded.get("_meta", {}))
+        replayed = [frame["params"]["update"] for frame in self.client.updates
+                    if frame.get("method") == "session/update"
+                    and frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"]
+        self.assertEqual(replayed, [{"sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": self.model_reply}}])
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            row, = db.execute("SELECT value FROM events WHERE session_id=? ORDER BY sequence DESC LIMIT 1",
+                              (self.session,)).fetchone()
+        self.assertEqual(json.loads(row)["_meta"][ASSISTANT_ORIGIN_META], "model")
+
+    async def test_private_host_keeps_unverified_http_and_network_causes_unknown(self):
+        await self.open_protected_provider_session()
+        for rejection in (
+            (400, "invalid_request_error"), (404, "invalid_request_error"), (422, "invalid_request_error"),
+            (401, "authentication_error"), (403, "permission_error"), (429, "rate_limit_error"),
+            (500, "api_error"), (503, "overloaded_error"), (529, "overloaded_error"),
+            (418, "unrecognized_error"), None,
+        ):
+            with self.subTest(rejection=rejection):
+                self.http_error = rejection
+                if rejection is None:
+                    self.listener.close()
+                    await self.listener.wait_closed()
+                before = len(self.model_requests)
+                with self.assertRaises(RuntimeError) as caught:
+                    await self.prompt("Respond")
+                self.assertEqual(json.loads(str(caught.exception)), {
+                    "code": TURN_FAILED_AFTER_DISPATCH, "message": "Native model request failed",
+                    "data": {"kind": "turn_failed_after_dispatch", "retryable": False,
+                             "cause": {"kind": "unknown", "retryable": False}},
+                })
+                if rejection is None:
+                    self.assertEqual(len(self.model_requests), before)
+                else:
+                    self.assertGreater(len(self.model_requests), before)
+
+    async def reopen_with_provider_api(self, api, *, extensions=()):
+        await self.client.close()
+        models_path = self.root / "agent/models.json"
+        models = json.loads(models_path.read_text(encoding="utf-8"))
+        models["providers"]["fixture"]["api"] = api
+        models_path.write_text(json.dumps(models), encoding="utf-8")
+        self.client = await AcpClient.start(self.root, EXECUTABLE, extensions=extensions)
+        created = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []})
+        self.session = created["sessionId"]
+        await self.config("autoRetryEnabled", "false")
+
+    async def test_anthropic_stream_error_preserves_diagnostic_but_uses_unknown(self):
+        await self.reopen_with_provider_api("anthropic-messages")
+        self.anthropic_error = {"type": "error", "error": {"type": "overloaded_error", "message": "fixture overload"}}
+        with self.assertRaises(RuntimeError) as caught:
+            await self.prompt("Respond")
+        self.assertEqual(json.loads(str(caught.exception)), {
+            "code": TURN_FAILED_AFTER_DISPATCH, "message": repr(self.anthropic_error),
+            "data": {"kind": "turn_failed_after_dispatch", "retryable": False,
+                     "cause": {"kind": "unknown", "retryable": False}},
+        })
+        self.assertEqual(len(self.model_requests), 1)
+
+    async def test_codex_http_error_preserves_diagnostic_but_uses_unknown(self):
+        extension = self.root / "codex-account.py"
+        extension.write_text("def setup(api):\n"
+                             "    from aelix_ai.providers import openai_codex_responses\n"
+                             "    openai_codex_responses._get_account_id = lambda _: 'fixture-account'\n",
+                             encoding="utf-8")
+        await self.reopen_with_provider_api("openai-codex-responses", extensions=[extension])
+        self.http_error = (401, "authentication_error")
+        with self.assertRaises(RuntimeError) as caught:
+            await self.prompt("Respond")
+        error = json.loads(str(caught.exception))
+        self.assertEqual(error["code"], TURN_FAILED_AFTER_DISPATCH)
+        self.assertTrue(error["message"].startswith("OpenAI Codex request failed (401): "))
+        self.assertEqual(error["data"], {"kind": "turn_failed_after_dispatch", "retryable": False,
+                                         "cause": {"kind": "unknown", "retryable": False}})
+        self.assertEqual(len(self.model_requests), 1)
+
+    async def test_failed_provider_turn_reloads_safely_and_keeps_its_receipt(self):
+        await self.config("autoRetryEnabled", "false")
+        self.http_error = (401, "authentication_error")
+        request_key = "provider-rejection"
+        with self.assertRaises(RuntimeError) as caught:
+            await self.prompt("Respond", key=request_key)
+        error = json.loads(str(caught.exception))
+        self.assertEqual(error["code"], TURN_FAILED_AFTER_DISPATCH)
+        self.assertTrue(error["message"].startswith("Error code: 401 - "))
+        self.assertIn("synthetic rejection", error["message"])
+        await self.client.close()
+
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            rows = db.execute("SELECT value FROM events WHERE session_id=? ORDER BY sequence", (self.session,))
+            entries = [json.loads(value) for value, in rows]
+            self.assertEqual([entry["content"]["text"] for entry in entries], ["Respond", "Request failed."])
+            self.assertEqual(entries[-1]["_meta"][ASSISTANT_ORIGIN_META], "prompt_failure")
+            self.assertEqual(db.execute("SELECT state,result FROM turns WHERE session_id=? AND request_key=?",
+                                        (self.session, request_key)).fetchone(), ("interrupted", None))
+            append_event(db, self.session, {"sessionUpdate": "agent_message_chunk", "content": {
+                "type": "text", "text": "Request failed: Error code: 401 - legacy-provider-marker"}})
+
+        self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities=PROTECTED_HOST)
+        await self.client.request("session/load", {"sessionId": self.session, "cwd": str(self.root), "mcpServers": []})
+        self.assertEqual(self.client.text(), "RespondRequest failed.Request failed.")
+        before = len(self.model_requests)
+        with self.assertRaises(RuntimeError) as duplicate:
+            await self.prompt("Respond", key=request_key)
+        self.assertEqual(json.loads(str(duplicate.exception)), {
+            "code": -32006, "message": "Previous request has an unresolved outcome; it will not be executed again",
+            "data": {"kind": "unresolved_turn", "requestId": request_key, "state": "interrupted"},
+        })
+        self.assertEqual(len(self.model_requests), before)
 
     async def test_failure_before_native_dispatch_keeps_its_specific_code(self):
         with self.assertRaises(RuntimeError) as caught:

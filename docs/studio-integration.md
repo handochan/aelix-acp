@@ -84,6 +84,59 @@ lands. The native lock is
 recognized from native's own refusal text until R7 provides a structured
 signal; the native transcript path is never copied into the error.
 
+### Native provider failures (ACP #64, Host #71)
+
+A failed native assistant `message_end` with `stop_reason: "error"` and an
+error diagnostic adds `data.cause = {kind, retryable}` to the `-33002` error.
+If native supplies a structured `message.error` object, ACP reads its integer
+`status` and then its `type` when the status has no mapping. The structured
+object is authoritative, including when the resulting cause is `unknown`.
+See [native #921](https://github.com/handochan/aelix-ai/issues/921).
+
+Native pin `83714045` serializes failed HTTP responses, connection failures,
+and stream errors into the same `error_message` field. A provider can supply
+identical text in an HTTP 200 stream, including a complete SDK-formatted
+diagnostic. ACP uses `unknown` for every failure on this pin that lacks
+structured provenance.
+
+| Structured HTTP status | Structured error type | ACP `data.cause.kind` |
+|---|---|---|
+| 400, 404, 422 | `invalid_request_error` | `provider_bad_request` |
+| 401, 403 | `authentication_error`, `permission_error` | `provider_auth` |
+| 429 | `rate_limit_error` | `provider_rate_limit` |
+| 500–599, including 529 | `overloaded_error`, `api_error` | `provider_unavailable` |
+| No mapped status | `connection_error` | `provider_network` |
+| Absent or unrecognized | Absent or unrecognized | `unknown` |
+
+The cause contains only the enum and a boolean. Both `retryable` fields are
+`false` because replaying a dispatched turn could repeat model calls or tool
+effects. Direct replies to standard clients keep the native diagnostic.
+ACP records a generic `Request failed.` entry for dispatched failures and
+records whether new assistant chunks came from model output, adapter output,
+or a prompt failure. Protected replay uses that origin for new entries and
+uses the old `Request failed:` prefix only for ambiguous legacy entries.
+The origin marker is private to ACP storage. `session/prompt`
+requires an ID. An ID-less prompt has no effect. This is the protected Studio
+Host error for a structured authentication failure.
+
+```json
+{
+  "code": -33002,
+  "message": "Native model request failed",
+  "data": {
+    "kind": "turn_failed_after_dispatch",
+    "retryable": false,
+    "cause": {"kind": "provider_auth", "retryable": false}
+  }
+}
+```
+
+The host should allowlist `cause.kind` against the vocabulary above, accept
+a boolean `cause.retryable`, and keep the generic turn failure for `unknown`,
+absent, or unrecognized causes. Keep filtering free-form peer details on the
+protected relay and use the outer `data.retryable` for turn replay decisions.
+See [Host #71](https://github.com/handochan/aelix-studio-host/issues/71).
+
 ## Transcript synchronization (ACP #22, Host #4)
 
 When the client offers transcript v1 and the native worker advertises
