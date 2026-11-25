@@ -254,6 +254,8 @@ class Session:
             preferences = load_preferences(self.server.db, self.id)
         self.fork_projection = preferences.get("forkProjection") is True
         self.fork_head = preferences.get("forkHead")
+        config = preferences.get("config", {})
+        self.saved_config = config if isinstance(config, dict) else {}  # start() refuses a malformed one.
         self.active_tools = preferences.get("activeTools")
         if self.active_tools is not None and (not isinstance(self.active_tools, list) or any(not isinstance(name, str) for name in self.active_tools)):
             raise ProtocolError("Invalid saved tool selection")
@@ -653,8 +655,14 @@ class Session:
             self.fork_projection = True
         row = (self.id, self.cwd, self.server.args.profile, self.state.get("sessionFile"),
                self.state.get("sessionName") or f"Aelix {self.server.args.profile}", int(time.time()))
+        config = self.controls.selections()
+        if not self.controls.model_selected():
+            # Native has no model, e.g. the saved one is unavailable right now. Keep
+            # the saved model and reasoning choice so a later start can restore them.
+            config.update({config_id: value for config_id, value in self.saved_config.items()
+                           if config_id in NATIVE_SESSION_SELECTORS and config_id not in config})
         preferences = {"permission_mode": self.controls.permission_mode, "extensions": self.extra_extensions,
-            "config": self.controls.selections(),
+            "config": config,
             **({"extensionOverrides": self.extension_overrides} if self.extension_overrides else {}),
             "lastContextMeasurement": self.context.last_measurement,
             "agent": self.controls.capabilities.get("activeAgent"),
@@ -665,6 +673,7 @@ class Session:
             "backendMessageCount": self.state.get("messageCount", self.state.get("message_count", 0))}
         await write_store(self.server.args.state_dir, save_session, row, preferences, inherited_history,
                           before_commit=before_commit)
+        self.saved_config = config
         if live:
             self.require_live_worker(worker, committed=True)
 

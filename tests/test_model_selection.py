@@ -217,6 +217,8 @@ from pathlib import Path
 PLACEHOLDER = %(placeholder)s
 AVAILABLE = %(available)s
 REASONING = %(reasoning)s
+HIDDEN = Path("hidden-models").read_text().split() if Path("hidden-models").is_file() else []
+AVAILABLE = [m for m in AVAILABLE if m["id"] not in HIDDEN]  # A provider that is unavailable for now.
 Path(os.environ["AELIX_ACP_READY_FILE"]).write_text(os.environ["AELIX_ACP_NONCE"])
 mode = sys.argv[sys.argv.index("--permission-mode") + 1]
 if "--session" in sys.argv:
@@ -382,13 +384,32 @@ class NoCurrentModelWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_history_without_a_restorable_model_takes_the_saved_choice(self):
         session_id = await self.new_session()
         await self.config(session_id, "model", "fixture/reasoner")
+        await self.config(session_id, "thinking_level", "high")
         self.assertEqual(await self.prompt(session_id), {"stopReason": "end_turn"})
         session_file = Path(self.server.sessions[session_id].state["sessionFile"])
         # Native's recorded model is gone: it resumes the history on its placeholder.
         session_file.write_text(session_file.read_text().replace('"provider": "fixture"', '"provider": "removed"', 1))
         loaded = await self.reopen(session_id)
-        self.assertEqual(self.options(loaded)["model"], "fixture/reasoner")
+        # Selecting the model resets native's level, so "high" is the saved choice restored.
+        self.assertEqual((self.options(loaded)["model"], self.options(loaded)["thinking_level"]), ("fixture/reasoner", "high"))
         self.assertNotIn("aelix/recoveryWarnings", loaded["_meta"])
+
+    async def test_a_temporarily_unavailable_choice_is_kept_for_the_next_load(self):
+        session_id = await self.new_session()
+        await self.config(session_id, "model", "fixture/reasoner")
+        await self.config(session_id, "thinking_level", "high")
+        hidden = self.root / "hidden-models"
+        hidden.write_text("reasoner")
+        unavailable = await self.reopen(session_id)
+        self.assertEqual(self.options(unavailable)["model"], "")
+        self.assertEqual([warning["configId"] for warning in unavailable["_meta"]["aelix/recoveryWarnings"]],
+                         ["model", "thinking_level"])
+        config = load_preferences(self.server.db, session_id)["config"]
+        self.assertEqual((config["model"], config["thinking_level"]), ("fixture/reasoner", "high"))
+        hidden.unlink()
+        restored = await self.reopen(session_id)
+        self.assertEqual((self.options(restored)["model"], self.options(restored)["thinking_level"]), ("fixture/reasoner", "high"))
+        self.assertNotIn("aelix/recoveryWarnings", restored["_meta"])
 
     async def test_native_history_model_still_wins_over_the_saved_choice(self):
         session_id = await self.new_session()
