@@ -143,7 +143,8 @@ class TargetFence:
                 raise UnsafeTarget()
             project = target_stamp(path, project=True)
             global_version = target_stamp(global_target)
-            if (directory_identity(path.parent.parent) != cwd
+            if ((project is not None and global_version is not None and project[:2] == global_version[:2])
+                    or directory_identity(path.parent.parent) != cwd
                     or directory_identity(path.parent, optional=True) != parent
                     or self.global_path.resolve() != global_target):
                 raise UnsafeTarget()

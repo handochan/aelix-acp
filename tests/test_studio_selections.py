@@ -556,6 +556,15 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.call("selections-set-mcp"), CASES["relay-error-scope-readonly"]["result"])
         self.assertFalse(self.mutations)
 
+    async def test_different_path_spellings_for_the_same_file_refuse_before_dispatch(self):
+        target = self.root / ".aelix/mcp.json"
+        alias = target.with_name("MCP.JSON")
+        if alias == target or not alias.exists() or not alias.samefile(target):
+            self.skipTest("Requires a filesystem with distinct path spellings for the same file")
+        self.snapshots["mcp"]["scopes"]["global"]["path"] = str(alias)
+        self.assertEqual(await self.call("selections-set-mcp"), CASES["relay-error-scope-readonly"]["result"])
+        self.assertFalse(self.mutations)
+
     async def test_deferred_tool_apply_fences_prompts_with_an_override(self):
         self.session.active_tools = []
         self.active = []
