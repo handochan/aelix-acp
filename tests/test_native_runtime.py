@@ -12,6 +12,7 @@ import textwrap
 import unittest
 
 from support import AcpClient, process_alive
+from aelix_acp.runtime import host_bytes, session_relay
 from aelix_acp.runtime.leases import acquire as acquire_lease
 from aelix_acp.wire.errors import ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH
 
@@ -95,6 +96,7 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.model_authorizations = []
         self.write_path = self.root / "approved.txt"
         self.failures = 0
+        self.http_error = None
         self.model_gate = None
         self.prompt_tokens = 23
         self.listener = await asyncio.start_server(self.model, "127.0.0.1", 0)
@@ -168,7 +170,13 @@ def setup(api):
             if self.failures:
                 self.failures -= 1
                 body = b'data: {"error":{"message":"overloaded fixture","type":"overloaded_error"}}\n\n'
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: "
+            status, mime = "200 OK", "text/event-stream"
+            if self.http_error:
+                code, error_type = self.http_error
+                status, mime = f"{code} Fixture Error", "application/json"
+                body = json.dumps({"error": {"type": error_type, "code": error_type,
+                                             "message": "synthetic rejection"}}).encode()
+            writer.write(f"HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nConnection: close\r\nContent-Length: ".encode()
                          + str(len(body)).encode() + b"\r\n\r\n" + body)
             await writer.drain()
         except (ConnectionError, asyncio.IncompleteReadError):
@@ -1533,9 +1541,39 @@ def setup(api):
             await self.prompt("Respond")
         error = json.loads(str(caught.exception))
         self.assertEqual(error["code"], TURN_FAILED_AFTER_DISPATCH)
-        self.assertEqual(error["data"], {"kind": "turn_failed_after_dispatch", "retryable": False})
+        self.assertEqual(error["data"], {"kind": "turn_failed_after_dispatch", "retryable": False,
+                                         "cause": {"kind": "unknown", "retryable": False}})
         self.assertIn("overloaded fixture", error["message"])
         self.assertEqual(len(self.model_requests), 1)
+
+    async def test_private_host_gets_unknown_cause_for_provider_rejections_and_connection_refusal(self):
+        await self.client.close()
+        self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities={"_meta": {
+            session_relay.META_KEY: {"version": 1, "notifications": False}, host_bytes.META_KEY: {"version": 1},
+        }})
+        created = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []})
+        self.session = created["sessionId"]
+        await self.config("autoRetryEnabled", "false")
+        for rejection in ((400, "invalid_request_error"), (401, "authentication_error"),
+                          (403, "permission_error"), (429, "rate_limit_error"),
+                          (500, "api_error"), (503, "overloaded_error"), None):
+            with self.subTest(rejection=rejection):
+                self.http_error = rejection
+                if rejection is None:
+                    self.listener.close()
+                    await self.listener.wait_closed()
+                before = len(self.model_requests)
+                with self.assertRaises(RuntimeError) as caught:
+                    await self.prompt("Respond")
+                self.assertEqual(json.loads(str(caught.exception)), {
+                    "code": TURN_FAILED_AFTER_DISPATCH, "message": "Native model request failed",
+                    "data": {"kind": "turn_failed_after_dispatch", "retryable": False,
+                             "cause": {"kind": "unknown", "retryable": False}},
+                })
+                if rejection is None:
+                    self.assertEqual(len(self.model_requests), before)
+                else:
+                    self.assertGreater(len(self.model_requests), before)
 
     async def test_failure_before_native_dispatch_keeps_its_specific_code(self):
         with self.assertRaises(RuntimeError) as caught:

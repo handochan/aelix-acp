@@ -7,6 +7,7 @@ import codecs
 import asyncio
 import contextlib
 from collections import Counter
+from dataclasses import dataclass
 import json
 import hmac
 import hashlib
@@ -19,8 +20,9 @@ import tempfile
 import time
 import uuid
 
-from .wire.errors import (ProtocolError, BackendError, SOCKET_PATH_TOO_LONG, after_dispatch, delivery_unknown, fork_head_changed,
-                          is_native_session_locked, require_object, require_string, session_changing, session_locked)
+from .wire.errors import (ProtocolError, BackendError, NativeAssistantError, SOCKET_PATH_TOO_LONG, after_dispatch,
+                          delivery_unknown, fork_head_changed, is_native_session_locked, require_object, require_string,
+                          session_changing, session_locked)
 from .wire.process import terminate_owned
 from .stdio import write_diagnostic
 from .wire.transport import encode_frame
@@ -179,6 +181,12 @@ def profile_unavailable(name):
                          -32004, {"kind": "profile_unavailable", "profile": name})
 
 
+@dataclass(frozen=True)
+class TurnFailure:
+    message: str
+    assistant_error: bool = False
+
+
 class Session:
     def __init__(self, server, session_id, cwd, *, initial_mode=None):
         self.server, self.id, self.cwd = server, session_id, cwd
@@ -188,7 +196,7 @@ class Session:
         self.history_requests = set()
         self.tasks = set()
         self.done = None
-        self.failure = None
+        self.failure: TurnFailure | None = None
         self.rpc_closed = False
         self.cancelled = False
         self.cancel_generation = 0
@@ -744,7 +752,7 @@ class Session:
             self.interventions[task] = future  # raise_fence reads whether native answered.
         try:
             if self.rpc_closed:
-                raise ProtocolError(self.failure or "Aelix RPC stream is closed", -32603)
+                raise ProtocolError(self.failure.message if self.failure else "Aelix RPC stream is closed", -32603)
             if not self.proc or self.proc.returncode is not None:
                 raise ProtocolError("Aelix child is not running", -32603)
             frame = {"id": request_id, "type": command, **kwargs}
@@ -848,7 +856,8 @@ class Session:
                 else:
                     await self.event(event)
         except Exception as exc:
-            self.failure = "Aelix stream failed" if self.private_host else f"Aelix stream failed: {exc}"
+            detail = "Aelix stream failed" if self.private_host else f"Aelix stream failed: {exc}"
+            self.failure = TurnFailure(detail)
         finally:
             self.rpc_closed = True
             self.invalidate_image_acceptance()
@@ -857,7 +866,7 @@ class Session:
                 if not future.done():
                     future.set_exception(ProtocolError("Aelix process closed its RPC stream", -32603))
             if self.done and not self.done.done():
-                self.failure = self.failure or "Aelix process closed during a turn"
+                self.failure = self.failure or TurnFailure("Aelix process closed during a turn")
                 self.done.set_result(None)
             if self._close_task is None:
                 task = asyncio.create_task(self.close())
@@ -929,7 +938,9 @@ class Session:
             message = event.get("message") or {}
             error = message.get("errorMessage") or message.get("error_message")
             if error:
-                self.failure = "Native model request failed" if self.private_host else error
+                detail = "Native model request failed" if self.private_host else error
+                stop_reason = message.get("stopReason") or message.get("stop_reason")
+                self.failure = TurnFailure(detail, assistant_error=message.get("role") == "assistant" and stop_reason == "error")
                 self.clear_image_sample()
             await self.settle_message(event, message)
         elif kind == "aelix_subagent":
@@ -1801,7 +1812,9 @@ class Session:
             await self.context.finish_compaction("failed")
             await self.publish_context_usage()
             if self.failure and not self.cancelled:
-                raise ProtocolError(self.failure, -32603)
+                if self.failure.assistant_error:
+                    raise NativeAssistantError(self.failure.message)
+                raise ProtocolError(self.failure.message, -32603)
             stop_reason = "cancelled" if self.cancelled else "end_turn"
             await self.save()
             return {"stopReason": stop_reason}

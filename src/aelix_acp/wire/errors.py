@@ -29,6 +29,11 @@ class BackendError(ProtocolError):
         super().__init__(message, -32603, {"kind": "backend_error", "command": command})
 
 
+class NativeAssistantError(ProtocolError):
+    def __init__(self, message: str):
+        super().__init__(message, -32603)
+
+
 def require_object(value: object, name: str = "params") -> dict:
     if not isinstance(value, dict):
         raise ProtocolError(f"{name} must be an object")
@@ -103,7 +108,11 @@ def after_dispatch(error: BaseException) -> ProtocolError:
         return error
     detail = {"kind": "turn_failed_after_dispatch", "retryable": False}
     data = getattr(error, "data", None)
-    if isinstance(data, dict):
+    if isinstance(error, NativeAssistantError):
+        # The pinned runtime sends an assistant stop reason, but no typed
+        # provider error or HTTP status. Its display text is untrusted.
+        detail["cause"] = {"kind": "unknown", "retryable": False}
+    elif isinstance(data, dict):
         cause = {key: data[key] for key in ("kind", "command") if isinstance(data.get(key), str)}
         if cause:
             detail["cause"] = cause

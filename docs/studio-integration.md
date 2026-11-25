@@ -84,6 +84,47 @@ lands. The native lock is
 recognized from native's own refusal text until R7 provides a structured
 signal; the native transcript path is never copied into the error.
 
+### Native provider failures (ACP #64, Host #71)
+
+A failed native assistant message with `stop_reason: "error"` and an error
+message adds `data.cause = {kind, retryable}` to the `-33002` error. The
+provider cause vocabulary is `provider_auth`, `provider_rate_limit`,
+`provider_unavailable`, `provider_bad_request`, `provider_network` and
+`unknown`. Specific categories require a structured provider status or error
+type from native. The `83714045` pin acknowledges the prompt and then reports
+a generic assistant error in `message_end`. On that wire, HTTP status and
+provider error type survive only in display text, if present at all. The
+adapter emits `unknown` for the following cases on that pin.
+
+| Provider outcome | ACP `data.cause.kind` |
+|---|---|
+| HTTP 400, 401, 403, 429 or 5xx | `unknown` |
+| Provider error in an HTTP 200 stream | `unknown` |
+| Unreachable provider endpoint | `unknown` |
+
+The cause contains only the enum and a boolean. Both `retryable` fields are
+`false` because replaying a dispatched turn could repeat model calls or tool
+effects. The ACP error message retains its existing behavior. A protected
+Studio Host connection receives this error object for each case above.
+
+```json
+{
+  "code": -33002,
+  "message": "Native model request failed",
+  "data": {
+    "kind": "turn_failed_after_dispatch",
+    "retryable": false,
+    "cause": {"kind": "unknown", "retryable": false}
+  }
+}
+```
+
+The host should allowlist `cause.kind` against the vocabulary above, accept
+a boolean `cause.retryable`, and keep the generic turn failure for `unknown`,
+absent, or unrecognized causes. Keep filtering free-form peer details on the
+protected relay and use the outer `data.retryable` for turn replay decisions.
+See [Host #71](https://github.com/handochan/aelix-studio-host/issues/71).
+
 ## Transcript synchronization (ACP #22, Host #4)
 
 When the client offers transcript v1 and the native worker advertises

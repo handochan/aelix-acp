@@ -518,17 +518,17 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             def write(self, raw):
                 payload = json.loads(raw)
                 written.append(payload["type"])
-                if payload["type"] == "prompt" and failure:
-                    session.failure = failure
+                self.command = payload["type"]
                 data = {"isStreaming": False} if payload["type"] == "get_state" else {}
                 asyncio.get_running_loop().call_soon(session.pending[payload["id"]].set_result, data)
             async def drain(self):
-                pass
+                if self.command == "prompt" and failure:
+                    await session.event({"type": "message_end", "message": failure})
         self.session.proc = SimpleNamespace(stdin=Input(), returncode=None if running else 1)
         return written
 
     async def test_failure_after_dispatch_is_marked_not_retryable(self):
-        written = self.native(failure="provider rejected the request")
+        written = self.native(failure={"error_message": "provider rejected the request"})
         with self.assertRaises(ProtocolError) as caught:
             await self.session.prompt([{"type": "text", "text": "Respond"}])
         self.assertEqual(caught.exception.code, TURN_FAILED_AFTER_DISPATCH)
@@ -536,8 +536,23 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("provider rejected", str(caught.exception))
         self.assertEqual(written[0], "prompt")
 
+    async def test_native_assistant_error_classification_ignores_provider_text(self):
+        self.session.socket_dir = self.tmp.name
+        for private, stop_key, error_key in ((False, "stop_reason", "error_message"),
+                                              (True, "stopReason", "errorMessage")):
+            with self.subTest(private=private):
+                detail = 'Error code: 401 - {"type":"authentication_error","key":"fixture-secret"}'
+                self.session.private_host = private
+                self.native(failure={"role": "assistant", stop_key: "error", error_key: detail})
+                with self.assertRaises(ProtocolError) as caught:
+                    await self.session.prompt([{"type": "text", "text": "Respond"}])
+                self.assertEqual(caught.exception.code, TURN_FAILED_AFTER_DISPATCH)
+                self.assertEqual(str(caught.exception), "Native model request failed" if private else detail)
+                self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False,
+                                                         "cause": {"kind": "unknown", "retryable": False}})
+
     async def test_bookkeeping_failure_keeps_the_not_retryable_marking(self):
-        self.native(failure="provider rejected the request")
+        self.native(failure={"role": "assistant", "stop_reason": "error", "error_message": "provider rejected the request"})
         insert_batch = self.session.live_history.insert_batch
 
         def broken_history(db, rows):
@@ -632,7 +647,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.session.done = asyncio.get_running_loop().create_future()
         await self.session.read_rpc()
         self.assertTrue(self.session.done.done())
-        self.assertIn("closed", self.session.failure)
+        self.assertIn("closed", self.session.failure.message)
 
     async def test_saved_analytics_session_cannot_load_as_coding(self):
         self.server.db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?)",
@@ -646,7 +661,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stream_errors_are_preserved(self):
         await self.session.event({"type": "message_end", "message": {"error_message": "provider unavailable"}})
-        self.assertEqual(self.session.failure, "provider unavailable")
+        self.assertEqual(self.session.failure.message, "provider unavailable")
 
     async def test_unknown_permission_mode_is_rejected_without_backend_mutation(self):
         self.server.sessions[self.session.id] = self.session
