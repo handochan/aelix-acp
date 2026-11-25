@@ -628,6 +628,22 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((caught.exception.code, str(caught.exception)), (TURN_FAILED_AFTER_DISPATCH, "Aelix turn timed out"))
         self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False})
 
+    async def test_client_reply_does_not_swallow_enclosing_deadline(self):
+        loop = asyncio.get_running_loop()
+        deadline = asyncio.timeout(None)
+
+        async def send(frame):
+            reply = self.server.pending[frame["id"]]
+            loop.call_soon(reply.set_result, {"outcome": {"outcome": "selected", "optionId": "allow-once"}})
+            deadline.reschedule(loop.time())
+
+        self.server.send = send
+        with self.assertRaises(TimeoutError):
+            async with deadline:
+                await self.server.client_request("session/request_permission", {}, withdraw=True, timeout=2)
+        self.assertTrue(deadline.expired())
+        self.assertFalse(self.server.pending)
+
     async def test_native_assistant_error_classifies_without_copying_provider_details(self):
         self.session.socket_dir = self.tmp.name
         for private, stop_key, error_key in ((False, "stop_reason", "error_message"),

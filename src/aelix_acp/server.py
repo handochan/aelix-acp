@@ -93,6 +93,7 @@ class Server:
         self.withdrawal_slots = asyncio.BoundedSemaphore(MAX_WITHDRAWABLE_REQUESTS)
         self.cleanup_tasks = set()
         self.closing = False  # The client is gone: sessions end without sending.
+        self.input_closed = False
         self.output_lock = asyncio.Lock()
         self.output = None
         self.output_error = None
@@ -264,7 +265,8 @@ class Server:
                 await self.send(frame)
             else:
                 await self.send(frame, before_send=before_send)
-            return await asyncio.wait_for(future, timeout or CLIENT_REQUEST_SECONDS)
+            async with asyncio.timeout(timeout or CLIENT_REQUEST_SECONDS):
+                return await future
         except (asyncio.CancelledError, TimeoutError):
             if withdraw and not self.closing and (future.cancelled() or not future.done()):
                 task = asyncio.create_task(self.send(
@@ -440,6 +442,7 @@ class Server:
 
         identifier = str(uuid.uuid4())
         session = Session(self, identifier, cwd)
+        session.studio_resources.starting_binding = binding_id
         session.client_mcp = mcp
         preferences = load_preferences(self.db, parent)
         head = preferences.pop("forkHead", None)
@@ -470,6 +473,8 @@ class Server:
                     await session.commands()
                     result = {"sessionId": identifier, **session.selectors()}
                     await session.save(session.fork_history(), live=True)
+                    if restore_operation := session.studio_resources.restore_operation:
+                        restore_operation.require_restore_current()
                     self.sessions[identifier] = session
                 try:
                     forks.receipt_path(self.args.state_dir, identifier).unlink(missing_ok=True)
@@ -499,10 +504,16 @@ class Server:
             raise ProtocolError("Session is busy", -32000)
         async with session.mutation_lock:
             await session.close()
+            # A failed compaction recovery can retain an already-closed
+            # session for retry. An explicit close releases that handle too.
+            if self.sessions.get(session.id) is session:
+                self.sessions.pop(session.id)
         return {}
 
-    async def dispatch(self, method, params):
+    async def dispatch(self, method, params, *, response_id=None):
         require_object(params)
+        if handler := session_relay.RESOURCE_REQUESTS.get(method):
+            return await self.relay_request(handler, params, response_id=response_id)
         if handler := session_relay.REQUESTS.get(method):
             return await self.relay_request(handler, params)
         if self.host_bytes is not None and (handler := session_relay.IMAGE_REQUESTS.get(method)):
@@ -515,18 +526,36 @@ class Server:
             return await self.intervene(params)
         if method in SESSION_MUTATIONS:
             session_id = require_string(params.get("sessionId"), "sessionId")
-            if method in ("session/load", "session/delete", "session/close") and session_id in self.starting_ids:
+            live = self.sessions.get(session_id)
+            candidate = self.pending_stop_sessions.get(session_id) or live
+            if method == "session/close" and candidate is not None:
+                candidate.studio_resources.retire_approval()
+            if method == "session/load" and self.relay_enabled:
+                replacement = session_relay.open_binding(params.get("_meta"))
+                cwd = params.get("cwd")
+                if (candidate is not None and replacement is not None and isinstance(cwd, str)
+                        and str(Path(cwd).expanduser().resolve()) == candidate.cwd):
+                    candidate.studio_resources.retire_replaced_approval(replacement)
+            pending_open = live is not None and live.studio_resources.restore_operation is not None
+            if pending_open or (method in ("session/load", "session/delete", "session/close")
+                                and session_id in self.starting_ids):
                 raise ProtocolError("Session is already starting", -32000)
             registered = session_id in self.sessions or self.db.execute(
                 "SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
             if registered:
                 with acquire_lease(self.args.state_dir, session_id, purpose="activity"):
+                    readback = method == "_aelix/manage" and params.get("action") in (
+                        "resources/list", "agents/list", "agents/show", "mcp/status", "permissions/get",
+                    )
+                    if (live is not None and live.studio_resources.uncertain and not readback
+                            and method not in {"session/load", "session/close", "session/delete"}):
+                        raise ProtocolError("Reopen the session to recover its profile and tool state.", -32004)
                     return await self.dispatch_request(method, params)
             if method == "session/fork":
                 raise ProtocolError("Saved session does not match this workspace and profile")
         return await self.dispatch_request(method, params)
 
-    async def relay_request(self, handler, params):
+    async def relay_request(self, handler, params, **kwargs):
         if not self.relay_enabled:
             raise ProtocolError("Session relay was not negotiated.", -32601)
         session_relay.require_fields(params, {"sessionId", "bindingId", "payload"})
@@ -534,9 +563,13 @@ class Server:
         binding_id = require_string(params["bindingId"], "bindingId")
         session = self.sessions.get(session_id)
         relay = session.input_relay if session is not None else None
-        if relay is None or relay.binding_id != binding_id or session_id in self.starting_ids:
+        if (relay is None or relay.binding_id != binding_id or session_id in self.starting_ids
+                or session.studio_resources.retired_binding == binding_id
+                or session.studio_resources.restore_operation is not None):
             raise ProtocolError("Session relay binding is unavailable.", session_relay.SCOPE_DENIED)
-        return await handler(relay, params["payload"])
+        if "response_id" in kwargs:
+            session_relay.validate_response_id(kwargs["response_id"])
+        return await handler(relay, params["payload"], **kwargs)
 
     async def intervene(self, params):
         session_id = require_string(params.get("sessionId"), "sessionId")
@@ -544,6 +577,8 @@ class Server:
         if session_id in self.starting_ids:
             raise session_changing()
         session = self.session(params)
+        if session.studio_resources.restore_operation is not None:
+            raise session_changing()
         if params["action"] not in session.controls.capabilities.get("methods", []):
             raise ProtocolError("Unsupported management action")
         return await session.intervene(params["action"], arguments)
@@ -615,18 +650,18 @@ class Server:
             session = None
             snapshot = None
             try:
-                if previous:
-                    self.sessions.pop(session_id, None)
-                    await previous.close()
                 session = Session(self, session_id, cwd,
                                   initial_mode=getattr(self.args, "permission_mode", "default") if method == "session/new" else None)
                 session.index_snapshot = index_snapshot
                 session.client_mcp = params.get("mcpServers", [])
+                if method == "session/load":
+                    self.pending_stop_sessions[session_id] = session
+                    session.studio_resources.starting_binding = binding_id
+                if previous:
+                    self.sessions.pop(session_id, None)
+                    await previous.close()
                 async with session.publication_lock:
                     await session.start(session_file)
-                    if method == "session/load":
-                        # Stop can address the worker while replay and publication are pending.
-                        self.pending_stop_sessions[session_id] = session
                     await session.commands()
                     if method == "session/load":
                         snapshot = await self.replay_history(session)
@@ -634,10 +669,13 @@ class Server:
                         await session.save(live=True)
                     await session.publish_recovery_warnings()
                     await session.live_history.flush()
+                    if restore_operation := session.studio_resources.restore_operation:
+                        restore_operation.require_restore_current()
                     session.require_live_worker()
                     self.sessions[session_id] = session
             except BaseException:
-                self.sessions.pop(session_id, None)
+                if self.sessions.get(session_id) is session:
+                    self.sessions.pop(session_id, None)
                 if session:
                     await session.close()
                 raise
@@ -661,11 +699,13 @@ class Server:
             lease = live.lease if live and live.lease else acquire_lease(self.args.state_dir, session_id)
             if live:
                 live.lease = None  # Hold the lease across native close and SQL deletion.
+            close_completed = False
             self.starting_ids.add(session_id)
             try:
                 async with (live.mutation_lock if live else asyncio.Lock()):
                     if live:
                         await live.close()
+                        close_completed = True
                     def delete_records(db):
                         db.execute("DELETE FROM preferences WHERE session_id=?", (session_id,))
                         db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
@@ -674,8 +714,11 @@ class Server:
                         db.execute("DELETE FROM turns WHERE session_id=?", (session_id,))
 
                     await write_store(self.args.state_dir, delete_records)
+                    if live is not None and self.sessions.get(session_id) is live:
+                        self.sessions.pop(session_id)
             except BaseException:
-                if live and self.sessions.get(session_id) is live:
+                # A retained handle with a completed close cannot release a returned lease.
+                if live and not close_completed and self.sessions.get(session_id) is live:
                     live.lease, lease = lease, None
                 raise
             finally:
@@ -749,7 +792,8 @@ class Server:
             if session.mutation_lock.locked():
                 raise ProtocolError("Session is busy", -32000)
             async with session.mutation_lock:
-                await session.recover_after_compaction()
+                if not session.studio_resources.uncertain:
+                    await session.recover_after_compaction()
                 if action == "sessions/branch":
                     return await self.branch_session(session, arguments)
                 if action == "workspace/trust":
@@ -783,14 +827,16 @@ class Server:
                     return await session.notice_turn()
                 if action == "mcp/configure":
                     result = await session.configure_mcp(arguments.get("servers"))
+                elif action == "resources/reload":
+                    result = await session.reload_resources(arguments, timeout=60)
                 else:
                     result = await session.rpc("aelix_control", method=action, params=arguments,
                         _timeout=(getattr(self.args, "command_timeout", 600) or None) if action in LONG_CONTROLS else 60)
                 if action == "tools/set_active":
                     session.active_tools = result["activeTools"]
+                    session.studio_resources.invalidate_pages()
                     await session.save()
                 if action == "resources/reload":
-                    await session.restore_tools()
                     await session.commands()
                 if action == "agents/use":
                     await session.commands()
@@ -812,27 +858,46 @@ class Server:
             method = message["method"]
             if request_id is None and (method == "session/prompt" or method.startswith(session_relay.METHOD_PREFIX)):
                 return  # These methods are requests and require a correlated reply.
-            result = await self.dispatch(method, message.get("params") or {})
+            kwargs = {"response_id": request_id} if method in session_relay.RESOURCE_REQUESTS else {}
+            result = await self.dispatch(method, message.get("params") or {}, **kwargs)
             if request_id is not None:
                 response = {"jsonrpc": "2.0", "id": request_id, "result": result}
                 if method == session_relay.LOOKUP_METHOD:
                     response = session_relay.bounded_lookup_response(response)
-                await self.send(response)
-                replied = True
-                if message["method"] in ("session/new", "session/load", "session/fork"):
+                session = None
+                if method in ("session/new", "session/load", "session/fork"):
                     session = self.sessions.get(result.get("sessionId") or message.get("params", {}).get("sessionId"))
-                    if session:
-                        # Follows the open response, so a host that applies its
-                        # own saved preference first still observes the
-                        # restored policy.
-                        await session.update({"sessionUpdate": "current_mode_update",
-                                              "currentModeId": session.controls.permission_mode})
+                resources = getattr(session, "studio_resources", None)
+                restore_operation = getattr(resources, "restore_operation", None)
+                if restore_operation is None:
+                    await self.send(response)
+                else:
+                    def admit_binding():
+                        restore_operation.require_restore_current()
+                        resources.restore_operation = None
+                        resources.starting_binding = None
+
+                    try:
+                        await self.send(response, before_send=admit_binding)
+                    except ProtocolError:
+                        await session.close()
+                        raise
+                replied = True
+                if resources is not None:
+                    resources.starting_binding = None
+                if session:
+                    # Follows the open response, so the host observes the restored policy.
+                    await session.update({"sessionUpdate": "current_mode_update",
+                                          "currentModeId": session.controls.permission_mode})
         except Exception as exc:
             if self.output_error is not None or self.closing:
                 return
             if request_id is not None and not replied:
                 error = {"code": getattr(exc, "code", -32603), "message": str(exc)}
-                if isinstance(exc, ProtocolError) and exc.data is not None:
+                if method in session_relay.RESOURCE_REQUESTS or (
+                        method.startswith(session_relay.METHOD_PREFIX) and error["code"] == -32601):
+                    error["message"] = "Outcome unknown." if error["code"] == -33100 else "Request refused."
+                elif isinstance(exc, ProtocolError) and exc.data is not None:
                     error["data"] = exc.data
                 await self.send({"jsonrpc": "2.0", "id": request_id, "error": error})
             else:
@@ -867,6 +932,7 @@ class Server:
 
         def end_input():
             nonlocal input_deadline
+            self.input_closed = True
             if input_deadline is None and not self.closing:
                 input_deadline = loop.call_later(STDOUT_DRAIN_SECONDS, stop)
                 self.error_replies.end_input()
