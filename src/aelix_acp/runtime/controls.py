@@ -143,15 +143,17 @@ class SessionControls:
         Native refuses such a prompt itself ("No model selected", aelix-ai
         runnable_models.turn_refusal) with CLI advice a client cannot follow;
         this names the option to set instead. A state without a model field is
-        no evidence, and the state is read again before refusing.
+        no evidence, and the state is read again before refusing. A catalog that
+        changed meanwhile (a model, or models to choose from) is published first.
         """
         if "model" not in self.session.state or self.model_selected():
             return
+        published = self.options()
         await self.refresh()
-        if self.model_selected():
+        if self.options() != published:
             await self.session.update({"sessionUpdate": "config_option_update", "configOptions": self.options()})
-            return
-        raise model_selection_required(len(self.models))
+        if not self.model_selected():
+            raise model_selection_required(len(self.models))
 
     async def set(self, config_id: str, value: str, *, publish=True) -> dict:
         option = next((option for option in self.options() if option["id"] == config_id), None)

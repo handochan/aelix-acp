@@ -155,6 +155,7 @@ class NoCurrentModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("prompt", commands)
         self.assertIn("get_state", commands)  # The refusal reads native again first.
         self.assertEqual(self.recorded("user_message_chunk"), [])
+        self.assertEqual(self.published(), [])  # Nothing changed, so nothing is republished.
 
         await self.session.controls.set("model", "fixture/reasoner")
         self.assertEqual(await self.prompt("Hello"), {"stopReason": "end_turn"})
@@ -179,6 +180,17 @@ class NoCurrentModelTests(unittest.IsolatedAsyncioTestCase):
         with patch("aelix_acp.session.execute_slash", prepare), self.assertRaises(ProtocolError) as refused:
             await self.prompt("/template")
         self.assertEqual(refused.exception.data, REFUSAL)
+        self.assertNotIn("prompt", [command for command, _kwargs in self.calls])
+
+    async def test_refusal_first_publishes_a_catalog_that_changed_meanwhile(self):
+        # A provider was configured without the selectors being republished.
+        self.available.append({"id": "added", "name": "Added", "provider": "other", "reasoning": False})
+        with self.assertRaises(ProtocolError) as refused:
+            await self.prompt("Hello")
+        self.assertEqual(refused.exception.data, {**REFUSAL, "availableModels": 3})
+        model = self.option(self.published()[-1]["configOptions"], "model")
+        self.assertEqual(model["currentValue"], "")
+        self.assertIn("other/added", [entry["value"] for entry in model["options"]])
         self.assertNotIn("prompt", [command for command, _kwargs in self.calls])
 
     async def test_a_model_native_reports_on_the_second_read_is_used_and_published(self):
