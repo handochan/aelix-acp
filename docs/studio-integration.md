@@ -397,10 +397,15 @@ Set accepts 1–1024 distinct, ordered `{key,on}` entries with boolean
 project scope exclusively. Global listings report `writable:false` with
 `reason:"management-helper"`. Global writes return `-33102` before a native
 call. Confirmation, paths, cwd, and commands are outside the payload schema.
-ACP checks the native target against the expected project filename and refuses
-existing path aliases. Native rechecks trust under its write lock. The MCP
-writer also checks the path identity from its own snapshot. An external
-retarget between ACP's check and the native snapshot is outside that check.
+Under the session write lease, ACP requires the expected project filename,
+rejects aliased directories and files, and checks the project and global file
+identities before dispatch and after native replies. A reported save must
+create or atomically replace the project file. Unexpected file or directory
+changes produce an unknown outcome and fence the worker. The pinned native
+writer resolves and locks its own target later. A path retarget can still
+affect another file before ACP detects it, and a retarget restored before
+readback may be invisible if its effect is outside the observed files. A native
+guard must bind the expected project directory and target to the transaction.
 
 First-time creation of `.aelix/settings.json` uses one standard
 `session/request_permission` card tied to the native confirm ID, operation,

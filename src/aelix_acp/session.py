@@ -1428,9 +1428,11 @@ class Session:
                 operation.require_current()
                 if not operation.awaiting_native():
                     cause = "unanswered"
-                if cause is None and not studio_selections.path_is_current(operation.target, operation.scopes):
-                    cause = "cancelled"
+                if cause is None:
+                    operation.target.require_version(operation.target.before)
             except (profile_reselection.Stopped, asyncio.CancelledError):
+                cause = "cancelled"
+            except studio_selections.UnsafeTarget:
                 cause = "cancelled"
             except TimeoutError:
                 cause = "unanswered"

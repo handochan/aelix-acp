@@ -150,21 +150,26 @@ class StudioResources:
         except (BackendError, KeyError, TypeError, ValueError):
             return refusal("unreadable")
         operation.require_current()
-        if not project["writable"]:
+        if not project["writable"] or project["exists"] != target.exists:
             return refusal("scope-readonly", scope="project", written=[])
         if not project["exists"] and (self.session.controls.permission_mode != "default"
                                       or not self.supports("ui/enable")):
             return refusal("consent-required", cause="unanswered", scope="project", written=[])
-        operation.target, operation.scopes = target, scopes
+        operation.target = target
         try:
             native = await self.session.rpc(
                 "aelix_control", method=selections.SET, params={"scope": "project", **value},
                 _before_native_write=operation.before_write, _selection_write=operation, _timeout=90,
             )
+        except selections.UnsafeTarget:
+            if operation.dispatched:
+                raise
+            return refusal("scope-readonly", scope="project", written=[])
         except BackendError as error:
             reason = getattr(error, "studio_selection_refusal", None)
             if reason is None or (reason == "cancelled" and operation.confirmation_sent):
                 raise
+            target.require_version(target.before)
             operation.no_effect = True
             if reason == "cancelled":
                 if not project["exists"] or operation.confirm_id is not None:
@@ -177,7 +182,8 @@ class StudioResources:
                 return refusal(reason, scope="project", written=[])
             return refusal(reason)
         operation.require_current()
-        result = selections.project_readback(kind, native, rows, target, changes)
+        result = selections.project_readback(kind, native, rows, target.path, changes)
+        version = target.verify_save(result["written"])
         if kind == "tool" and self.session.active_tools is not None:
             if result["apply"]["deferred"]:
                 # A native deferred apply can still turn tools back on after
@@ -186,6 +192,7 @@ class StudioResources:
             else:
                 await self.session.restore_tools(operation=operation)
                 operation.require_current()
+        target.require_version(version)
         if not fits(result):
             raise internal_error()
         return result

@@ -53,6 +53,12 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
                                                        "activeTools": self.active},
                          "tools/set_active": self.set_tools}
         self.snapshots = {kind: self.snapshot(kind) for kind in LIST_CASES}
+        (self.root / ".aelix").mkdir()
+        for kind in ("tool", "mcp"):
+            (self.root / studio_selections.file_label(kind)).write_bytes(b"{}")
+        self.global_file = self.root / "global/config.json"
+        self.global_file.parent.mkdir()
+        self.global_file.write_bytes(b"{}")
         self.active = ["read"]
         self.writes = {kind: self.write_result("selections-set-" + kind) for kind in LIST_CASES}
         self.server.send = self.send
@@ -138,7 +144,16 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
             self.finish_set(request)
 
     def finish_set(self, request):
-        self.reply(request, self.writes[request["params"]["kind"]])
+        result = self.writes[request["params"]["kind"]]
+        for path in map(Path, result["written"]):
+            replacement = path.with_suffix(".tmp")
+            replacement.write_bytes(b"{}")
+            replacement.replace(path)
+        self.reply(request, result)
+
+    def missing_project_file(self, kind):
+        self.snapshots[kind]["scopes"]["project"]["exists"] = False
+        (self.root / studio_selections.file_label(kind)).unlink(missing_ok=True)
 
     def set_tools(self, request):
         self.active = request["params"]["names"]
@@ -270,7 +285,7 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_confirm_approve_refuse_cancel_and_timeout(self):
         self.confirm = True
-        self.snapshots["skill"]["scopes"]["project"]["exists"] = False
+        self.missing_project_file("skill")
         fixture = CASES["project-file-consent"]
         for index, case in enumerate(("project-file-consent", "project-permission-deny",
                                       "project-permission-cancel", "project-permission-timeout"), start=1):
@@ -280,6 +295,7 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
                                            else vector["permissionOutcome"])
                 payload = {**fixture["post"]["payload"], "requestId": f"019aa123-0001-7000-8000-{index:012d}"}
                 timeout = 0.1 if self.permission_outcome is None else 45
+                self.missing_project_file("skill")
                 with patch.object(profile_reselection, "APPROVAL_SECONDS", timeout):
                     self.assertEqual(await self.call(case if index == 1 else "project-file-consent", payload=payload),
                                      vector["result"])
@@ -292,7 +308,7 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_yolo_cannot_create_and_unsupported_kind_is_never_sent(self):
         self.session.controls.permission_mode = "yolo"
-        self.snapshots["skill"]["scopes"]["project"]["exists"] = False
+        self.missing_project_file("skill")
         self.assertEqual(await self.call("selections-set-skill"), CASES["project-permission-timeout"]["result"])
         self.session.controls.capabilities["selectionKinds"].remove("skill")
         self.assertEqual(await self.call("relay-error-unsupported"), CASES["relay-error-unsupported"]["result"])
@@ -318,7 +334,7 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_close_and_rebind_while_waiting_for_consent_reject_late_selection(self):
         self.confirm = True
-        self.snapshots["skill"]["scopes"]["project"]["exists"] = False
+        self.missing_project_file("skill")
         for method in ("session/close", "session/load"):
             with self.subTest(method=method):
                 self.permission_sent.clear()
@@ -386,7 +402,7 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.call("selections-set-tool"), CASES["relay-error-busy"]["result"])
         self.controls["selections/set"] = self.set_native
         self.confirm = True
-        self.snapshots["skill"]["scopes"]["project"]["exists"] = False
+        self.missing_project_file("skill")
         write = asyncio.create_task(self.call("selections-set-skill"))
         await asyncio.wait_for(self.permission_sent.wait(), 5)
         self.reply(self.selection_frame, error="Command cancelled")
@@ -398,6 +414,38 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         scopes["global"]["path"] = scopes["project"]["path"]
         listing = await self.call("selections-list-mcp")
         self.assertFalse(listing["scopes"]["project"]["writable"])
+        self.assertEqual(await self.call("selections-set-mcp"), CASES["relay-error-scope-readonly"]["result"])
+        self.assertFalse(self.mutations)
+
+    async def test_project_directory_replaced_after_dispatch_is_outcome_unknown(self):
+        project = self.root / ".aelix"
+        project.mkdir(exist_ok=True)
+        self.controls["selections/set"] = lambda _: self.requested.set()
+        write = asyncio.create_task(self.call("selections-set-mcp"))
+        await asyncio.wait_for(self.requested.wait(), 5)
+        project.rename(self.root / "previous")
+        project.mkdir()
+        self.finish_set(self.selection_frame)
+        with self.assertRaises(ProtocolError) as raised:
+            await write
+        self.assertEqual(raised.exception.code, session_relay.OUTCOME_UNKNOWN)
+        self.assertTrue(self.session.studio_resources.uncertain)
+
+    async def test_global_file_change_during_save_is_outcome_unknown(self):
+        self.controls["selections/set"] = lambda _: self.requested.set()
+        write = asyncio.create_task(self.call("selections-set-mcp"))
+        await asyncio.wait_for(self.requested.wait(), 5)
+        self.global_file.write_bytes(b'{"unexpected": true}')
+        self.finish_set(self.selection_frame)
+        with self.assertRaises(ProtocolError) as raised:
+            await write
+        self.assertEqual(raised.exception.code, session_relay.OUTCOME_UNKNOWN)
+        self.assertTrue(self.session.studio_resources.uncertain)
+
+    async def test_project_file_hardlinked_to_global_is_readonly(self):
+        target = self.root / ".aelix/mcp.json"
+        target.unlink()
+        target.hardlink_to(self.global_file)
         self.assertEqual(await self.call("selections-set-mcp"), CASES["relay-error-scope-readonly"]["result"])
         self.assertFalse(self.mutations)
 

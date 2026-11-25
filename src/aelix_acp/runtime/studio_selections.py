@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 from collections import Counter
+import os
 from pathlib import Path
+import stat
 
+from .profile_refs import file_stamp
 from .profile_reselection import Operation
 
 EFFECTS = {"tool": "next_request", "skill": "next_request", "mcp": "restart"}
@@ -23,7 +26,6 @@ class SelectionWrite(Operation):
         self.consent_cause = None
         self.confirmation_sent = False
         self.target = None
-        self.scopes = None
 
     def awaiting_native(self):
         return self.reply is not None and not self.reply.done()
@@ -33,10 +35,15 @@ class SelectionWrite(Operation):
         if (self.awaiting_native() and self.confirm_id is None
                 and isinstance(identifier, str) and identifier
                 and event.get("title") == CREATE_TITLE and event.get("message") == CREATE_HINT
-                and self.target.name == "settings.json"):
+                and self.target.path.name == "settings.json"):
             self.confirm_id = identifier
             return True
         return False
+
+    def before_write(self):
+        self.require_current()
+        self.target.require_version(self.target.before)
+        super().before_write()
 
 
 def file_label(kind):
@@ -44,24 +51,108 @@ def file_label(kind):
 
 
 def project_target(session, kind, scopes):
-    """Check the native target before dispatch. Native owns locking and trust checks."""
     project = scopes["project"]["path"]
     try:
         target = Path(session.cwd) / file_label(kind)
-        if not isinstance(project, str) or Path(project) != target or not path_is_current(target, scopes):
+        if not isinstance(project, str) or Path(project) != target:
             return None
-        return target
-    except (OSError, ValueError, RuntimeError):
+        return TargetFence(target, scopes["global"]["path"])
+    except UnsafeTarget:
         return None
 
 
-def path_is_current(target, scopes):
+class UnsafeTarget(ValueError):
+    def __init__(self):
+        super().__init__("Project selection file identity could not be verified")
+
+
+def is_alias(info):
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def directory_identity(path, *, optional=False):
     try:
-        global_ = scopes["global"]["path"]
-        return (target.resolve() == target
-                and (not isinstance(global_, str) or Path(global_).resolve() != target))
-    except (OSError, ValueError, RuntimeError):
-        return False
+        info = path.lstat()
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise
+    if is_alias(info) or not stat.S_ISDIR(info.st_mode):
+        raise UnsafeTarget()
+    return info.st_dev, info.st_ino
+
+
+def target_stamp(path, *, project=False):
+    """Verify with two handles to keep stat and fstat timestamps comparable on Windows."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if is_alias(info) or not stat.S_ISREG(info.st_mode):
+        raise UnsafeTarget()
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    stamps = []
+    for _ in range(2):
+        with os.fdopen(os.open(path, flags), "rb") as file:
+            current = os.fstat(file.fileno())
+            if not stat.S_ISREG(current.st_mode) or (project and current.st_nlink != 1):
+                raise UnsafeTarget()
+            stamps.append(file_stamp(current))
+    if stamps[0] != stamps[1] or path.resolve(strict=True) != path:
+        raise UnsafeTarget()
+    return stamps[0]
+
+
+class TargetFence:
+    """ACP's observations under the session write lease. Native owns the filesystem lock."""
+
+    def __init__(self, path, global_path):
+        if not isinstance(global_path, str) or not Path(global_path).is_absolute():
+            raise UnsafeTarget()
+        self.path = path
+        self.global_path = Path(global_path)
+        self.before = self.version()
+
+    def version(self):
+        try:
+            path = self.path
+            cwd = directory_identity(path.parent.parent)
+            parent = directory_identity(path.parent, optional=True)
+            global_target = self.global_path.resolve()
+            if path.resolve() != path or global_target == path:
+                raise UnsafeTarget()
+            project = target_stamp(path, project=True)
+            global_version = target_stamp(global_target)
+            if (directory_identity(path.parent.parent) != cwd
+                    or directory_identity(path.parent, optional=True) != parent
+                    or self.global_path.resolve() != global_target):
+                raise UnsafeTarget()
+            return cwd, parent, project, (global_target, global_version)
+        except (OSError, ValueError, RuntimeError):
+            raise UnsafeTarget() from None
+
+    @property
+    def exists(self):
+        return self.before[2] is not None
+
+    def require_version(self, expected):
+        if self.version() != expected:
+            raise UnsafeTarget()
+
+    def verify_save(self, written):
+        after = self.version()
+        if not written:
+            if after != self.before:
+                raise UnsafeTarget()
+            return after
+        cwd, parent, file, global_version = self.before
+        if (after[0] != cwd or (parent is not None and after[1] != parent)
+                or after[2] is None or (file is not None and after[2][:2] == file[:2])
+                or after[3] != global_version):
+            raise UnsafeTarget()
+        return after
 
 
 def native_refusal(message):
