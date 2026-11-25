@@ -669,7 +669,13 @@ def setup(api):
         for _ in range(2):
             self.client.updates.clear()
             opened = await self.client.request("session/load", load, timeout=120)
-            self.assertEqual(opened["_meta"]["aelix/transcript"]["totalMessages"], 0)
+            marker = opened["_meta"]["aelix/transcript"]
+            self.assertEqual(marker["totalMessages"], 0)
+            replayed = [update for update in self.updates() if update["sessionUpdate"] not in {
+                "available_commands_update", "config_option_update", "current_mode_update",
+                "session_info_update", "usage_update"}]
+            self.assertGreater(len(replayed), 0)
+            self.assertEqual(marker["totalFrames"], len(replayed))
             self.assertEqual(self.card(parent)[-1]["status"], "completed")
             self.assertEqual(self.card(nested[0]["toolCallId"]), nested)
 

@@ -80,7 +80,7 @@ class StdoutWriter:
         self.finished = asyncio.Event()
         threading.Thread(target=self.pump, name="acp-stdout", daemon=True).start()
 
-    async def write(self, raw, *, before_queue=None):
+    async def write(self, raw, *, before_queue=None, after_queue=None):
         await self.credit.acquire()
         if before_queue is not None:
             try:
@@ -91,6 +91,8 @@ class StdoutWriter:
         future = self.loop.create_future()
         self.pending.add(future)
         self.queue.put_nowait((raw, future, before_queue is not None))
+        if after_queue is not None:
+            after_queue()
         await future
 
     def settle(self, future, error, first_failure):

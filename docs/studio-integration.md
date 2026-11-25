@@ -114,9 +114,18 @@ snapshot marker in the successful load result:
 ```json
 {"_meta": {"aelix/transcript": {
   "version": 1, "nativeSessionId": "native-123", "leafId": "c8434a01",
-  "totalMessages": 4, "recovered": false
+  "totalMessages": 4, "totalFrames": 4, "recovered": false
 }}}
 ```
+
+The optional nonnegative integer `totalFrames` counts the display
+`session/update` notifications emitted during the completed load, including native
+parts, synthetic tool cards, adapter display updates and recovery warnings.
+It excludes lifecycle updates such as the command catalog and context usage. When present,
+the client must check that it received that many replay frames. Older
+adapters can omit it, so clients still verify the native entry count and
+contiguous parts. A present marker with a frame count mismatch gives the host
+no snapshot to apply.
 
 The durable key is `(nativeSessionId, entryId)`. Sequence is the one-based
 native message ordinal on the selected path. Siblings can share an ordinal,

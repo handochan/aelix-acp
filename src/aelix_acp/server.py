@@ -98,10 +98,10 @@ class Server:
         self.run_task = None
         self.managed_extensions = getattr(args, "managed_extensions", None)
 
-    async def send(self, message, *, before_send=None):
-        await self._send_frame(message, before_send=before_send)
+    async def send(self, message, *, before_send=None, display_count=None):
+        await self._send_frame(message, before_send=before_send, display_count=display_count)
 
-    async def _send_frame(self, payload, *, before_send=None):
+    async def _send_frame(self, payload, *, before_send=None, display_count=None):
         async with self.output_lock:
             if self.output_error is not None:
                 raise self.output_error
@@ -110,7 +110,14 @@ class Server:
             raw = payload if isinstance(payload, bytes) else encode_frame(payload)
             if self.output is None:
                 self.output = StdoutWriter(on_failure=self.output_failed)
-            if before_send is None:
+            if display_count is not None:
+                # This display frame remains queued if its waiter is
+                # cancelled. Count it before releasing the encoding lock.
+                def count_queued_frame():
+                    display_count["totalFrames"] += 1
+
+                await self.output.write(raw, after_queue=count_queued_frame)
+            elif before_send is None:
                 await self.output.write(raw)
             else:
                 await self.output.write(raw, before_queue=before_send)
@@ -619,6 +626,8 @@ class Server:
                                   initial_mode=getattr(self.args, "permission_mode", "default") if method == "session/new" else None)
                 session.index_snapshot = index_snapshot
                 session.client_mcp = params.get("mcpServers", [])
+                if method == "session/load" and transcript.offered(getattr(self, "client_capabilities", {})):
+                    session.load_display_frames = {"totalFrames": 0}
                 async with session.publication_lock:
                     await session.start(session_file)
                     if method == "session/load":
@@ -643,7 +652,10 @@ class Server:
                 self.starting_ids.discard(session_id)
             result = {**session.selectors(), **({"sessionId": session_id} if method.endswith("new") else {})}
             if snapshot is not None:
-                result["_meta"][transcript.META] = snapshot
+                session.load_display_frames.update(snapshot)
+                result["_meta"][transcript.META] = session.load_display_frames
+            else:
+                session.load_display_frames = None
             return session_relay.bind_session(session, result, binding_id)
         if method == "session/close":
             return await self.close_session(self.session(params))
@@ -819,6 +831,9 @@ class Server:
                 if message["method"] in ("session/new", "session/load", "session/fork"):
                     session = self.sessions.get(result.get("sessionId") or message.get("params", {}).get("sessionId"))
                     if session:
+                        marker = (result.get("_meta") or {}).get(transcript.META)
+                        if marker is not None and marker is session.load_display_frames:
+                            session.load_display_frames = None
                         # Follows the open response, so a host that applies its
                         # own saved preference first still observes the
                         # restored policy.

@@ -24,6 +24,8 @@ METHOD = "transcript/list"
 SETTLED = "_aelix/transcript/settled"
 VERSION = {"version": 1}
 ROLES = {"user", "assistant", "toolResult"}
+DISPLAY_UPDATES = {"user_message_chunk", "agent_message_chunk", "agent_thought_chunk",
+                   "tool_call", "tool_call_update", "plan"}
 POSITIONS = ("entryId", "parentEntryId", "sequence")
 MAX_PART = 196_608
 MAX_BYTES = 64 * 1024**2

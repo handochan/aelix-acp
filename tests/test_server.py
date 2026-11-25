@@ -35,6 +35,42 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.server.db.close()
         self.tmp.cleanup()
 
+    async def test_load_frame_count_is_sealed_after_earlier_output(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                entered, release = asyncio.Event(), asyncio.Event()
+                captured = []
+
+                async def write(raw, *, after_queue=None):
+                    frame = json.loads(raw)
+                    captured.append(frame)
+                    if after_queue is not None:
+                        after_queue()
+                        entered.set()
+                        await release.wait()
+
+                self.server.output = SimpleNamespace(write=write)
+                self.session.load_display_frames = {"version": 1, "totalFrames": 0}
+                self.server.send = Server.send.__get__(self.server)
+                update = {"sessionUpdate": "agent_message_chunk",
+                          "content": {"type": "text", "text": "Recovery"}}
+                notify = asyncio.create_task(
+                    self.session.notify("session/update", {"sessionId": self.session.id, "update": update}))
+                await asyncio.wait_for(entered.wait(), 5)
+                response = {"jsonrpc": "2.0", "id": 1, "result": {"_meta": {
+                    "aelix/transcript": self.session.load_display_frames}}}
+                reply = asyncio.create_task(self.server.send(response))
+                if cancel:
+                    notify.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await notify
+                else:
+                    release.set()
+                    await asyncio.wait_for(notify, 5)
+                await asyncio.wait_for(reply, 5)
+                self.assertEqual(captured[0]["params"]["update"], update)
+                self.assertEqual(captured[1]["result"]["_meta"]["aelix/transcript"]["totalFrames"], 1)
+
     async def test_close_session_rejects_held_mutation_lock(self):
         async with self.session.mutation_lock:
             with self.assertRaises(ProtocolError) as refused:

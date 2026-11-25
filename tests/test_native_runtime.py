@@ -1027,10 +1027,20 @@ def setup(api):
         config["providers"]["replacement"] = provider
         filename.write_text(json.dumps(config), encoding="utf-8")
         (self.root / "agent/settings.json").write_text(json.dumps({"defaultProvider": "replacement", "defaultModel": "one"}), encoding="utf-8")
-        self.client = await AcpClient.start(self.root, EXECUTABLE)
+        meta = "aelix/transcript"
+        self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities={"_meta": {meta: {"version": 1}}})
         result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []})
         self.assertEqual(result["models"]["currentModelId"], "replacement/one")
         self.assertTrue(result["_meta"]["aelix/recoveryWarnings"])
+        marker = result["_meta"].get(meta)
+        if marker is not None or os.environ.get("AELIX_ACP_REQUIRE_TRANSCRIPT") == "1":
+            self.assertIsNotNone(marker)
+            updates = [event["params"]["update"] for event in self.client.updates if event["method"] == "session/update"]
+            display = [update for update in updates if meta in update.get("_meta", {})]
+            warnings = [update for update in display if update.get("content", {}).get("text", "").startswith("Session recovery: ")]
+            self.assertTrue(warnings)
+            self.assertGreater(marker["totalFrames"], marker["totalMessages"])
+            self.assertEqual(marker["totalFrames"], len(display))
 
     async def test_removed_profile_refuses_the_load_and_never_widens_tools(self):
         profiles = self.root / "agent/agents"
@@ -1612,6 +1622,7 @@ def setup(api):
                 self.fail("The transcript candidate must advertise transcript/list")
             self.skipTest("This native runtime does not advertise transcript/list")
         self.assertEqual(initial["_meta"][meta]["totalMessages"], 0)
+        self.assertEqual(initial["_meta"][meta]["totalFrames"], 0)
 
         await self.config("permission_mode", "yolo")
         self.client.updates.clear()
@@ -1689,6 +1700,7 @@ def setup(api):
             updates = [event["params"]["update"] for event in self.client.updates if event["method"] == "session/update"]
             replay = [(update["_meta"][meta], update["content"]["text"]) for update in updates
                       if update["sessionUpdate"] in {"agent_message_chunk", "user_message_chunk"}]
+            self.assertEqual(marker["totalFrames"], len(replay))
             self.assertEqual([text for _, text in replay],
                              ["Studio first turn", "NATIVE_OK", "Identical CLI input", "NATIVE_OK",
                               "Identical CLI input", "NATIVE_OK"])
@@ -1708,10 +1720,13 @@ def setup(api):
         for _ in range(2):
             self.client.updates.clear()
             result = await self.client.request("session/load", load)
-            self.assertEqual(result["_meta"][meta], replays[0][0])
+            marker = result["_meta"][meta]
+            self.assertEqual({key: value for key, value in marker.items() if key != "totalFrames"},
+                             {key: value for key, value in replays[0][0].items() if key != "totalFrames"})
             updates = [event["params"]["update"] for event in self.client.updates if event["method"] == "session/update"]
             display = [update for update in updates if update.get("_meta", {}).get(meta, {}).get("source") == "adapter"]
             self.assertEqual(len(display), 4)
+            self.assertEqual(marker["totalFrames"], replays[0][0]["totalFrames"] + len(display))
             self.assertEqual(display[0]["content"]["text"], "/help")
             self.assertEqual([update["content"]["text"] for update in display[2:]], ["/echo local-only", "echo:local-only"])
             coords = [update["_meta"][meta] for update in display]
