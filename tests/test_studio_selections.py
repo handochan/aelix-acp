@@ -279,14 +279,15 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         case = "selections-list-skill"
         row = self.snapshots["skill"]["items"][0]
         self.snapshots["skill"]["items"] = [
-            {**row, "key": str(index), "label": "한" * 40000} for index in range(3)]
+            {**row, "key": str(index), "label": "한" * 15000} for index in range(6)]
         first = await self.call(case)
-        self.assertEqual(len(first["items"]), 2)
+        self.assertEqual(len(first["items"]), 5)
         self.assertTrue(session_relay.fits_resource_reply(first))
         last = await self.call(case, payload={"kind": "skill", "cursor": first["nextCursor"]})
         self.assertEqual(len(last["items"]), 1)
         self.assertIsNone(last["nextCursor"])
-        self.snapshots["skill"]["items"] = [{**row, "label": "한" * 90000}]
+        self.snapshots["skill"]["items"] = [{**row, "label": "한" * 15000}]
+        self.snapshots["skill"]["problems"] = ["fixture"] * 4100
         too_large = CASES["relay-error-large-item"]["result"]
         self.assertEqual(await self.call(case), too_large)
         self.snapshots["tool"]["items"] = []
@@ -421,6 +422,24 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         payload = {**CASES["tools-set-empty"]["post"]["payload"], "names": [key]}
         self.assertEqual(await self.call("tools-set-empty", payload=payload),
                          {"accepted": False, "reason": "tool-locked", "key": key})
+
+    async def test_resource_inventory_and_errors_redact_native_free_text(self):
+        fictional = "FICTIONAL_NOT_A_SECRET_ACP71"
+        detail = "fixture password=" + fictional
+        self.controls["resources/list"] = lambda _: {
+            "tools": [{"name": "read", "description": detail}],
+            "skills": [{"name": "review", "description": detail}],
+            "skippedTools": [{"tool": "write", "reason": detail}],
+            "extensionErrors": [{"message": detail}],
+        }
+        params = {"sessionId": self.session.id, "action": "resources/list"}
+        inventory = await self.server.dispatch("_aelix/manage", params)
+        self.assertNotIn(fictional, json.dumps(inventory))
+        self.assertEqual(inventory["tools"][0]["description"], "fixture [redacted credential]")
+
+        self.controls["resources/list"] = lambda request: self.reply(request, error=detail)
+        await self.server.handle({"jsonrpc": "2.0", "id": 7, "method": "_aelix/manage", "params": params})
+        self.assertEqual(self.client_frames[-1]["error"]["message"], "fixture [redacted credential]")
 
     @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)
     async def test_close_and_rebind_while_waiting_for_consent_reject_late_selection(self, _):

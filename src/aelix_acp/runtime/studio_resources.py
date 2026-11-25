@@ -11,7 +11,7 @@ from . import profile_reselection as reselection
 from . import studio_selections as selections
 from .profile_refs import (DisplayTooLarge, catalog_description, file_identity, preview, public_preview, source_label,
                            valid_name, valid_ref)
-from .resource_identifiers import ResourceIdentifiers, ordinary_name, public_name
+from .resource_identifiers import ResourceIdentifiers, ordinary_name, public_name, public_text_fields
 from ..wire.errors import BackendError, ProtocolError
 
 MAX_PREVIEWS = 100
@@ -67,11 +67,15 @@ class StudioResources:
         for kind in ("tool", "skill"):
             field = kind + "s"
             if field in result:
-                result[field] = [{**row, "name": identifiers.key(kind, row["name"])} for row in result[field]]
+                result[field] = [{**public_text_fields(row, "description"), "name": identifiers.key(kind, row["name"])}
+                                 for row in result[field]]
         if "skippedTools" in result:
             result["skippedTools"] = [
-                {**row, "tool": identifiers.key("tool", row["tool"])} for row in result["skippedTools"]
+                {**public_text_fields(row, "reason"), "tool": identifiers.key("tool", row["tool"])}
+                for row in result["skippedTools"]
             ]
+        if "extensionErrors" in result:
+            result["extensionErrors"] = [public_text_fields(row, "message") for row in result["extensionErrors"]]
         return result
 
     def public_native_profile(self, result):
@@ -79,7 +83,7 @@ class StudioResources:
         if not isinstance(profile, dict):
             return result
         identifiers = self.identifiers
-        return {**result, "profile": {**profile, **{
+        return {**result, "profile": {**public_text_fields(profile, "description", "body"), **{
             field: identifiers.names("tool", profile[field]) for field in ("tools", "exclude_tools") if field in profile
         }}}
 

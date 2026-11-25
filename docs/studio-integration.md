@@ -406,6 +406,9 @@ and `selections/set` and refresh after rebinding. ACP resolves the key against
 the current native inventory and stores the native override so it can restore
 it after restart. The session management inventory and tool selector use the
 same keys. Profile skill source labels describe provenance.
+Every projected selection label passes the sensitive-text check, including
+labels that differ from their native keys. Projected inventory descriptions,
+reasons, and error messages use the same redaction.
 
 Set accepts 1–1024 distinct, ordered `{key,on}` entries with boolean
 `on`. ACP checks each key and lock against a fresh native list and sends

@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 import shlex
 
-from ..wire.errors import ProtocolError
+from ..wire.errors import BackendError, ProtocolError
+from .resource_identifiers import public_text_fields
 
 BUILTINS = {
     "help": "List commands and runtime support",
@@ -100,7 +101,13 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
             return await session.reload_resources(params or {}, timeout=timeout, refresh_first=True)
         if method == "tools/set_active":
             return await session.studio_resources.legacy_tools(params or {}, timeout=timeout)
-        return await session.rpc("aelix_control", method=method, params=params or {}, _timeout=timeout)
+        try:
+            return await session.rpc("aelix_control", method=method, params=params or {}, _timeout=timeout)
+        except BackendError as error:
+            if method not in ("resources/list", "agents/show"):
+                raise
+            detail = public_text_fields({"message": str(error)}, "message")["message"]
+            raise ProtocolError(detail or "Native resource request failed.", error.code, error.data) from None
 
     if name == "help":
         await output("\n".join(f"/{command} — {description}" for command, description in BUILTINS.items()))

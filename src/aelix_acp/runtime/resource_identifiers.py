@@ -13,14 +13,19 @@ MAX_KEY_LENGTH = 8192
 
 
 def ordinary_name(name):
-    return isinstance(name, str) and len(name) <= MAX_KEY_LENGTH and safe_label(name) and redact(name) == name
+    return isinstance(name, str) and len(name) <= MAX_KEY_LENGTH and safe_label(name)
 
 
 def safe_label(name):
     return (bool(name.strip())
             and name not in (".", "..") and not name.startswith(KEY_PREFIX)
             and "/" not in name and "\\" not in name and not re.match(r"^[A-Za-z]:", name)
-            and display_text(name) == name)
+            and display_text(name) == name and redact(name) == name)
+
+
+def public_text_fields(row, *fields):
+    return {**row, **{field: display_text(redact(row[field]), multiline=True)
+                     for field in fields if isinstance(row.get(field), str)}}
 
 
 def public_name(name):

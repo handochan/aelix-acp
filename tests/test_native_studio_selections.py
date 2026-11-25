@@ -268,3 +268,19 @@ class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
         applied = (await self.listing("mcp"))["items"][0]
         self.assertEqual((applied["saved"], applied["applied"], applied["live"], applied["pending"]),
                          (False, False, False, False))
+
+    async def test_prefixed_native_mcp_row_never_displays_credential_shaped_label(self):
+        fictional = "FICTIONAL_NOT_A_SECRET_ACP71"
+        name = "extension:password=" + fictional
+        self.project.mkdir()
+        (self.project / "mcp.json").write_text(
+            json.dumps({"mcpServers": {name: {"command": sys.executable, "enabled": False}}}),
+            encoding="utf-8",
+        )
+        await self.start(trusted=True)
+        listing = await self.listing("mcp")
+        self.assertEqual(len(listing["items"]), 1)
+        row = listing["items"][0]
+        self.assertTrue(row["key"].startswith("selection:"))
+        self.assertNotIn(fictional, json.dumps(listing))
+        self.assertEqual(row["label"], "Selection item")

@@ -27,6 +27,7 @@ from .runtime.store import (open_store, load_preferences, history, legacy_permis
                             save_preferences, cache_recovered_history, display_recorded_update, with_assistant_origin,
                             write_store)
 from .runtime.controls import MODE_IDS
+from .runtime.resource_identifiers import public_text_fields
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
 from .stdio import StdinReader, offer_stderr, write_diagnostic
@@ -905,6 +906,10 @@ class Server:
                     error["message"] = "Outcome unknown." if error["code"] == -33100 else "Request refused."
                 elif isinstance(exc, ProtocolError) and exc.data is not None:
                     error["data"] = exc.data
+                params = message.get("params")
+                if (method == "_aelix/manage" and isinstance(params, dict) and params.get("action") in (
+                        "resources/list", "tools/set_active", "agents/show", "mcp/status", "mcp/configure")):
+                    error = public_text_fields(error, "message")
                 await self.send({"jsonrpc": "2.0", "id": request_id, "error": error})
             else:
                 detail = type(exc).__name__ if self.host_bytes else str(exc)

@@ -7,7 +7,7 @@ import stat
 
 from .profile_refs import file_stamp
 from . import profile_reselection
-from .resource_identifiers import ordinary_name, safe_label
+from .resource_identifiers import safe_label
 
 EFFECTS = {"tool": "next_request", "skill": "next_request", "mcp": "restart"}
 LIST = "selections/list"
@@ -244,8 +244,7 @@ def public_row(kind, key, row, tools):
     result = {field: row[field] for field in ("role", "saved", "decidedBy",
                                               "applied", "inForce", "live", "pending")}
     label = row["label"]
-    label_safe = ordinary_name(label) if label == row["key"] else safe_label(label)
-    result.update(key=key, label=label if label_safe else "Selection item")
+    result.update(key=key, label=label if safe_label(label) else "Selection item")
     if (result["role"] not in ("item", "placeholder", "info")
             or result["decidedBy"] not in ("global", "project", None)
             or any(type(result[field]) is not bool for field in ("saved", "applied", "inForce", "pending"))
@@ -256,7 +255,7 @@ def public_row(kind, key, row, tools):
     if lock is not None:
         if not isinstance(lock["kind"], str) or type(lock["value"]) is not bool:
             raise ValueError("Invalid selection lock")
-        result["lock"] = {"kind": lock["kind"], "value": lock["value"],
+        result["lock"] = {"kind": lock["kind"] if safe_label(lock["kind"]) else "unknown", "value": lock["value"],
                           "reason": LOCK_REASONS.get(lock["kind"], "locked")}
     result["loaded"] = (result["role"] == "item" and row["key"] in tools
                         if kind == "tool" else result["applied"])
