@@ -1409,7 +1409,7 @@ class Session:
         if operation is not None and operation.awaiting_native():
             try:
                 operation.require_current()
-                if self.controls.permission_mode == "default":
+                if operation.may_confirm_creation():
                     params = {
                         "sessionId": self.id,
                         "toolCall": {
@@ -1428,6 +1428,8 @@ class Session:
                 operation.require_current()
                 if not operation.awaiting_native():
                     cause = "unanswered"
+                if cause is None and not operation.may_confirm_creation():
+                    cause = "cancelled"
                 if cause is None:
                     operation.target.require_version(operation.target.before)
             except (profile_reselection.Stopped, asyncio.CancelledError):

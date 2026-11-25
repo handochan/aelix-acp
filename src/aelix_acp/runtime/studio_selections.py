@@ -8,7 +8,7 @@ from pathlib import Path
 import stat
 
 from .profile_refs import file_stamp
-from .profile_reselection import Operation
+from . import profile_reselection
 
 EFFECTS = {"tool": "next_request", "skill": "next_request", "mcp": "restart"}
 LIST = "selections/list"
@@ -20,7 +20,7 @@ LOCK_REASONS = {"cli": "launch-locked", "profile": "profile-locked",
 OPAQUE_PREFIX = "selection:"
 
 
-class SelectionWrite(Operation):
+class SelectionWrite(profile_reselection.Operation):
     def __init__(self, resources):
         super().__init__(resources)
         self.reply = None
@@ -31,6 +31,10 @@ class SelectionWrite(Operation):
 
     def awaiting_native(self):
         return self.reply is not None and not self.reply.done()
+
+    def may_confirm_creation(self):
+        return (self.binding is not None and self.session.controls.permission_mode == "default"
+                and profile_reselection.host_verified_manual_approval(self))
 
     def claim_confirmation(self, event):
         identifier = event.get("id")

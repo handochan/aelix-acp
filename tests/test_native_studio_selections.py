@@ -13,10 +13,11 @@ from support import AcpClient
 from test_session_relay import META, initialize_offer, request_id
 
 EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
-SHORT_APPROVAL = """
+VERIFIED_APPROVAL = """
 from aelix_acp.runtime import profile_reselection
 from aelix_acp.server import main
-profile_reselection.APPROVAL_SECONDS = 2
+profile_reselection.host_verified_manual_approval = lambda operation: True
+profile_reselection.APPROVAL_SECONDS = {seconds}
 main()
 """
 
@@ -35,8 +36,8 @@ class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.global_settings.write_text('{"defaultTools":["-read"]}\n', encoding="utf-8")
         self.binding = "selection-first"
 
-    async def start(self, *, expiry=False, trusted=False):
-        kwargs = {"entry": ("-c", SHORT_APPROVAL)} if expiry else {}
+    async def start(self, *, verified=False, expiry=False, trusted=False):
+        kwargs = {"entry": ("-c", VERIFIED_APPROVAL.format(seconds=2 if expiry else 45))} if verified else {}
         self.client = await AcpClient.start(
             self.root, EXECUTABLE, capabilities=initialize_offer()["clientCapabilities"],
             prefix=("--approve",) if trusted else (), **kwargs)
@@ -74,7 +75,7 @@ class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_refuse_then_approve_first_save_and_preserve_empty_override_across_restart(self):
         global_bytes = self.global_settings.read_bytes()
-        await self.start(trusted=True)
+        await self.start(verified=True, trusted=True)
         self.assertFalse((await self.listing("tool"))["scopes"]["project"]["exists"])
         await self.relay("tools/set-active", {"names": [], "requestId": request_id(1)})
         with self.assertRaisesRegex(RuntimeError, "-33102"):
@@ -103,7 +104,7 @@ class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_native_confirmation_expires_without_project_file(self):
         global_bytes = self.global_settings.read_bytes()
-        await self.start(expiry=True)
+        await self.start(verified=True, expiry=True)
         seen = asyncio.Event()
 
         async def unanswered(_):
@@ -119,11 +120,21 @@ class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.global_settings.read_bytes(), global_bytes)
         self.assertEqual(len(self.permission_cards()), 1)
 
+    async def test_first_file_creation_is_disabled_on_the_current_host_contract(self):
+        await self.start()
+        self.assertEqual(await self.set_selection("tool", "read", True, 9),
+                         {"accepted": False, "reason": "consent-required", "cause": "unanswered",
+                          "scope": "project", "written": []})
+        self.assertFalse(self.permission_cards())
+        self.assertFalse((self.project / "settings.json").exists())
+
     async def test_skill_save_is_applied_without_restarting(self):
         skill = self.agent / "skills/review/SKILL.md"
         skill.parent.mkdir(parents=True)
         skill.write_text("---\nname: review\ndescription: Review changes\n---\nReview changes carefully.\n", encoding="utf-8")
-        await self.start()
+        self.project.mkdir()
+        (self.project / "settings.json").write_text("{}\n", encoding="utf-8")
+        await self.start(trusted=True)
         before = await self.listing("skill")
         self.assertTrue(next(row for row in before["items"] if row["key"] == "review")["loaded"])
         result = await self.set_selection("skill", "review", False, 6)

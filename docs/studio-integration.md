@@ -411,10 +411,13 @@ guard must bind the expected project directory and target to the transaction.
 
 First-time creation of `.aelix/settings.json` uses one standard
 `session/request_permission` card tied to the native confirm ID, operation,
-worker, binding, and cancellation generation. The two options are allow once
-and reject once. A refusal, Stop, binding retirement, or 45-second expiry
-leaves the file uncreated. Automatic permission modes cannot authorize
-creation. The approval covers file creation and project trust still applies.
+worker, binding, and cancellation generation. The approval path is disabled
+pending Host #76's authenticated, binding-bound manual confirmation signal.
+Until then, an edit requiring creation returns `consent-required` with
+`cause:"unanswered"` before dispatching a native save. Existing project files
+remain editable. The approval path offers allow once and reject once, with
+withdrawal on Stop, retirement, or 45-second expiry. Project trust is checked
+separately. [Host #76](https://github.com/handochan/aelix-studio-host/issues/76)
 
 For tools and skills, native saves `defaultTools` or `skills` in
 `.aelix/settings.json`. The effect is `next_request`. A confirmed save can

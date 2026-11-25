@@ -283,7 +283,8 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.active = ["한" * 90000]
         self.assertEqual(await self.call("selections-list-tool-first"), too_large)
 
-    async def test_confirm_approve_refuse_cancel_and_timeout(self):
+    @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)
+    async def test_confirm_approve_refuse_cancel_and_timeout(self, _):
         self.confirm = True
         self.missing_project_file("skill")
         fixture = CASES["project-file-consent"]
@@ -306,7 +307,17 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
                                  [("allow-once", "allow_once"), ("reject-once", "reject_once")])
         self.assertTrue(any(frame["method"] == "$/cancel_request" for frame in self.client_frames))
 
-    async def test_yolo_cannot_create_and_unsupported_kind_is_never_sent(self):
+    async def test_unverified_host_cannot_admit_first_file_creation(self):
+        self.confirm = True
+        self.missing_project_file("skill")
+        self.permission_outcome = {"outcome": "selected", "optionId": "allow-once"}
+        self.assertEqual(await self.call("selections-set-skill"), CASES["project-permission-timeout"]["result"])
+        self.assertFalse(self.mutations)
+        self.assertFalse(self.client_frames)
+        self.assertFalse((self.root / ".aelix/settings.json").exists())
+
+    @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)
+    async def test_yolo_cannot_create_and_unsupported_kind_is_never_sent(self, _):
         self.session.controls.permission_mode = "yolo"
         self.missing_project_file("skill")
         self.assertEqual(await self.call("selections-set-skill"), CASES["project-permission-timeout"]["result"])
@@ -332,7 +343,8 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.mutations), 1)
         self.assertEqual(self.calls[-1]["params"], {"names": []})
 
-    async def test_close_and_rebind_while_waiting_for_consent_reject_late_selection(self):
+    @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)
+    async def test_close_and_rebind_while_waiting_for_consent_reject_late_selection(self, _):
         self.confirm = True
         self.missing_project_file("skill")
         for method in ("session/close", "session/load"):
@@ -396,7 +408,8 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         result = await self.call("selections-set-tool")
         self.assertEqual(result["mismatches"], vector["dto"]["mismatches"])
 
-    async def test_native_busy_and_dialog_cancellation_are_definite_refusals(self):
+    @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)
+    async def test_native_busy_and_dialog_cancellation_are_definite_refusals(self, _):
         self.controls["selections/set"] = lambda request: self.reply(
             request, error="Runtime mutations require an idle session")
         self.assertEqual(await self.call("selections-set-tool"), CASES["relay-error-busy"]["result"])

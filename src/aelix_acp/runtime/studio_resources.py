@@ -155,8 +155,7 @@ class StudioResources:
         operation.require_current()
         if not project["writable"] or project["exists"] != target.exists:
             return refusal("scope-readonly", scope="project", written=[])
-        if not project["exists"] and (self.session.controls.permission_mode != "default"
-                                      or not self.supports("ui/enable")):
+        if not project["exists"] and (not operation.may_confirm_creation() or not self.supports("ui/enable")):
             return refusal("consent-required", cause="unanswered", scope="project", written=[])
         operation.target = target
         native_changes = [{"key": rows[edit["key"]]["key"], "on": edit["on"]} for edit in changes]
