@@ -437,6 +437,8 @@ keys. It derives changed values from the keyed snapshots because the pin
 reports display labels that can be shared by multiple rows. A missing
 requested row returns `selection-missing`. Its `written` paths report any
 observed partial save so the client can refresh before taking another action.
+When native refuses a missing row before saving, `written` is empty even
+if an external edit had already replaced the file.
 Atomic batch validation requires a native transaction change.
 [Native batch validation and keyed results](https://github.com/handochan/aelix-ai/issues/928)
 

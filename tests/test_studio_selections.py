@@ -466,6 +466,21 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.controls["selections/set"] = refuse
         self.assertEqual(await self.call("selections-set-skill"), CASES["relay-error-unknown-row"]["result"])
 
+    async def test_native_pre_save_missing_row_survives_external_mcp_file_replacement(self):
+        def refuse(request):
+            target = self.root / ".aelix/mcp.json"
+            replacement = target.with_suffix(".tmp")
+            replacement.write_bytes(b'{"mcpServers": {}}')
+            replacement.replace(target)
+            self.snapshots["mcp"]["items"].clear()
+            self.reply(request, error="Unknown mcp row: local-docs")
+
+        self.controls["selections/set"] = refuse
+        self.assertEqual(await self.call("selections-set-mcp"),
+                         {"accepted": False, "reason": "selection-missing", "scope": "project",
+                          "written": [], "mismatches": [{"key": "local-docs", "reason": "missing"}]})
+        self.assertFalse(self.session.studio_resources.uncertain)
+
     async def test_mcp_save_refuses_partial_batch_and_reports_written_project_file(self):
         case = "selections-set-mcp"
         snapshot = self.snapshots["mcp"]

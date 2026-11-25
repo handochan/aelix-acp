@@ -191,11 +191,13 @@ class StudioResources:
             if reason is None or (reason == "cancelled" and operation.confirmation_sent):
                 raise
             if reason == "selection-missing":
+                # Native validates row keys before entering the save path.
+                # The edit that removed the row may itself have replaced mcp.json.
+                operation.no_effect = True
                 result = await self.missing_selections(kind, changes, getattr(error, "studio_selection_key", None))
+                return result if fits(result) else refusal("result-too-large")
             target.require_version(target.before)
             operation.no_effect = True
-            if reason == "selection-missing":
-                return result if fits(result) else refusal("result-too-large")
             if reason == "cancelled":
                 if not project["exists"] or operation.confirm_id is not None:
                     return refusal("consent-required", cause="cancelled", scope="project", written=[])
