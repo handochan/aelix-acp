@@ -215,11 +215,21 @@ class StudioResources:
             return refusal("unsupported")
         if self.session.changing or self.session.rpc_closed:
             return refusal("unreadable")
+        relay = self.session.input_relay
+        generation = relay.list_generation if relay is not None else None
+
+        def require_snapshot_current():
+            if (self.session.input_relay is not relay
+                    or (relay is not None and (relay.list_generation != generation
+                                               or self.retired_binding == relay.binding_id))):
+                raise reselection.Stopped()
+
         try:
             data = await self.rpc(selections.LIST, kind=kind)
             rows = self.selection_rows(kind, data)
             scopes = data["scopes"]
-            target = await self.session.server.selection_target_io.run(selections.project_target, self.session, kind, scopes)
+            target = await self.session.server.selection_target_io.run(
+                selections.project_target, self.session, kind, scopes, before_start=require_snapshot_current)
             public_scopes = {scope: selections.exposed_scope(kind, scope, scopes[scope], target is not None)
                              for scope in ("global", "project")}
             pending = data["policyPending"]

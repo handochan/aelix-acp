@@ -32,7 +32,9 @@ class SelectionTargetIO:
     def __init__(self):
         self.slots = asyncio.BoundedSemaphore(4)
 
-    async def run(self, probe, *args, operation=None):
+    async def run(self, probe, *args, operation=None, before_start=None):
+        if operation is not None:
+            operation.require_current()
         try:
             async with asyncio.timeout(TARGET_PROBE_WAIT) as wait:
                 if operation is not None:
@@ -71,6 +73,8 @@ class SelectionTargetIO:
         try:
             if operation is not None:
                 operation.require_current()
+            if before_start is not None:
+                before_start()
             Thread(target=work, name="aelix-selection-target", daemon=True).start()
         except BaseException:
             self.slots.release()

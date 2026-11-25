@@ -922,6 +922,44 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
                                  CASES["relay-error-busy"]["result"])
         self.assertFalse(self.mutations)
 
+    async def test_retired_write_skips_slot_wait_after_native_preflight_reply(self):
+        requests = []
+
+        def hold_snapshot(request):
+            requests.append(request)
+            self.requested.set()
+
+        self.controls["selections/list"] = hold_snapshot
+        self.session.cancel_native = AsyncMock()
+        write = None
+        try:
+            async with self.saturated_probe_pool() as waiting:
+                write = asyncio.create_task(self.call("selections-set-skill"))
+                await asyncio.wait_for(self.requested.wait(), 5)
+                await self.server.dispatch("session/cancel", {"sessionId": self.session.id})
+                self.reply(requests[0], self.snapshots["skill"])
+                with self.assertRaises(ProtocolError) as retired:
+                    await asyncio.wait_for(asyncio.shield(write), 1)
+                self.assertEqual(retired.exception.code, -32004)
+                self.assertFalse(waiting.is_set())
+        finally:
+            if write is not None:
+                await asyncio.gather(write, return_exceptions=True)
+        self.assertFalse(self.mutations)
+
+    async def test_stale_queued_catalogue_probe_never_touches_target(self):
+        for invalidate in (self.relay.invalidate_list_pages,
+                           lambda: self.session.studio_resources.retire_replaced_approval("b-22")):
+            with patch.object(studio_selections, "project_target", wraps=studio_selections.project_target) as probe:
+                async with self.saturated_probe_pool() as waiting:
+                    listing = asyncio.create_task(self.call("selections-list-tool-first"))
+                    await asyncio.wait_for(waiting.wait(), 5)
+                    invalidate()
+                self.assertEqual(await asyncio.wait_for(listing, 5), CASES["relay-error-unreadable"]["result"])
+                probe.assert_not_called()
+                self.assertFalse(self.relay.list_pages)
+                self.assertFalse(self.server.selection_target_io.slots.locked())
+
     async def test_cancelled_probe_awaiter_does_not_free_the_running_threads_slot(self):
         pool = self.server.selection_target_io
         loop = asyncio.get_running_loop()
