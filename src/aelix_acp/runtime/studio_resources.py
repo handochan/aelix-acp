@@ -79,6 +79,13 @@ class StudioResources:
             ]
         if "extensionErrors" in result:
             result["extensionErrors"] = [public_text_fields(row, "message") for row in result["extensionErrors"]]
+        for field in ("commands", "prompts"):
+            if field in result:
+                result[field] = [public_text_fields(row, "description") for row in result[field]]
+        for field in ("mcp", "servers"):
+            if field in result:
+                result[field] = [public_text_fields(row, "name", "clientName", "description", "reason")
+                                 for row in result[field]]
         return result
 
     def public_native_profile(self, result):

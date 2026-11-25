@@ -451,6 +451,22 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         await self.server.handle({"jsonrpc": "2.0", "id": 7, "method": "_aelix/manage", "params": params})
         self.assertEqual(self.client_frames[-1]["error"]["message"], "fixture [redacted credential]")
 
+    async def test_command_prompt_and_mcp_inventory_text_is_redacted(self):
+        fictional = "FICTIONAL_NOT_A_SECRET_ACP71"
+        detail = "extension:password=" + fictional
+        self.controls["resources/list"] = lambda _: {
+            "commands": [{"name": "fixture", "description": detail}],
+            "prompts": [{"name": "fixture", "description": detail}],
+            "mcp": [{"name": "server", "clientName": detail, "connected": False}],
+        }
+        inventory = await self.server.dispatch("_aelix/manage", {
+            "sessionId": self.session.id, "action": "resources/list",
+        })
+        self.assertNotIn(fictional, json.dumps(inventory))
+        self.assertEqual(inventory["commands"][0]["description"], "extension:[redacted credential]")
+        self.assertEqual(inventory["prompts"][0]["description"], "extension:[redacted credential]")
+        self.assertEqual(inventory["mcp"][0]["clientName"], "extension:[redacted credential]")
+
     @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)
     async def test_close_and_rebind_while_waiting_for_consent_reject_late_selection(self, _):
         self.confirm = True

@@ -176,9 +176,7 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
                 session.studio_resources.invalidate_pages()
             await output(session.studio_resources.public_inventory(result))
         else:
-            resources = await control("resources/list")
-            if name in {"tools", "skills"}:
-                resources = session.studio_resources.public_inventory(resources)
+            resources = session.studio_resources.public_inventory(await control("resources/list"))
             await output(resources.get(name, []))
     elif name == "settings":
         if not args:

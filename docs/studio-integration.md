@@ -429,7 +429,9 @@ writer resolves and locks its own target later. A path retarget can still
 affect another file before ACP detects it, and a retarget restored before
 readback may be invisible if its effect is outside the observed files. A native
 guard must bind the expected project directory and target to the transaction.
-[Native target guard](https://github.com/handochan/aelix-ai/issues/927)
+Beta allows project writes with this residual risk.
+[Native target guard](https://github.com/handochan/aelix-ai/issues/927) ·
+[Beta decision](https://github.com/handochan/aelix-studio/issues/7#issuecomment-7176049795)
 
 First-time creation of `.aelix/settings.json` uses one standard
 `session/request_permission` card tied to the native confirm ID, operation,
@@ -456,8 +458,8 @@ keys. It derives changed values from the keyed snapshots because the pin
 reports display labels that can be shared by multiple rows. A missing
 requested row returns `selection-missing`. Its `written` paths report any
 observed partial save so the client can refresh before taking another action.
-This settled partial result leaves the worker available. An unknown write
-outcome uses `-33100` and fences the worker.
+This is a settled outcome and can leave the worker available. An unknown
+write outcome uses `-33100` and fences the worker.
 When native refuses a missing row before saving, `written` is empty even
 if an external edit had already replaced the file.
 Atomic batch validation requires a native transaction change.
