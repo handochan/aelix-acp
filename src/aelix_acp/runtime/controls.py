@@ -16,8 +16,10 @@ THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 # Native runs on an empty placeholder when nothing chose a model (no
 # defaultProvider/defaultModel and no --model). ACP still requires a select's
 # currentValue: "" means nothing is selected. It is never a provider/id key, so
-# it is never selectable; Studio's renderer treats it as unset, and AionCore
-# treats an empty current value as missing.
+# it is never selectable. Studio's renderer treats it as unset. AionCore keeps it
+# as the observed value (reconcile still applies a stored choice) and its resume
+# paths drop an empty model id, but its derived model catalog maps "" to the
+# first or desired model (non_empty_or_first, preserve_desired_model_in_catalog).
 UNSELECTED = ""
 
 
