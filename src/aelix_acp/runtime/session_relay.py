@@ -7,14 +7,14 @@ from pathlib import Path
 from dataclasses import dataclass
 import hashlib
 import json
-import secrets
 import time
 import uuid
 
 from .. import image_policy
 from . import host_bytes, profile_reselection, studio_selections
 from .leases import acquire as acquire_lease
-from .profile_refs import text_list, valid_name, valid_ref
+from .profile_refs import valid_name, valid_ref
+from .resource_identifiers import ResourceIdentifiers, public_name
 from .studio_resources import refusal
 from ..wire.errors import ProtocolError, require_object, require_string
 from ..wire.transport import encode_frame
@@ -158,7 +158,7 @@ class SessionRelay:
     def __init__(self, session, binding_id, *, clock=time.monotonic):
         self.session = session
         self.binding_id = binding_id
-        self.selection_key_secret = secrets.token_bytes(32)
+        self.identifiers = ResourceIdentifiers()
         self.clock = clock
         self.turn_id = None
         self.acquiring_images = False
@@ -446,7 +446,7 @@ class SessionRelay:
     async def tools_set_active(self, payload, *, response_id):
         require_fields(payload, {"names", "requestId"})
         names = payload["names"]
-        if not text_list(names) or any(not name.strip() for name in names) or len(set(names)) != len(names):
+        if not isinstance(names, list) or not all(map(public_name, names)) or len(set(names)) != len(names):
             raise ProtocolError("Expected unique tool names")
         return await self.resource_write("tools/set-active", names, payload["requestId"], response_id)
 
@@ -470,7 +470,7 @@ class SessionRelay:
         for change in changes:
             require_fields(change, {"key", "on"})
             key = require_string(change["key"], "key")
-            if len(key) > 8192 or key in keys or studio_selections.path_bearing(key) or type(change["on"]) is not bool:
+            if not public_name(key) or key in keys or type(change["on"]) is not bool:
                 raise ProtocolError("Expected unique selection keys and boolean values")
             keys.add(key)
         return await self.resource_write(studio_selections.SET, {"kind": kind, "changes": changes},

@@ -10,7 +10,8 @@ import re
 from . import profile_reselection as reselection
 from . import studio_selections as selections
 from .profile_refs import (DisplayTooLarge, catalog_description, file_identity, preview, public_preview, source_label,
-                           text_list, valid_name, valid_ref)
+                           valid_name, valid_ref)
+from .resource_identifiers import ResourceIdentifiers, ordinary_name, public_name
 from ..wire.errors import BackendError, ProtocolError
 
 MAX_PREVIEWS = 100
@@ -37,6 +38,7 @@ def internal_error():
 class StudioResources:
     def __init__(self, session):
         self.session = session
+        self.unbound_identifiers = ResourceIdentifiers()
         self.recorded = None
         self.previews = OrderedDict()
         self.uncertain = False
@@ -50,6 +52,55 @@ class StudioResources:
     def binding(self):
         relay = self.session.input_relay
         return self.starting_binding or (relay.binding_id if relay is not None else None)
+
+    @property
+    def identifiers(self):
+        relay = self.session.input_relay
+        return relay.identifiers if relay is not None else self.unbound_identifiers
+
+    def public_inventory(self, data):
+        result = dict(data)
+        identifiers = self.identifiers
+        for field in ("activeTools", "toolOverride"):
+            if field in result:
+                result[field] = identifiers.names("tool", result[field])
+        for kind in ("tool", "skill"):
+            field = kind + "s"
+            if field in result:
+                result[field] = [{**row, "name": identifiers.key(kind, row["name"])} for row in result[field]]
+        if "skippedTools" in result:
+            result["skippedTools"] = [
+                {**row, "tool": identifiers.key("tool", row["tool"])} for row in result["skippedTools"]
+            ]
+        return result
+
+    def public_native_profile(self, result):
+        profile = result.get("profile")
+        if not isinstance(profile, dict):
+            return result
+        identifiers = self.identifiers
+        return {**result, "profile": {**profile, **{
+            field: identifiers.names("tool", profile[field]) for field in ("tools", "exclude_tools") if field in profile
+        }}}
+
+    async def legacy_tools(self, arguments, *, timeout):
+        names = arguments.get("names")
+        if not isinstance(names, list) or not all(map(public_name, names)):
+            raise ProtocolError("Expected tool identifiers")
+        identifiers = self.identifiers
+        if any(not ordinary_name(name) for name in names):
+            resources = await self.rpc("resources/list")
+            available = identifiers.index("tool", (tool["name"] for tool in resources["tools"]))
+            if any(name not in available for name in names):
+                raise ProtocolError("Tool identifier is unavailable")
+            names = [available[name] for name in names]
+        try:
+            return await self.session.rpc("aelix_control", method="tools/set_active",
+                                          params={**arguments, "names": names}, _timeout=timeout)
+        except BackendError as error:
+            key = getattr(error, "studio_tool_lock", None) or tool_lock_key(str(error))
+            data = {"kind": "tool_locked", "key": identifiers.key("tool", key)} if key in names else error.data
+            raise ProtocolError("Native tool selection was refused.", error.code, data) from None
 
     def retire_approval(self):
         operation = self.profile_operation or self.tool_operation or self.selection_operation or self.restore_operation
@@ -87,7 +138,7 @@ class StudioResources:
             relay.invalidate_list_pages()
 
     def selection_rows(self, kind, data):
-        return selections.check_snapshot(kind, data, self.session.input_relay.selection_key_secret)
+        return selections.check_snapshot(kind, data, self.identifiers)
 
     async def selections_catalog(self, kind):
         if not self.supports_selection(kind, selections.LIST):
@@ -117,7 +168,7 @@ class StudioResources:
             if kind == "tool":
                 resources = await self.rpc("resources/list")
                 active = resources["activeTools"]
-                if not text_list(active):
+                if not isinstance(active, list) or not all(isinstance(name, str) for name in active):
                     raise ValueError("Invalid active tools response")
                 tools = {tool["name"] for tool in resources["tools"]}
                 # Native can also change tools independently of ACP. Reject
@@ -133,10 +184,12 @@ class StudioResources:
                      for key in sorted(rows, key=lambda key: key.encode("utf-8"))]
         except (BackendError, KeyError, TypeError, ValueError):
             return refusal("unreadable")
+        identifiers = self.identifiers
         return {"kind": kind, "effect": selections.EFFECTS[kind], "scopes": public_scopes, "items": items,
                 "policyPending": pending, "diagnostics": [
                     {"code": "native-problem", "key": None, "source": None} for _ in data["problems"]],
-                "toolOverride": self.session.active_tools if kind == "tool" else None, "activeTools": active}
+                "toolOverride": identifiers.names("tool", self.session.active_tools) if kind == "tool" else None,
+                "activeTools": identifiers.names("tool", active)}
 
     async def set_selections(self, value, fits, operation):
         kind, changes = value["kind"], value["changes"]
@@ -211,7 +264,7 @@ class StudioResources:
                 return refusal(reason, scope="project", written=[])
             return refusal(reason)
         operation.require_current()
-        result = selections.project_readback(kind, native, target.path)
+        result = selections.project_readback(kind, native, target.path, self.identifiers)
         version = target.verify_save(result["written"])
         if kind == "tool" and self.session.active_tools is not None:
             if result["apply"]["deferred"]:
@@ -337,7 +390,7 @@ class StudioResources:
                 "activeAgent": name if valid_name(name) else None, "activeRef": active_ref,
                 "diagnostics": diagnostics, "nextCursor": None}
 
-    async def inspect(self, name, *, revision_bound=False):
+    async def inspect(self, name, *, revision_bound=False, for_display=False):
         if not self.supports("agents/show"):
             return UNAVAILABLE
         try:
@@ -358,6 +411,10 @@ class StudioResources:
                 if native != confirmed or (ref, source, stamp) != await asyncio.to_thread(file_identity, confirmed):
                     return None
             result = preview(native, ref, source)
+            if for_display:
+                identifiers = self.identifiers
+                result["displayTools"] = identifiers.names("tool", native["tools"])
+                result["displayExcludeTools"] = identifiers.names("tool", native["exclude_tools"])
         except DisplayTooLarge:
             return TOO_LARGE
         except (BackendError, OSError, KeyError, TypeError, ValueError, RuntimeError):
@@ -372,14 +429,18 @@ class StudioResources:
             self.previews.popitem(last=False)
 
     async def show(self, name, fits):
-        candidate = await self.inspect(name, revision_bound=self.guarded())
+        candidate = await self.inspect(name, revision_bound=self.guarded(), for_display=True)
         if candidate is UNAVAILABLE:
             return refusal("unsupported")
         if candidate is TOO_LARGE:
             return refusal("result-too-large")
         if candidate is None:
             return refusal("profile-unavailable", name=name)
-        result = {"profile": public_preview(candidate)}
+        profile = public_preview(candidate)
+        if "displayTools" in candidate:
+            profile["tools"] = candidate["displayTools"]
+            profile["policy"]["excludeTools"] = candidate["displayExcludeTools"]
+        result = {"profile": profile}
         if not fits(result):
             return refusal("result-too-large")
         self.remember(candidate)
@@ -563,22 +624,25 @@ class StudioResources:
     def tools_match(result, names):
         active = result.get("activeTools") if isinstance(result, dict) else None
         return (isinstance(result, dict) and result.get("accepted", True) is True
-                and text_list(active) and len(active) == len(names) and set(active) == set(names))
+                and isinstance(active, list) and all(isinstance(name, str) for name in active)
+                and len(active) == len(names) and set(active) == set(names))
 
     async def set_tools(self, names, fits, operation):
         if not self.supports("resources/list", "tools/set_active"):
             return refusal("unsupported")
         self.tool_operation = operation
+        identifiers = self.identifiers
         try:
             resources = await self.rpc("resources/list")
             operation.require_current()
-            available = {tool["name"] for tool in resources["tools"]}
+            available = identifiers.index("tool", (tool["name"] for tool in resources["tools"]))
             for name in names:
                 if name not in available:
                     return refusal("tool-unavailable", key=name)
             if not fits({"accepted": True, "toolOverride": names, "activeTools": names}):
                 return refusal("result-too-large")
-            result = await self.rpc("tools/set_active", names=names, operation=operation)
+            native_names = [available[name] for name in names]
+            result = await self.rpc("tools/set_active", names=native_names, operation=operation)
             active = result.get("activeTools")
             if "accepted" in result and type(result["accepted"]) is not bool:
                 raise internal_error()
@@ -587,11 +651,11 @@ class StudioResources:
                 if reason == "write-failed":
                     operation.no_effect = True
                     return refusal(reason)
-                if reason in ("tool-locked", "tool-unavailable") and key in names:
+                if reason in ("tool-locked", "tool-unavailable") and key in native_names:
                     operation.no_effect = True
-                    return refusal(reason, key=key)
+                    return refusal(reason, key=identifiers.key("tool", key))
                 raise internal_error()
-            if not self.tools_match(result, names):
+            if not self.tools_match(result, native_names):
                 raise internal_error()
             operation.require_current()
             self.session.active_tools = active
@@ -601,12 +665,13 @@ class StudioResources:
             if not operation.dispatched:
                 raise
             key = getattr(error, "studio_tool_lock", None) or tool_lock_key(str(error))
-            if key in names:
+            if key in native_names:
                 operation.no_effect = True
-                return refusal("tool-locked", key=key)
+                return refusal("tool-locked", key=identifiers.key("tool", key))
             raise
         finally:
             self.tool_operation = None
             if operation.dispatched:
                 self.invalidate_pages()
-        return {"accepted": True, "toolOverride": active, "activeTools": active}
+        public = identifiers.names("tool", active)
+        return {"accepted": True, "toolOverride": public, "activeTools": public}

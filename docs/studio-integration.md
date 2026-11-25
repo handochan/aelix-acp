@@ -395,8 +395,17 @@ each snapshot to its session binding, method, and kind. Repeat `kind` on
 continuations. A cursor expires 60 seconds after the snapshot is taken.
 Replays before expiry return the same page. The reply budget includes the JSON
 envelope. A row or common header that cannot fit returns `result-too-large`.
-Path-bearing native row identifiers are projected as opaque keys scoped to the
-binding. Use the listed key in edits and read a new list after rebinding.
+Identifiers pass through unchanged when they are nonblank, at most 8,192
+Unicode characters, and contain no slash, backslash, leading drive prefix,
+non-displayable Unicode character, or text flagged by the existing sensitive
+text redaction. The names `.` and `..` and the `selection:` prefix are
+reserved. Every other native identifier becomes a binding-scoped
+`selection:<hex>` key. The same key appears in rows, active tool and override
+lists, changes, apply deltas, and keyed refusals. Use it in `tools/set-active`
+and `selections/set` and refresh after rebinding. ACP resolves the key against
+the current native inventory and stores the native override so it can restore
+it after restart. The session management inventory and tool selector use the
+same keys. Profile skill source labels describe provenance.
 
 Set accepts 1–1024 distinct, ordered `{key,on}` entries with boolean
 `on`. ACP checks each key and lock against a fresh native list and sends

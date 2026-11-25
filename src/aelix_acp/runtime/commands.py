@@ -98,6 +98,8 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         timeout = getattr(session.server.args, "command_timeout", 600) or None
         if method == "resources/reload":
             return await session.reload_resources(params or {}, timeout=timeout, refresh_first=True)
+        if method == "tools/set_active":
+            return await session.studio_resources.legacy_tools(params or {}, timeout=timeout)
         return await session.rpc("aelix_control", method=method, params=params or {}, _timeout=timeout)
 
     if name == "help":
@@ -114,7 +116,7 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         from .controls import sanitize_model
         state = dict(await session.rpc("get_state"))
         state["model"] = sanitize_model(state.get("model") or {})
-        await output(state)
+        await output(session.studio_resources.public_inventory(state))
     elif name == "name":
         if args:
             await session.rpc("set_session_name", name=args)
@@ -158,9 +160,11 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
             result = await control("tools/set_active", {"names": shlex.split(args)})
             session.active_tools = result["activeTools"]
             session.studio_resources.invalidate_pages()
-            await output(result)
+            await output(session.studio_resources.public_inventory(result))
         else:
             resources = await control("resources/list")
+            if name in {"tools", "skills"}:
+                resources = session.studio_resources.public_inventory(resources)
             await output(resources.get(name, []))
     elif name == "settings":
         if not args:
@@ -184,7 +188,8 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         if operation == "list":
             await output(await control("agents/list"))
         elif operation in {"show", "use"}:
-            await output(await control("agents/" + operation, {"name": remainder.strip()}))
+            result = await control("agents/" + operation, {"name": remainder.strip()})
+            await output(session.studio_resources.public_native_profile(result) if operation == "show" else result)
             if operation == "use":
                 await session.controls.refresh()
                 await session.sync_profile_tools()

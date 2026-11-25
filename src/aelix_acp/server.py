@@ -829,6 +829,8 @@ class Server:
                     result = await session.configure_mcp(arguments.get("servers"))
                 elif action == "resources/reload":
                     result = await session.reload_resources(arguments, timeout=60)
+                elif action == "tools/set_active":
+                    result = await session.studio_resources.legacy_tools(arguments, timeout=60)
                 else:
                     result = await session.rpc("aelix_control", method=action, params=arguments,
                         _timeout=(getattr(self.args, "command_timeout", 600) or None) if action in LONG_CONTROLS else 60)
@@ -846,6 +848,10 @@ class Server:
                         await session.sync_profile_tools()
                     await session.save()
                     await session.update({"sessionUpdate": "config_option_update", "configOptions": session.controls.options()})
+                if action in {"resources/list", "tools/set_active", "mcp/status", "mcp/configure"}:
+                    return session.studio_resources.public_inventory(result)
+                if action == "agents/show":
+                    return session.studio_resources.public_native_profile(result)
                 return result
         if method == "authenticate":
             raise ProtocolError("Configure provider authentication using the existing Aelix CLI first")

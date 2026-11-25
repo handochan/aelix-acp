@@ -250,7 +250,7 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
     async def test_paging_utf8_boundaries_stable_replay_context_expiry_and_invalidated(self):
         case = "selections-list-skill"
         row = self.snapshots["skill"]["items"][0]
-        keys = ["\U00010000", "\ue000", "한"] + [f"key-{index:03}" for index in range(100)]
+        keys = ["\U00010000", "\ufffd", "한"] + [f"key-{index:03}" for index in range(100)]
         self.snapshots["skill"]["items"] = [{**row, "key": key} for key in reversed(keys)]
         expected = sorted(keys, key=lambda key: key.encode())
         first = await self.call(case)
@@ -290,7 +290,7 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         too_large = CASES["relay-error-large-item"]["result"]
         self.assertEqual(await self.call(case), too_large)
         self.snapshots["tool"]["items"] = []
-        self.active = ["한" * 90000]
+        self.active = [f"{index}-" + "한" * 7500 for index in range(12)]
         self.assertEqual(await self.call("selections-list-tool-first"), too_large)
 
     async def test_tool_page_cannot_mix_rows_with_a_concurrent_tool_override(self):
@@ -406,6 +406,21 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.mutations), 1)
         self.assertEqual([call["params"] for call in self.calls if call.get("method") == "tools/set_active"],
                          [{"names": []}])
+
+    async def test_opaque_tool_lock_refusal_cannot_echo_the_native_identifier(self):
+        native = str(self.root / "tool")
+        key = self.relay.identifiers.key("tool", native)
+        self.assertNotEqual(self.relay.identifiers.key("tool", key), key)
+        self.controls["resources/list"] = lambda _: {"tools": [{"name": native}, {"name": key}]}
+
+        def refuse(request):
+            self.assertEqual(request["params"]["names"], [native])
+            self.reply(request, error=f"Cannot turn on {native}: {native} is locked off for this run: profile")
+
+        self.controls["tools/set_active"] = refuse
+        payload = {**CASES["tools-set-empty"]["post"]["payload"], "names": [key]}
+        self.assertEqual(await self.call("tools-set-empty", payload=payload),
+                         {"accepted": False, "reason": "tool-locked", "key": key})
 
     @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)
     async def test_close_and_rebind_while_waiting_for_consent_reject_late_selection(self, _):

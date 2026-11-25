@@ -20,6 +20,17 @@ profile_reselection.host_verified_manual_approval = lambda operation: True
 profile_reselection.APPROVAL_SECONDS = {seconds}
 main()
 """
+PATH_NAMED_TOOL = """
+from aelix_agent_core.types import AgentTool
+from aelix_ai.tools import ToolResult
+
+def setup(api):
+    async def execute(*_args):
+        return ToolResult(content=[])
+
+    api.register_tool(AgentTool(name={name!r}, description="Path-named test tool",
+                                parameters={{"type": "object", "properties": {{}}}}, execute=execute))
+"""
 
 
 @unittest.skipUnless(EXECUTABLE, "Set AELIX_ACP_TEST_AELIX to the pinned native executable")
@@ -36,11 +47,11 @@ class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.global_settings.write_text('{"defaultTools":["-read"]}\n', encoding="utf-8")
         self.binding = "selection-first"
 
-    async def start(self, *, verified=False, expiry=False, trusted=False):
+    async def start(self, *, verified=False, expiry=False, trusted=False, extensions=()):
         kwargs = {"entry": ("-c", VERIFIED_APPROVAL.format(seconds=2 if expiry else 45))} if verified else {}
         self.client = await AcpClient.start(
             self.root, EXECUTABLE, capabilities=initialize_offer()["clientCapabilities"],
-            prefix=("--approve",) if trusted else (), **kwargs)
+            prefix=("--approve",) if trusted else (), extensions=extensions, **kwargs)
         self.addAsyncCleanup(self.client.close)
         created = await self.client.request("session/new", self.open_params(), timeout=120)
         self.session_id = created["sessionId"]
@@ -127,6 +138,54 @@ class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
                           "scope": "project", "written": []})
         self.assertFalse(self.permission_cards())
         self.assertFalse((self.project / "settings.json").exists())
+
+    async def test_path_named_tool_uses_one_key_in_selection_state_and_writes(self):
+        raw = str(self.root / "private-tools" / "fixture-tool")
+        extension = self.root / "tool_fixture.py"
+        extension.write_text(PATH_NAMED_TOOL.format(name=raw), encoding="utf-8")
+        profile = self.agent / "agents/path-tool.md"
+        profile.parent.mkdir()
+        profile.write_text(f"---\nname: path-tool\ndescription: Path tool fixture\ntools: [{json.dumps(raw)}]\n"
+                           "---\nInspect the test resource.\n", encoding="utf-8")
+        self.project.mkdir()
+        (self.project / "settings.json").write_text("{}\n", encoding="utf-8")
+        await self.start(trusted=True, extensions=(extension,))
+        initial = await self.listing("tool")
+        key = next(row["key"] for row in initial["items"] if row["key"].startswith("selection:"))
+        self.assertIn(key, initial["activeTools"])
+        self.assertNotIn(raw, initial["activeTools"])
+        self.assertIn("read", [row["key"] for row in initial["items"]])
+        preview = await self.relay("profiles/show", {"name": "path-tool"})
+        self.assertEqual(preview["profile"]["tools"], [key])
+
+        saved = await self.set_selection("tool", key, False, 11)
+        self.assertTrue(saved["accepted"], saved)
+        self.assertEqual(saved["changed"], [{"key": key, "saved": False}])
+        self.assertEqual(saved["mismatches"], [])
+        self.assertEqual(saved["apply"]["turnedOff"], [key])
+
+        with self.assertRaisesRegex(RuntimeError, "-32602"):
+            await self.relay("tools/set-active", {"names": [raw], "requestId": request_id(12)})
+        applied = await self.relay("tools/set-active", {"names": [key], "requestId": request_id(13)})
+        self.assertEqual(applied, {"accepted": True, "activeTools": [key], "toolOverride": [key]})
+        self.assertEqual(self.saved_preferences()["activeTools"], [raw])
+        current = await self.listing("tool")
+        self.assertEqual((current["activeTools"], current["toolOverride"]), ([key], [key]))
+
+        inventory = await self.client.request("_aelix/manage", {"sessionId": self.session_id, "action": "resources/list"})
+        self.assertIn(key, [tool["name"] for tool in inventory["tools"]])
+        self.assertEqual(inventory["activeTools"], [key])
+        managed = await self.client.request("_aelix/manage", {
+            "sessionId": self.session_id, "action": "tools/set_active", "arguments": {"names": [key]},
+        })
+        self.assertEqual(managed["activeTools"], [key])
+        await self.restart_worker()
+        rebound = await self.listing("tool")
+        new_key = next(row["key"] for row in rebound["items"] if row["key"].startswith("selection:"))
+        self.assertNotEqual(new_key, key)
+        self.assertEqual((rebound["activeTools"], rebound["toolOverride"]), ([new_key], [new_key]))
+        self.assertEqual(await self.relay("tools/set-active", {"names": [key], "requestId": request_id(14)}),
+                         {"accepted": False, "reason": "tool-unavailable", "key": key})
 
     async def test_skill_save_is_applied_without_restarting(self):
         skill = self.agent / "skills/review/SKILL.md"

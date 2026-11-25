@@ -1,13 +1,13 @@
 """D16 projection of native project selections."""
 from __future__ import annotations
 
-import hmac
 import os
 from pathlib import Path
 import stat
 
 from .profile_refs import file_stamp
 from . import profile_reselection
+from .resource_identifiers import ordinary_name, safe_label
 
 EFFECTS = {"tool": "next_request", "skill": "next_request", "mcp": "restart"}
 LIST = "selections/list"
@@ -16,7 +16,6 @@ CREATE_TITLE = "This creates .aelix/settings.json: the folder falls under projec
 CREATE_HINT = "next launch may ask; -p may need --approve"
 LOCK_REASONS = {"cli": "launch-locked", "profile": "profile-locked",
                 "shadowed": "shadowed", "unavailable": "unavailable"}
-OPAQUE_PREFIX = "selection:"
 
 
 class SelectionWrite(profile_reselection.Operation):
@@ -222,24 +221,7 @@ def exposed_scope(kind, scope, status, safe_target):
     return {"exists": exists, "writable": writable, "reason": reason}
 
 
-def path_bearing(value):
-    return "/" in value or "\\" in value or (len(value) > 1 and value[0].isascii()
-                                             and value[0].isalpha() and value[1] == ":")
-
-
-def public_key(secret, kind, key):
-    # Escape the token namespace too, so a literal native key cannot shadow a token.
-    if path_bearing(key) or key.startswith(OPAQUE_PREFIX):
-        digest = hmac.digest(secret, (kind + "\0" + key).encode("utf-8"), "sha256")
-        return OPAQUE_PREFIX + digest.hex()
-    return key
-
-
-def display_label(label):
-    return "Selection item" if path_bearing(label) else label
-
-
-def check_snapshot(kind, data, secret):
+def check_snapshot(kind, data, identifiers):
     if data["kind"] != kind or data["effect"] != EFFECTS[kind]:
         raise ValueError("Invalid selection snapshot")
     for field in ("items", "unreadable", "problems", "notices"):
@@ -251,7 +233,7 @@ def check_snapshot(kind, data, secret):
     for row in data["items"]:
         if not isinstance(row["key"], str) or not isinstance(row["label"], str) or type(row["saved"]) is not bool:
             raise ValueError("Invalid selection row")
-        key = public_key(secret, kind, row["key"])
+        key = identifiers.key(kind, row["key"])
         if key in rows:
             raise ValueError("Invalid selection row")
         rows[key] = row
@@ -261,7 +243,9 @@ def check_snapshot(kind, data, secret):
 def public_row(kind, key, row, tools):
     result = {field: row[field] for field in ("role", "saved", "decidedBy",
                                               "applied", "inForce", "live", "pending")}
-    result.update(key=key, label=display_label(row["label"]))
+    label = row["label"]
+    label_safe = ordinary_name(label) if label == row["key"] else safe_label(label)
+    result.update(key=key, label=label if label_safe else "Selection item")
     if (result["role"] not in ("item", "placeholder", "info")
             or result["decidedBy"] not in ("global", "project", None)
             or any(type(result[field]) is not bool for field in ("saved", "applied", "inForce", "pending"))
@@ -280,7 +264,7 @@ def public_row(kind, key, row, tools):
     return result
 
 
-def project_readback(kind, native, target):
+def project_readback(kind, native, target, identifiers):
     if (native["scope"] != "project" or native["kind"] != kind or native["effect"] != EFFECTS[kind]
             or not isinstance(native["written"], list)
             or len(native["written"]) > 1
@@ -306,7 +290,7 @@ def project_readback(kind, native, target):
         if apply["warning"] is not None:
             apply["warning"] = "apply-warning" if apply["applied"] else "apply-failed"
         for field in ("turnedOn", "turnedOff"):
-            apply[field] = [display_label(label) for label in apply[field]]
+            apply[field] = identifiers.names(kind, apply[field])
     return {
         "accepted": True, "scope": "project", "kind": kind, "effect": EFFECTS[kind],
         "written": [file_label(kind)] if native["written"] else [],
