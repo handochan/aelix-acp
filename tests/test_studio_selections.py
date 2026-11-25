@@ -1,5 +1,6 @@
 """D16 v1 selection vectors over the ACP relay and native JSONL boundary."""
 import asyncio
+from contextlib import asynccontextmanager
 from copy import deepcopy
 import json
 import os
@@ -862,6 +863,93 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 release.set()
                 await listing
+
+    @asynccontextmanager
+    async def saturated_probe_pool(self):
+        slots = self.server.selection_target_io.slots
+        for _ in range(4):
+            await slots.acquire()
+        waiting = asyncio.Event()
+        acquire = slots.acquire
+
+        async def observe_wait():
+            waiting.set()
+            return await acquire()
+
+        try:
+            with patch.object(slots, "acquire", observe_wait):
+                yield waiting
+        finally:
+            for _ in range(4):
+                slots.release()
+
+    async def test_stop_and_close_release_write_admission_while_probe_slots_are_held(self):
+        params = {"sessionId": self.session.id}
+        self.session.cancel_native = AsyncMock()
+        self.session.prompt = AsyncMock(return_value={"stopReason": "end_turn"})
+        self.server.close_session = AsyncMock(return_value={})
+        for index, method in enumerate(("session/cancel", "session/close"), start=1):
+            with self.subTest(method=method):
+                payload = {**CASES["selections-set-skill"]["post"]["payload"],
+                           "requestId": f"019aa123-0001-7000-8000-{index:012x}"}
+                write = None
+                try:
+                    async with self.saturated_probe_pool() as waiting:
+                        write = asyncio.create_task(self.call("selections-set-skill", payload=payload))
+                        await asyncio.wait_for(waiting.wait(), 5)
+                        if method == "session/close":
+                            with self.assertRaises(ProtocolError) as busy:
+                                await self.server.dispatch(method, params)
+                            self.assertEqual(busy.exception.code, -32000)
+                        else:
+                            await self.server.dispatch(method, params)
+                        with self.assertRaises(ProtocolError) as retired:
+                            await asyncio.wait_for(asyncio.shield(write), 1)
+                        self.assertEqual(retired.exception.code, -32004)
+                        self.assertEqual(await self.server.dispatch("session/prompt", {
+                            **params, "prompt": [{"type": "text", "text": "next"}],
+                        }), {"stopReason": "end_turn"})
+                        self.assertEqual(await self.server.dispatch("session/close", params), {})
+                finally:
+                    if write is not None:
+                        await asyncio.gather(write, return_exceptions=True)
+        self.assertFalse(self.mutations)
+
+    async def test_selection_write_returns_busy_when_probe_slot_wait_times_out(self):
+        async with self.saturated_probe_pool():
+            with patch.object(studio_selections, "TARGET_PROBE_WAIT", 0):
+                self.assertEqual(await asyncio.wait_for(self.call("selections-set-skill"), 1),
+                                 CASES["relay-error-busy"]["result"])
+        self.assertFalse(self.mutations)
+
+    async def test_cancelled_probe_awaiter_does_not_free_the_running_threads_slot(self):
+        pool = self.server.selection_target_io
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        release = Event()
+
+        def blocked():
+            loop.call_soon_threadsafe(entered.set)
+            release.wait()
+
+        for _ in range(3):
+            await pool.slots.acquire()
+        worker = asyncio.create_task(pool.run(blocked))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            worker.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await worker
+            with patch.object(studio_selections, "TARGET_PROBE_WAIT", 0):
+                with self.assertRaises(studio_selections.TargetProbeBusy):
+                    await pool.run(lambda: self.fail("Probe started while every worker slot was occupied"))
+        finally:
+            release.set()
+            # Wait for the worker to return its own permit before releasing
+            # the other three reservations made by this test.
+            await asyncio.wait_for(pool.slots.acquire(), 5)
+            for _ in range(4):
+                pool.slots.release()
 
     async def test_fresh_snapshot_is_not_sent_while_native_stop_is_pending(self):
         entered = asyncio.Event()

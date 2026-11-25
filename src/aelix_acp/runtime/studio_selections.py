@@ -19,6 +19,11 @@ CREATE_TITLE = "This creates .aelix/settings.json: the folder falls under projec
 CREATE_HINT = "next launch may ask; -p may need --approve"
 LOCK_REASONS = {"cli": "launch-locked", "profile": "profile-locked",
                 "shadowed": "shadowed", "unavailable": "unavailable"}
+TARGET_PROBE_WAIT = 5
+
+
+class TargetProbeBusy(TimeoutError):
+    pass
 
 
 class SelectionTargetIO:
@@ -27,8 +32,20 @@ class SelectionTargetIO:
     def __init__(self):
         self.slots = asyncio.BoundedSemaphore(4)
 
-    async def run(self, probe, *args):
-        await self.slots.acquire()
+    async def run(self, probe, *args, operation=None):
+        try:
+            async with asyncio.timeout(TARGET_PROBE_WAIT) as wait:
+                if operation is not None:
+                    operation.probe_wait = wait
+                try:
+                    await self.slots.acquire()
+                finally:
+                    if operation is not None:
+                        operation.probe_wait = None
+        except TimeoutError:
+            if operation is not None and operation.retired:
+                raise profile_reselection.Stopped() from None
+            raise TargetProbeBusy() from None
         loop = asyncio.get_running_loop()
         result = loop.create_future()
 
@@ -52,6 +69,8 @@ class SelectionTargetIO:
                 loop.call_soon_threadsafe(complete, value, error)
 
         try:
+            if operation is not None:
+                operation.require_current()
             Thread(target=work, name="aelix-selection-target", daemon=True).start()
         except BaseException:
             self.slots.release()
@@ -69,6 +88,14 @@ class SelectionWrite(profile_reselection.Operation):
         self.target = None
         self.kind = None
         self.native_keys = {}
+        self.probe_wait = None
+
+    def retire(self):
+        super().retire()
+        # Expire only the slot wait. A probe already running retains its
+        # semaphore permit until its worker calls complete().
+        if self.probe_wait is not None and not self.probe_wait.expired():
+            self.probe_wait.reschedule(asyncio.get_running_loop().time())
 
     def awaiting_native(self):
         return self.reply is not None and not self.reply.done()

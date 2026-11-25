@@ -227,7 +227,7 @@ class StudioResources:
                 raise ValueError("Invalid selection policy status")
             items = [selections.public_row(kind, key, rows[key])
                      for key in sorted(rows, key=lambda key: key.encode("utf-8"))]
-        except (BackendError, reselection.Stopped, KeyError, TypeError, ValueError):
+        except (BackendError, reselection.Stopped, selections.TargetProbeBusy, KeyError, TypeError, ValueError):
             return refusal("unreadable")
         identifiers = self.identifiers
         return {"kind": kind, "effect": selections.EFFECTS[kind], "scopes": public_scopes, "items": items,
@@ -244,6 +244,10 @@ class StudioResources:
         self.invalidate_pages()
         try:
             return await self._set_selections(kind, changes, fits, operation)
+        except selections.TargetProbeBusy:
+            if operation.dispatched:
+                raise
+            return refusal("busy")
         finally:
             if operation.permission is not None:
                 operation.permission.cancel()
@@ -256,7 +260,7 @@ class StudioResources:
             data = await self.rpc(selections.LIST, kind=kind)
             rows = self.selection_rows(kind, data)
             scopes = data["scopes"]
-            target = await target_io.run(selections.project_target, self.session, kind, scopes)
+            target = await target_io.run(selections.project_target, self.session, kind, scopes, operation=operation)
             project = selections.exposed_scope(kind, "project", scopes["project"], target is not None)
             for edit in changes:
                 key = edit["key"]
@@ -281,7 +285,7 @@ class StudioResources:
             # Keep the last filesystem check under the mutation and selection
             # locks. The synchronous dispatch hook still fences Stop/close
             # after this thread returns and immediately before the pipe write.
-            await target_io.run(target.require_version, target.before)
+            await target_io.run(target.require_version, target.before, operation=operation)
             native = await self.session.rpc(
                 "aelix_control", method=selections.SET,
                 params={"scope": "project", "kind": kind, "changes": native_changes},

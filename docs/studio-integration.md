@@ -414,7 +414,10 @@ envelope. A row or common header that cannot fit returns `result-too-large`.
 ACP runs selection target discovery and file identity checks on up to four
 daemon probe threads per adapter while retaining the write locks for write
 checks. A running probe holds its slot until it returns, even if its request
-is cancelled. On EOF, ACP completes normal worker, transport, and store
+is cancelled. Slot acquisition waits up to five seconds. Stop and Close
+expire a pre-dispatch write's slot wait so it can release session activity.
+A saturated pre-dispatch write whose wait expires returns `busy`. On EOF,
+ACP completes normal worker, transport, and store
 cleanup and can exit with a blocked read-only probe still outstanding.
 Daemon probes avoid the default executor's shutdown join on Windows and
 POSIX. The OS releases their read handles on exit. ACP refuses a fresh
