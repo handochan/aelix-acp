@@ -14,9 +14,12 @@ import unittest
 from support import AcpClient, process_alive
 from aelix_acp.runtime import host_bytes, session_relay
 from aelix_acp.runtime.leases import acquire as acquire_lease
+from aelix_acp.runtime.store import append_event
 from aelix_acp.wire.errors import ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH
 
 EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
+PROTECTED_HOST = {"_meta": {session_relay.META_KEY: {"version": 1, "notifications": False},
+                           host_bytes.META_KEY: {"version": 1}}}
 SELECTOR_PROFILE = (
     "---\nname: restricted\ndescription: Restricted\nprovider: fixture\nmodel: two\n"
     "thinking: 'off'\ntools: [read]\n---\nRead only.\n"
@@ -1548,9 +1551,7 @@ def setup(api):
 
     async def test_private_host_gets_unknown_cause_for_provider_rejections_and_connection_refusal(self):
         await self.client.close()
-        self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities={"_meta": {
-            session_relay.META_KEY: {"version": 1, "notifications": False}, host_bytes.META_KEY: {"version": 1},
-        }})
+        self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities=PROTECTED_HOST)
         created = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []})
         self.session = created["sessionId"]
         await self.config("autoRetryEnabled", "false")
@@ -1574,6 +1575,38 @@ def setup(api):
                     self.assertEqual(len(self.model_requests), before)
                 else:
                     self.assertGreater(len(self.model_requests), before)
+
+    async def test_failed_provider_turn_reloads_safely_and_keeps_its_receipt(self):
+        await self.config("autoRetryEnabled", "false")
+        self.http_error = (401, "authentication_error")
+        request_key = "provider-rejection"
+        with self.assertRaises(RuntimeError) as caught:
+            await self.prompt("Respond", key=request_key)
+        error = json.loads(str(caught.exception))
+        self.assertEqual(error["code"], TURN_FAILED_AFTER_DISPATCH)
+        self.assertIn("synthetic rejection", error["message"])
+        await self.client.close()
+
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            rows = db.execute("SELECT value FROM events WHERE session_id=? ORDER BY sequence", (self.session,))
+            entries = [json.loads(value)["content"]["text"] for value, in rows]
+            self.assertEqual(entries, ["Respond", "Request failed."])
+            self.assertEqual(db.execute("SELECT state,result FROM turns WHERE session_id=? AND request_key=?",
+                                        (self.session, request_key)).fetchone(), ("interrupted", None))
+            append_event(db, self.session, {"sessionUpdate": "agent_message_chunk", "content": {
+                "type": "text", "text": "Request failed: Error code: 401 - legacy-provider-marker"}})
+
+        self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities=PROTECTED_HOST)
+        await self.client.request("session/load", {"sessionId": self.session, "cwd": str(self.root), "mcpServers": []})
+        self.assertEqual(self.client.text(), "RespondRequest failed.Request failed.")
+        before = len(self.model_requests)
+        with self.assertRaises(RuntimeError) as duplicate:
+            await self.prompt("Respond", key=request_key)
+        self.assertEqual(json.loads(str(duplicate.exception)), {
+            "code": -32006, "message": "Previous request has an unresolved outcome; it will not be executed again",
+            "data": {"kind": "unresolved_turn", "requestId": request_key, "state": "interrupted"},
+        })
+        self.assertEqual(len(self.model_requests), before)
 
     async def test_failure_before_native_dispatch_keeps_its_specific_code(self):
         with self.assertRaises(RuntimeError) as caught:

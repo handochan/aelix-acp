@@ -24,7 +24,7 @@ from . import __version__
 from .wire.errors import (ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH,
                           fork_head_changed, require_object, require_string)
 from .runtime.store import (open_store, load_preferences, history, legacy_permission_mode,
-                            save_preferences, cache_recovered_history, write_store)
+                            save_preferences, cache_recovered_history, redact_legacy_prompt_failure, write_store)
 from .runtime.controls import MODE_IDS
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
@@ -387,6 +387,8 @@ class Server:
     async def replay_history(self, session):
         await session.live_history.flush()
         recorded = history(self.db, session.id)
+        if session.private_host:
+            recorded = map(redact_legacy_prompt_failure, recorded)
         nesting = session.declares(NESTED_TOOL_CALLS)
         if session.transcript_enabled():
             snapshot = await transcript.read(
@@ -807,8 +809,8 @@ class Server:
         replied = False
         try:
             method = message["method"]
-            if request_id is None and method.startswith(session_relay.METHOD_PREFIX):
-                return  # v1 has no client-to-agent session relay notifications.
+            if request_id is None and (method == "session/prompt" or method.startswith(session_relay.METHOD_PREFIX)):
+                return  # These methods are requests and require a correlated reply.
             result = await self.dispatch(method, message.get("params") or {})
             if request_id is not None:
                 response = {"jsonrpc": "2.0", "id": request_id, "result": result}

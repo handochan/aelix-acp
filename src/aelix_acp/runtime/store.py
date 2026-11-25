@@ -17,6 +17,8 @@ from ..wire.errors import ProtocolError
 from .transcript import META as TRANSCRIPT_META
 
 WRITE_TIMEOUT = 10
+PROMPT_FAILURE_PREFIX = "Request failed: "
+PROMPT_FAILURE_TEXT = "Request failed."
 
 
 def open_store(directory: str) -> sqlite3.Connection:
@@ -314,6 +316,20 @@ def history(db: sqlite3.Connection, session_id: str):
     for (value,) in db.execute("SELECT value FROM events WHERE session_id=? AND sequence<=? ORDER BY sequence",
                                (session_id, last)):
         yield json.loads(value)
+
+
+def redact_legacy_prompt_failure(update: dict) -> dict:
+    """Strip old failure diagnostics from recorded ACP display events."""
+    if update.get("sessionUpdate") == "agent_message_chunk":
+        content = update.get("content")
+        if isinstance(content, dict) and content.get("type") == "text":
+            text = content.get("text")
+            if isinstance(text, str) and text.startswith(PROMPT_FAILURE_PREFIX):
+                meta = update.get("_meta")
+                coordinates = meta.get(TRANSCRIPT_META) if isinstance(meta, dict) else None
+                if not isinstance(coordinates, dict) or coordinates.get("source") in (None, "adapter"):
+                    return {**update, "content": {"type": "text", "text": PROMPT_FAILURE_TEXT}}
+    return update
 
 
 def recorded_turn(db: sqlite3.Connection, session_id: str, request_key: str, fingerprint: str | None = None) -> dict | None:

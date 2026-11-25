@@ -30,8 +30,8 @@ from . import image_policy
 from .runtime import native_frames, native_history, transcript
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
-from .runtime.store import (LiveHistory, begin_turn, confirm_adapter_input, finish_turn, legacy_permission_mode, load_preferences,
-                            recorded_turn, save_session, write_store)
+from .runtime.store import (LiveHistory, PROMPT_FAILURE_PREFIX, PROMPT_FAILURE_TEXT, begin_turn, confirm_adapter_input,
+                            finish_turn, legacy_permission_mode, load_preferences, recorded_turn, save_session, write_store)
 from .runtime.commands import (ALIASES, BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND,
                                compact_instructions, execute as execute_slash)
 from .runtime.extensions import extension_reference
@@ -1628,8 +1628,9 @@ class Session:
             # Once native may have started work, a failure is final: an
             # automatic replay could repeat model calls and tool effects.
             error = after_dispatch(failure) if self.dispatched else failure
+            history_text = PROMPT_FAILURE_TEXT if self.dispatched else PROMPT_FAILURE_PREFIX + str(error)
             update = {"sessionUpdate": "agent_message_chunk",
-                      "content": {"type": "text", "text": "Request failed: " + str(error)}}
+                      "content": {"type": "text", "text": history_text}}
             self.live_history.append(self.adapter_message(update) if transcript.supported(self.controls.capabilities) else update)
             if error is failure:
                 raise
