@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import uuid
 
 from .profile_refs import DisplayTooLarge, POLICY_FIELDS, safe_preview, valid_preview, valid_ref
@@ -12,7 +11,6 @@ from ..wire.transport import encode_frame
 
 APPROVAL_SECONDS = 45
 APPROVAL_BYTES = 64 * 1024
-MANUAL_APPROVAL_ENV = "AELIX_ACP_STUDIO_MANUAL_PROFILE_APPROVAL"
 RESTORE_MESSAGE = "Restore the original profile, then reopen this session."
 
 
@@ -24,12 +22,13 @@ class Stopped(ProtocolError):
 class Operation:
     """Lifetime of one write on one worker and binding generation."""
 
-    def __init__(self, resources):
+    def __init__(self, resources, *, original=None):
         self.resources = resources
         self.session = resources.session
         self.worker = self.session.proc
         self.generation = self.session.cancel_generation
         self.binding = resources.binding()
+        self.original = original
         self.dispatched = False
         self.no_effect = False
         self.retired = False
@@ -39,6 +38,12 @@ class Operation:
     def uncertain_effect(self):
         return self.dispatched and not self.no_effect
 
+    def require_restore_current(self):
+        try:
+            self.require_current()
+        except Stopped:
+            raise load_error("outcome-unknown" if self.uncertain_effect else "cancelled", self.original) from None
+
     def retire(self):
         self.retired = True
         if self.permission is not None:
@@ -47,6 +52,7 @@ class Operation:
     def require_current(self):
         s = self.session
         if (self.retired or s.cancelled or s.cancel_generation != self.generation
+                or self.worker is None or self.worker.returncode is not None
                 or s.proc is not self.worker or s.rpc_closed or s.ending
                 or s.server.closing or s.server.input_closed or self.resources.binding() != self.binding
                 or (self.binding is not None and self.binding == self.resources.retired_binding)):
@@ -117,17 +123,20 @@ def changed(recorded, candidate, original, before=None, after=None):
             "recovery": recovery(original)}
 
 
+def host_verified_manual_approval(operation):
+    """Host #76 must provide authenticated confirmation bound to this operation's binding."""
+    return False
+
+
 async def approve(operation, before, after):
     session = operation.session
-    # Only an operator-controlled launch of a host that verifies human
-    # confirmation and retires cards with their binding may enable this path.
-    if (os.environ.get(MANUAL_APPROVAL_ENV) != "1" or operation.binding is None
-            or not before.get("safeForConsent", True) or not after.get("safeForConsent", True)):
-        return "unanswered"
     try:
         operation.require_current()
     except Stopped:
         return "cancelled"
+    if (operation.binding is None or not host_verified_manual_approval(operation)
+            or not before.get("safeForConsent", True) or not after.get("safeForConsent", True)):
+        return "unanswered"
     original, candidate = before["ref"], after["ref"]
     delta = differences(original, candidate, before, after)
     lines = [

@@ -367,11 +367,9 @@ class SessionRelay:
     def retain_profile_snapshot(self, identifier, snapshot):
         # Account for the catalog and cursors even when the client uses limit=1.
         size = len(encode_frame(snapshot)) + 384 * len(snapshot["profiles"])
-        if size > MAX_PROFILE_SNAPSHOT_BYTES:
+        if (len(self.profile_snapshots) >= MAX_PROFILE_SNAPSHOTS
+                or sum(size for size, _ in self.profile_snapshots.values()) + size > MAX_PROFILE_SNAPSHOT_BYTES):
             return False
-        while (len(self.profile_snapshots) >= MAX_PROFILE_SNAPSHOTS
-               or sum(size for size, _ in self.profile_snapshots.values()) + size > MAX_PROFILE_SNAPSHOT_BYTES):
-            self.drop_profile_snapshot(next(iter(self.profile_snapshots)))
         self.profile_snapshots[identifier] = (size, self.clock() + PROFILE_CURSOR_TTL)
         return True
 

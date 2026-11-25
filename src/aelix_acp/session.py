@@ -596,15 +596,33 @@ class Session:
     async def restore_tools(self):
         if self.active_tools is None:
             return
-        if "tools/set_active" not in self.controls.capabilities.get("methods", []):
-            raise ProtocolError("This Aelix runtime cannot restore the saved tool selection", -32004)
-        resources = await self.rpc("aelix_control", method="resources/list", params={})
-        available = {tool["name"] for tool in resources.get("tools", [])}
-        selected = [name for name in self.active_tools if name in available]
-        result = await self.rpc("aelix_control", method="tools/set_active", params={"names": selected})
-        if not self.studio_resources.tools_match(result, selected):
-            raise ProtocolError("Aelix did not restore the saved tool selection", -32004,
-                                {"kind": "restrictions_unenforceable", "methods": ["tools/set_active"]})
+        try:
+            if "tools/set_active" not in self.controls.capabilities.get("methods", []):
+                raise ProtocolError("This Aelix runtime cannot restore the saved tool selection", -32004)
+            resources = await self.rpc("aelix_control", method="resources/list", params={})
+            available = {tool["name"] for tool in resources.get("tools", [])}
+            selected = [name for name in self.active_tools if name in available]
+            result = await self.rpc("aelix_control", method="tools/set_active", params={"names": selected})
+            if not self.studio_resources.tools_match(result, selected):
+                raise ProtocolError("Aelix did not restore the saved tool selection", -32004,
+                                    {"kind": "restrictions_unenforceable", "methods": ["tools/set_active"]})
+        except BaseException:
+            if self.server.sessions.get(self.id) is self:
+                self.studio_resources.mark_uncertain()
+            raise
+
+    async def reload_resources(self, arguments, *, timeout, refresh_first=False):
+        try:
+            result = await self.rpc("aelix_control", method="resources/reload", params=arguments, _timeout=timeout)
+            if refresh_first:
+                await self.controls.refresh()
+            await self.restore_tools()
+        except BaseException:
+            if self.active_tools is not None and not self.studio_resources.uncertain:
+                self.studio_resources.mark_uncertain()
+            raise
+        self.studio_resources.invalidate_pages()
+        return result
 
     async def configure_mcp(self, servers):
         before = await self.rpc("aelix_control", method="resources/list", params={})
@@ -654,9 +672,17 @@ class Session:
     async def save(self, inherited_history=None, *, live=False, managed_commit=False):
         before_commit = None
         if live:
+            operation = self.studio_resources.profile_operation
+            restore_operation = self.studio_resources.restore_operation
+            if restore_operation is not None:
+                restore_operation.require_restore_current()
             worker = self.require_live_worker()
 
             def before_commit():
+                if restore_operation is not None:
+                    restore_operation.require_restore_current()
+                elif operation is not None:
+                    operation.require_current()
                 self.require_live_worker(worker)
                 if managed_commit:
                     self.extension_commit_started = True
@@ -686,6 +712,8 @@ class Session:
                           before_commit=before_commit)
         self.saved_config = config
         if live:
+            if restore_operation is not None:
+                restore_operation.require_restore_current()
             self.require_live_worker(worker, committed=True)
 
     def selectors(self):
@@ -1496,6 +1524,7 @@ class Session:
                 await self.publish_context_usage()
                 await self.publish_recovery_warnings()
                 await self.save(live=True, managed_commit=managed_change is not None)
+                self.studio_resources.restore_operation = None
                 self.server.sessions[self.id] = self
             return snapshot
         except BaseException:

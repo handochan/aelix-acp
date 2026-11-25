@@ -8,11 +8,13 @@ from pathlib import Path
 import re
 
 from . import profile_reselection as reselection
-from .profile_refs import (DisplayTooLarge, file_identity, preview, public_preview, source_label,
+from .profile_refs import (DisplayTooLarge, catalog_description, file_identity, preview, public_preview, source_label,
                            text_list, valid_name, valid_ref)
 from ..wire.errors import BackendError, ProtocolError
 
 MAX_PREVIEWS = 100
+MAX_CATALOG_ROWS = 4096
+MAX_CATALOG_SOURCE_BYTES = 32 * 1024 * 1024
 UNAVAILABLE = object()
 TOO_LARGE = object()
 TOOL_LOCK = re.compile(r"Cannot turn on (.+): \1 is (?:locked off for this run: |removed for this run by ).+\Z")
@@ -40,14 +42,16 @@ class StudioResources:
         self.starting_binding = None
         self.retired_binding = None
         self.profile_operation = None
+        self.restore_operation = None
 
     def binding(self):
         relay = self.session.input_relay
         return self.starting_binding or (relay.binding_id if relay is not None else None)
 
     def retire_approval(self):
-        if self.profile_operation is not None:
-            self.profile_operation.retire()
+        operation = self.profile_operation or self.restore_operation
+        if operation is not None:
+            operation.retire()
 
     def retire_replaced_approval(self, replacement):
         binding = self.binding()
@@ -78,20 +82,60 @@ class StudioResources:
     def reset(self, preferences):
         self.recorded = reselection.recorded_profile(preferences)
         self.previews.clear()
+        self.restore_operation = None
         self.uncertain = False
         self.invalidate_pages()
 
-    def source_for_diagnostic(self, path, roots):
-        if not isinstance(path, str):
-            return None
-        location = Path(path)
-        for scope, root in roots:
-            if location.parent == root:
+    @staticmethod
+    def source_for_diagnostic(path, roots):
+        if isinstance(path, str):
+            location = Path(path)
+            if scope := roots.get(location.parent):
                 try:
                     return source_label(scope, location)
                 except ValueError:
-                    return None
+                    pass
         return None
+
+    def catalog_rows(self, rows, native_diagnostics, guarded, previews):
+        cwd = Path(self.session.cwd)
+        agent_dir = Path(os.environ.get("AELIX_CODING_AGENT_DIR") or Path.home() / ".aelix" / "agent").expanduser()
+        roots = {cwd / ".aelix" / "agents": "project", cwd / agent_dir / "agents": "user"}
+        profiles, diagnostics = {}, []
+        remaining = MAX_CATALOG_SOURCE_BYTES
+        for row in rows:
+            path = row.get("filePath") if isinstance(row, dict) else None
+            try:
+                name, scope = row["name"], row["scope"]
+                if not valid_name(name):
+                    raise ValueError("Invalid native name")
+                if guarded:
+                    # Guarded discovery supplies metadata and its ref in one parse.
+                    ref = row.get("ref")
+                    if not valid_ref(ref) or ref["name"] != name or ref["scope"] != scope:
+                        raise ValueError("Unbound native row")
+                else:
+                    # The interim pin supplies metadata and paths in one RPC.
+                    # The file hash is provisional until a checked Studio show.
+                    ref, _, stamp = file_identity(row, max_bytes=remaining)
+                    remaining -= stamp[-1]
+                checked = previews.get(ref["revision"])
+                description = (checked["description"] if checked and checked["ref"] == ref
+                               else catalog_description(row["description"]))
+            except DisplayTooLarge:
+                raise
+            except (OSError, KeyError, TypeError, ValueError, RuntimeError):
+                diagnostics.append({"code": "invalid-profile", "key": None,
+                                    "source": self.source_for_diagnostic(path, roots)})
+                continue
+            if isinstance(path, str):
+                roots.setdefault(Path(path).parent, scope)
+            profiles[name] = {"ref": ref, "description": description}
+        for entry in native_diagnostics:
+            if isinstance(entry, dict):
+                diagnostics.append({"code": "invalid-profile", "key": None,
+                                    "source": self.source_for_diagnostic(entry.get("path"), roots)})
+        return sorted(profiles.values(), key=lambda row: row["ref"]["name"].encode("utf-8")), diagnostics
 
     async def catalog(self):
         if not self.supports("agents/list"):
@@ -100,33 +144,19 @@ class StudioResources:
             data = await self.rpc("agents/list")
         except BackendError:
             return refusal("unreadable")
-        if not isinstance(data, dict) or not isinstance(data.get("profiles"), list):
+        if not isinstance(data, dict) or not isinstance(rows := data.get("profiles"), list):
             return refusal("unreadable")
-        cwd = Path(self.session.cwd)
-        agent_dir = Path(os.environ.get("AELIX_CODING_AGENT_DIR") or Path.home() / ".aelix" / "agent").expanduser()
-        roots = [("project", cwd / ".aelix" / "agents"), ("user", cwd / agent_dir / "agents")]
-        profiles, diagnostics = {}, []
-        for row in data["profiles"]:
-            name = row.get("name") if isinstance(row, dict) else None
-            path = row.get("filePath") if isinstance(row, dict) else None
-            if not valid_name(name):
-                continue
-            # agents/list on the interim pin supplies candidate names only.
-            # Take description and revision from the same checked show.
-            candidate = await self.inspect(name, revision_bound=self.guarded())
-            if not isinstance(candidate, dict):
-                diagnostics.append({"code": "invalid-profile", "key": None,
-                                    "source": self.source_for_diagnostic(path, roots)})
-                continue
-            ref = candidate["ref"]
-            if isinstance(path, str):
-                roots.append((ref["scope"], Path(path).parent))
-            profiles[name] = {"ref": ref, "description": candidate["description"]}
-        for entry in data.get("diagnostics", []):
-            if not isinstance(entry, dict):
-                continue
-            diagnostics.append({"code": "invalid-profile", "key": None,
-                                "source": self.source_for_diagnostic(entry.get("path"), roots)})
+        native_diagnostics = data.get("diagnostics", [])
+        if not isinstance(native_diagnostics, list):
+            return refusal("unreadable")
+        if len(rows) + len(native_diagnostics) > MAX_CATALOG_ROWS:
+            return refusal("result-too-large")
+        try:
+            profiles, diagnostics = await asyncio.to_thread(
+                self.catalog_rows, rows, native_diagnostics, self.guarded(), dict(self.previews)
+            )
+        except DisplayTooLarge:
+            return refusal("result-too-large")
         capabilities = self.session.controls.capabilities
         unverified = self.uncertain or (self.profile_operation is not None and self.profile_operation.uncertain_effect)
         if unverified:
@@ -136,7 +166,7 @@ class StudioResources:
                 capabilities = {}
         name = capabilities.get("activeAgent")
         active_ref = self.recorded["ref"] if self.recorded and not unverified else None
-        return {"profiles": [profiles[key] for key in sorted(profiles, key=lambda value: value.encode("utf-8"))],
+        return {"profiles": profiles,
                 "activeAgent": name if valid_name(name) else None, "activeRef": active_ref,
                 "diagnostics": diagnostics, "nextCursor": None}
 
@@ -190,11 +220,13 @@ class StudioResources:
 
     async def select(self, requested, operation):
         previous = self.recorded
-        original = previous["ref"] if previous else requested
+        original = previous["ref"] if previous else None
         self.profile_operation = operation
         try:
             return await self.select_current(requested, previous, original, operation)
         except reselection.Stopped:
+            if operation.uncertain_effect:
+                raise
             return refusal("consent-required", cause="cancelled", recovery=reselection.recovery(original))
         finally:
             self.profile_operation = None
@@ -218,6 +250,11 @@ class StudioResources:
                 if before and before["ref"] != requested:
                     before = None
                 return reselection.changed(requested, candidate["ref"], original, before, candidate)
+            shown = self.previews.get(requested["revision"])
+            if not self.guarded() and (shown is None or shown["ref"] != requested):
+                # The pinned discovery RPC has no revision bound to its parsed
+                # metadata. Require a checked preview before an interim pick.
+                return refusal("profile-refused")
             if previous and original["name"] == requested["name"] and original != requested:
                 reason = await reselection.approve(operation, previous, candidate)
                 if reason:
@@ -230,6 +267,8 @@ class StudioResources:
                 latest = await self.inspect(current["name"], revision_bound=self.guarded()) if current else None
                 if not isinstance(latest, dict) or latest["ref"] != current:
                     latest = None
+                if operation.uncertain_effect:
+                    operation.require_current()
                 return reselection.changed(requested, current, original, candidate, latest)
             return refusal(native["reason"])
         self.recorded = candidate
@@ -239,7 +278,9 @@ class StudioResources:
         capabilities = self.session.controls.capabilities
         if "activeAgent" not in capabilities or capabilities["activeAgent"] != name:
             raise internal_error()
+        operation.require_current()
         await self.session.save(live=True)
+        operation.require_current()
         self.invalidate_pages()
         return {"accepted": True, "activeAgent": name, "activeRef": requested, "toolOverride": None}
 
@@ -280,6 +321,7 @@ class StudioResources:
                 operation.no_effect = True
                 return result
             raise internal_error()
+        operation.require_current()
         if guarded:
             if result.get("activeRef") != candidate["ref"]:
                 raise internal_error()
@@ -290,6 +332,7 @@ class StudioResources:
             if active.get("activeAgent") != name:
                 raise internal_error()
             after = await self.inspect(name)
+            operation.require_current()
             if not isinstance(after, dict):
                 raise internal_error()
             observed = after["ref"]
@@ -315,7 +358,7 @@ class StudioResources:
     async def restore(self):
         previous = self.recorded
         ref = previous["ref"]
-        operation = self.profile_operation = reselection.Operation(self)
+        operation = self.profile_operation = reselection.Operation(self, original=ref)
         try:
             operation.require_current()
             candidate = await self.inspect(ref["name"], revision_bound=self.guarded())
@@ -340,10 +383,12 @@ class StudioResources:
                 if native["reason"] == "profile-changed":
                     raise reselection.load_error("changed-again", ref)
                 return False
+            operation.require_current()
             self.recorded = candidate
+            self.restore_operation = operation
             return True
         except reselection.Stopped:
-            raise reselection.load_error("cancelled", ref) from None
+            raise reselection.load_error("outcome-unknown" if operation.uncertain_effect else "cancelled", ref) from None
         finally:
             self.profile_operation = None
 

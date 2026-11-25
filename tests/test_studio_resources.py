@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import ANY, AsyncMock, patch
 
 from aelix_acp.runtime import session_relay
-from aelix_acp.runtime.profile_refs import POLICY_FIELDS, preview, profile_ref, public_preview
+from aelix_acp.runtime.profile_refs import POLICY_FIELDS, file_identity, preview, profile_ref, public_preview
 from aelix_acp.server import Server, Session
 from aelix_acp.wire.errors import BackendError, ProtocolError
 
@@ -129,6 +129,7 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
         self.session.rpc.assert_awaited_with("aelix_control", method="agents/use", params={"name": "--none"}, _before_native_write=ANY)
 
     async def test_invalid_guard_advertisements_use_only_the_name(self):
+        await self.assert_result("profiles-show")
         for number, version in enumerate((None, False, True, 2, "1", 1.0)):
             self.session.controls.capabilities["profileRefGuard"] = version
             payload = dict(CASES["profiles-use"]["post"]["payload"], requestId=f"019aa123-0001-7000-8000-{number:012x}")
@@ -293,6 +294,7 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
         self.session.rpc.assert_not_awaited()
         self.relay.receipts.clear()
         self.session.controls.capabilities.pop("profileRefGuard")
+        await self.assert_result("profiles-show")
         self.resources.inspect.side_effect = [QUIET, QUIET, PROJECT, PROJECT]
         with patch.object(session_relay, "fits_resource_reply", side_effect=lambda value: value["accepted"]):
             with self.assertRaises(ProtocolError) as error:
@@ -303,27 +305,37 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.call("lookup-unknown", payload={"requestId": request_id}),
                          CASES["lookup-unknown"]["result"])
 
-    async def test_catalog_uses_checked_show_description_and_identity(self):
-        self.resources.inspect.return_value = {**PROJECT, "description": "Write notes"}
+    async def test_catalog_prefers_checked_show_metadata_and_requires_it_before_interim_use(self):
+        self.session.controls.capabilities.pop("profileRefGuard")
+        path = self.root / "quiet.md"
+        path.write_bytes(b"---\nname: quiet\ndescription: Write notes\n---\nWrite notes.")
+        row = {"name": "quiet", "scope": "user", "filePath": str(path), "description": "Old discovery description"}
+        ref, _, _ = file_identity(row)
+        self.resources.inspect.return_value = {**QUIET, "ref": ref, "description": "Write notes"}
 
         async def catalog(*args, **kwargs):
             if kwargs["method"] == "agents/list":
-                return {"profiles": [{"name": "quiet", "description": "Old discovery description"}]}
+                return {"profiles": [row]}
             return await self.native(*args, **kwargs)
 
         self.session.rpc.side_effect = catalog
         result = await self.call("profiles-list-page-1")
-        self.assertEqual(result["profiles"], [{"ref": PROJECT["ref"], "description": "Write notes"}])
-        self.resources.inspect.assert_awaited_once_with("quiet", revision_bound=True)
+        self.assertEqual(result["profiles"][0]["ref"], ref)
+        pick = CASES["profiles-use"]["post"]["payload"]
+        self.assertEqual(await self.call("profiles-use", payload={**pick, "profile": ref}),
+                         {"accepted": False, "reason": "profile-refused"})
+        self.assertFalse(any(call.kwargs["method"] == "agents/use" for call in self.session.rpc.await_args_list))
+        await self.call("profiles-show")
+        result = await self.call("profiles-list-page-1")
+        self.assertEqual(result["profiles"], [{"ref": ref, "description": "Write notes"}])
 
     async def test_cursor_retention_bounds_count_bytes_and_response_id_lengths(self):
         first = CASES["profiles-list-page-1"]["result"]
         snapshot = {**first, "profiles": first["profiles"] + CASES["profiles-list-page-2"]["result"]["profiles"]}
         self.resources.catalog = AsyncMock(return_value=snapshot)
         with patch.object(session_relay, "MAX_PROFILE_SNAPSHOTS", 1):
-            stale = (await self.call("profiles-list-page-1"))["nextCursor"]
             current = (await self.call("profiles-list-page-1"))["nextCursor"]
-            await self.assert_result("relay-error-stale-cursor", payload={"cursor": stale})
+            await self.assert_result("relay-error-large-item", payload={"limit": 1})
             result = await self.relay.profiles_list({"cursor": current}, response_id=7)
             self.assertEqual(result, await self.relay.profiles_list({"cursor": current}, response_id="*" * 4094))
             self.assertTrue(session_relay.fits_resource(result, "*" * 4094))
@@ -349,3 +361,70 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(sensitive, wire)
             self.assertNotIn(sensitive, saved)
         self.assertNotIn("safeForConsent", wire)
+
+
+    async def test_redaction_covers_escaped_quoted_block_and_unterminated_spans(self):
+        cases = (
+            ('Authorization: "Basic opaque-prefix\\"ESCAPED_CANARY" and keep this.',
+             ("ESCAPED_CANARY", "opaque-prefix"), "[redacted credential]"),
+            ('password: |-\n  YAML_CANARY\n  SECOND_LINE_CANARY\nkeep this.',
+             ("YAML_CANARY", "SECOND_LINE_CANARY"), "[redacted credential]"),
+            ('Read "/private/folder with spaces/PATH_CANARY.txt" and keep this.',
+             ("/private/", "PATH_CANARY", "spaces"), "[redacted path]"),
+            ('secret: "UNTERMINATED_CANARY\nMORE_SECRET_CANARY',
+             ("UNTERMINATED_CANARY", "MORE_SECRET_CANARY"), ""),
+        )
+        for body, forbidden, replacement in cases:
+            with self.subTest(marker=forbidden[0]):
+                native = {
+                    "body": body,
+                    "file_path": str(self.root / "quiet.md"),
+                    "description": '"apiKey": "first\\"DESCRIPTION_CANARY"',
+                    "system_prompt": QUIET["promptMode"], "provider": None, "model": None,
+                    "skills": [], "tools": [], "approval_mode": "inherit",
+                    **{field: QUIET["policy"][name] for name, field in POLICY_FIELDS.items()},
+                }
+                result = preview(native, QUIET["ref"], QUIET["source"])
+                for value in (*forbidden, "DESCRIPTION_CANARY"):
+                    self.assertNotIn(value, json.dumps(result))
+                if replacement:
+                    self.assertIn(replacement, result["promptPreview"])
+                    self.assertIn("keep this.", result["promptPreview"])
+                else:
+                    self.assertEqual(result["promptPreview"], "")
+
+    async def test_large_catalog_limit_one_uses_one_native_discovery_pass(self):
+        del self.resources.inspect
+        self.session.controls.capabilities.pop("profileRefGuard")
+        inventory = []
+        for index in range(256):
+            name = f"profile-{index:03d}"
+            path = self.root / f"{name}.md"
+            path.write_text(f"---\nname: {name}\ndescription: Review\n---\nReview.", encoding="utf-8")
+            inventory.append({"name": name, "scope": "user", "filePath": str(path), "description": "Review"})
+
+        async def catalog(*args, **kwargs):
+            if kwargs["method"] == "agents/list":
+                return {"profiles": inventory}
+            if kwargs["method"] == "agents/show":
+                item = inventory[int(kwargs["params"]["name"].split("-")[-1])]
+                return {"profile": {
+                    **item, "file_path": item["filePath"], "body": "Review.", "system_prompt": "append",
+                    "provider": None, "model": None, "skills": [], "tools": [], "approval_mode": "inherit",
+                    **{field: QUIET["policy"][name] for name, field in POLICY_FIELDS.items()},
+                }}
+            return await self.native(*args, **kwargs)
+
+        self.session.rpc.side_effect = catalog
+        result = await self.call("profiles-list-page-1")
+        self.assertEqual([item["ref"]["name"] for item in result["profiles"]], ["profile-000"])
+        self.assertIsNotNone(result["nextCursor"])
+        self.assertEqual([call.kwargs["method"] for call in self.session.rpc.await_args_list], ["agents/list"])
+
+    async def test_first_selection_recovery_never_claims_attempted_ref(self):
+        self.resources.inspect.return_value = PROJECT
+        result = await self.call("profiles-use")
+        self.assertEqual(result["reason"], "profile-changed")
+        self.assertEqual(result["recorded"], QUIET["ref"])
+        self.assertIsNone(result["recovery"]["original"])
+        self.session.rpc.assert_not_awaited()

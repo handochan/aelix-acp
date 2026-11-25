@@ -438,6 +438,7 @@ class Server:
 
         identifier = str(uuid.uuid4())
         session = Session(self, identifier, cwd)
+        session.studio_resources.starting_binding = binding_id
         session.client_mcp = mcp
         preferences = load_preferences(self.db, parent)
         head = preferences.pop("forkHead", None)
@@ -468,6 +469,8 @@ class Server:
                     await session.commands()
                     result = {"sessionId": identifier, **session.selectors()}
                     await session.save(session.fork_history(), live=True)
+                    if restore_operation := session.studio_resources.restore_operation:
+                        restore_operation.require_restore_current()
                     self.sessions[identifier] = session
                 try:
                     forks.receipt_path(self.args.state_dir, identifier).unlink(missing_ok=True)
@@ -515,24 +518,24 @@ class Server:
             return await self.intervene(params)
         if method in SESSION_MUTATIONS:
             session_id = require_string(params.get("sessionId"), "sessionId")
-            if method == "session/close":
-                live = self.pending_stop_sessions.get(session_id) or self.sessions.get(session_id)
-                if live is not None:
-                    live.studio_resources.retire_approval()
+            live = self.sessions.get(session_id)
+            candidate = self.pending_stop_sessions.get(session_id) or live
+            if method == "session/close" and candidate is not None:
+                candidate.studio_resources.retire_approval()
             if method == "session/load" and self.relay_enabled:
-                live = self.pending_stop_sessions.get(session_id) or self.sessions.get(session_id)
                 replacement = session_relay.open_binding(params.get("_meta"))
                 cwd = params.get("cwd")
-                if (live is not None and replacement is not None and isinstance(cwd, str)
-                        and str(Path(cwd).expanduser().resolve()) == live.cwd):
-                    live.studio_resources.retire_replaced_approval(replacement)
-            if method in ("session/load", "session/delete", "session/close") and session_id in self.starting_ids:
+                if (candidate is not None and replacement is not None and isinstance(cwd, str)
+                        and str(Path(cwd).expanduser().resolve()) == candidate.cwd):
+                    candidate.studio_resources.retire_replaced_approval(replacement)
+            pending_open = live is not None and live.studio_resources.restore_operation is not None
+            if pending_open or (method in ("session/load", "session/delete", "session/close")
+                                and session_id in self.starting_ids):
                 raise ProtocolError("Session is already starting", -32000)
             registered = session_id in self.sessions or self.db.execute(
                 "SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
             if registered:
                 with acquire_lease(self.args.state_dir, session_id, purpose="activity"):
-                    live = self.sessions.get(session_id)
                     readback = method == "_aelix/manage" and params.get("action") in (
                         "resources/list", "agents/list", "agents/show", "mcp/status", "permissions/get",
                     )
@@ -553,7 +556,8 @@ class Server:
         session = self.sessions.get(session_id)
         relay = session.input_relay if session is not None else None
         if (relay is None or relay.binding_id != binding_id or session_id in self.starting_ids
-                or session.studio_resources.retired_binding == binding_id):
+                or session.studio_resources.retired_binding == binding_id
+                or session.studio_resources.restore_operation is not None):
             raise ProtocolError("Session relay binding is unavailable.", session_relay.SCOPE_DENIED)
         if "response_id" in kwargs:
             session_relay.validate_response_id(kwargs["response_id"])
@@ -565,6 +569,8 @@ class Server:
         if session_id in self.starting_ids:
             raise session_changing()
         session = self.session(params)
+        if session.studio_resources.restore_operation is not None:
+            raise session_changing()
         if params["action"] not in session.controls.capabilities.get("methods", []):
             raise ProtocolError("Unsupported management action")
         return await session.intervene(params["action"], arguments)
@@ -655,6 +661,8 @@ class Server:
                         await session.save(live=True)
                     await session.publish_recovery_warnings()
                     await session.live_history.flush()
+                    if restore_operation := session.studio_resources.restore_operation:
+                        restore_operation.require_restore_current()
                     session.require_live_worker()
                     self.sessions[session_id] = session
             except BaseException:
@@ -666,7 +674,6 @@ class Server:
             finally:
                 self.pending_stop_sessions.pop(session_id, None)
                 self.starting_ids.discard(session_id)
-            session.studio_resources.starting_binding = None
             result = {**session.selectors(), **({"sessionId": session_id} if method.endswith("new") else {})}
             if snapshot is not None:
                 result["_meta"][transcript.META] = snapshot
@@ -807,6 +814,8 @@ class Server:
                     return await session.notice_turn()
                 if action == "mcp/configure":
                     result = await session.configure_mcp(arguments.get("servers"))
+                elif action == "resources/reload":
+                    result = await session.reload_resources(arguments, timeout=60)
                 else:
                     result = await session.rpc("aelix_control", method=action, params=arguments,
                         _timeout=(getattr(self.args, "command_timeout", 600) or None) if action in LONG_CONTROLS else 60)
@@ -815,8 +824,6 @@ class Server:
                     session.studio_resources.invalidate_pages()
                     await session.save()
                 if action == "resources/reload":
-                    await session.restore_tools()
-                    session.studio_resources.invalidate_pages()
                     await session.commands()
                 if action == "agents/use":
                     await session.commands()
@@ -844,16 +851,31 @@ class Server:
                 response = {"jsonrpc": "2.0", "id": request_id, "result": result}
                 if method == session_relay.LOOKUP_METHOD:
                     response = session_relay.bounded_lookup_response(response)
-                await self.send(response)
-                replied = True
-                if message["method"] in ("session/new", "session/load", "session/fork"):
+                session = None
+                if method in ("session/new", "session/load", "session/fork"):
                     session = self.sessions.get(result.get("sessionId") or message.get("params", {}).get("sessionId"))
-                    if session:
-                        # Follows the open response, so a host that applies its
-                        # own saved preference first still observes the
-                        # restored policy.
-                        await session.update({"sessionUpdate": "current_mode_update",
-                                              "currentModeId": session.controls.permission_mode})
+                resources = getattr(session, "studio_resources", None)
+                restore_operation = getattr(resources, "restore_operation", None)
+                if restore_operation is None:
+                    await self.send(response)
+                else:
+                    def admit_binding():
+                        restore_operation.require_restore_current()
+                        resources.restore_operation = None
+                        resources.starting_binding = None
+
+                    try:
+                        await self.send(response, before_send=admit_binding)
+                    except ProtocolError:
+                        await session.close()
+                        raise
+                replied = True
+                if resources is not None:
+                    resources.starting_binding = None
+                if session:
+                    # Follows the open response, so the host observes the restored policy.
+                    await session.update({"sessionUpdate": "current_mode_update",
+                                          "currentModeId": session.controls.permission_mode})
         except Exception as exc:
             if self.output_error is not None or self.closing:
                 return

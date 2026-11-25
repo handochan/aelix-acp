@@ -9,10 +9,12 @@ import sys
 import tempfile
 import unittest
 
-from aelix_acp.runtime.profile_reselection import APPROVAL_SECONDS, MANUAL_APPROVAL_ENV
+from aelix_acp.runtime.profile_reselection import APPROVAL_SECONDS
 from support import AcpClient
 from test_session_relay import initialize_offer, META
 from test_studio_resources import CASES, QUIET
+
+MANUAL_APPROVAL_ENV = "AELIX_ACP_STUDIO_MANUAL_PROFILE_APPROVAL"
 
 GUARDED_CHILD = r'''
 import hashlib
@@ -25,7 +27,7 @@ import time
 root = Path.cwd()
 Path(os.environ["AELIX_ACP_READY_FILE"]).write_text(os.environ["AELIX_ACP_NONCE"])
 mode = sys.argv[sys.argv.index("--permission-mode") + 1]
-methods = ["agents/show", "agents/use", "permissions/get", "permissions/set", "tools/set_active", "resources/list"]
+methods = ["agents/show", "agents/use", "permissions/get", "permissions/set", "tools/set_active", "resources/list", "resources/reload"]
 active = None
 tools = ["read"]
 
@@ -71,9 +73,12 @@ for line in sys.stdin:
         result = {"mode": mode}
     elif name == "resources/list":
         result = {"tools": [{"name": "read"}], "activeTools": tools}
+    elif name == "resources/reload":
+        tools = ["read"]
+        result = {"cancelled": False}
     elif name == "tools/set_active":
-        tools = params["names"]
-        result = {"activeTools": ["read"] if Path("wrong-restore-tools").exists() else tools}
+        tools = ["read"] if Path("wrong-restore-tools").exists() else params["names"]
+        result = {"activeTools": tools}
     elif name == "agents/show":
         if Path("pause-show").exists():
             Path("inspecting").touch()
@@ -97,6 +102,11 @@ for line in sys.stdin:
             active = ref["name"]
             tools = profile["tools"]
             log("profile-applied", {"ref": ref, "tools": tools})
+            if Path("pause-apply").exists():
+                Path("applied-blocked").touch()
+                deadline = time.monotonic() + 8
+                while Path("pause-apply").exists() and time.monotonic() < deadline:
+                    time.sleep(0.005)
             result = {"message": "Agent profile selected"}
             if not Path("unguarded").exists():
                 result["activeRef"] = ref
@@ -105,6 +115,44 @@ for line in sys.stdin:
         response["error"] = "profile not found"
     print(json.dumps(response), flush=True)
 '''
+
+
+PUBLICATION_GATES = """
+import asyncio
+from pathlib import Path
+import time
+from aelix_acp.runtime import store
+from aelix_acp.server import Server, main
+
+original_store = store._write_store
+def write_store(directory, write, args, check_commit):
+    if check_commit is None or write is not store.save_session or not Path("pause-commit").exists():
+        return original_store(directory, write, args, check_commit)
+
+    def blocked():
+        pause = Path("pause-commit")
+        Path("commit-blocked").touch()
+        deadline = time.monotonic() + 8
+        while pause.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        check_commit()
+    return original_store(directory, write, args, blocked)
+
+original_send = Server.send
+async def send(server, message, **kwargs):
+    result = message.get("result")
+    binding = result.get("_meta", {}).get("aelix/sessionRelay", {}) if isinstance(result, dict) else {}
+    if binding.get("bindingId") == "b-22" and Path("pause-publication").exists():
+        Path("publication-blocked").touch()
+        async with asyncio.timeout(8):
+            while Path("pause-publication").exists():
+                await asyncio.sleep(0.005)
+    return await original_send(server, message, **kwargs)
+
+store._write_store = write_store
+Server.send = send
+main()
+"""
 
 
 class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
@@ -124,12 +172,16 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.session = (await self.client.request("session/new", self.open_params("b-21")))["sessionId"]
         self.original = self.write_record()
 
-    async def start_client(self, *, manual=True):
+    async def start_client(self, *, manual=True, inherited_flag=False, gates=False):
+        # Exercise future authenticated-host behavior only inside the fixture
+        # process. The adapter itself has no configuration that grants it.
+        fixture_hook = "r.host_verified_manual_approval=lambda operation: True;" if manual else ""
+        entry = "from aelix_acp.runtime import profile_reselection as r;r.APPROVAL_SECONDS=1.5;" + fixture_hook
+        entry += PUBLICATION_GATES if gates else "from aelix_acp.server import main;main()"
         client = await AcpClient.start(
             self.root, sys.executable, prefix=[str(self.script)], capabilities=initialize_offer()["clientCapabilities"],
-            extra_env={MANUAL_APPROVAL_ENV: "1"} if manual else None,
-            entry=("-c", "from aelix_acp.runtime import profile_reselection as r;"
-                   "r.APPROVAL_SECONDS=1.5;from aelix_acp.server import main;main()"),
+            extra_env={MANUAL_APPROVAL_ENV: "1"} if inherited_flag else None,
+            entry=("-c", entry),
         )
         self.addAsyncCleanup(client.close)
         return client
@@ -427,3 +479,106 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_load_error("load-drift-silence")
         self.assertFalse(self.client.requests)
         self.assertEqual(self.calls("agents/use"), [])
+
+
+    async def test_inherited_manual_approval_flag_cannot_enable_a_card(self):
+        await self.client.close()
+        self.client = await self.start_client(manual=False, inherited_flag=True)
+        self.write_profile(self.project, 1)
+        await self.assert_load_error("load-drift-silence")
+        self.assertFalse(self.client.requests)
+        self.assertEqual(self.calls("agents/use"), [])
+
+    async def retire_paused_apply(self, pending, *, busy_message):
+        paused = self.root / "pause-apply"
+        try:
+            await self.wait_until(lambda: (self.root / "applied-blocked").exists())
+            with self.assertRaisesRegex(RuntimeError, busy_message):
+                await self.client.request("session/load", {**self.open_params("b-replacement"),
+                                                           "sessionId": self.session})
+        finally:
+            paused.unlink(missing_ok=True)
+        return await pending
+
+    async def test_load_retired_mid_apply_refuses_publication_and_preserves_record(self):
+        self.write_profile(self.project, 1)
+        (self.root / "pause-apply").touch()
+        pending = asyncio.create_task(self.load())
+        with self.assertRaises(RuntimeError) as failure:
+            await self.retire_paused_apply(pending, busy_message="already starting")
+        data = json.loads(str(failure.exception))["data"]
+        self.assertEqual(data["reason"], "outcome-unknown")
+        self.assertEqual(data["recovery"]["original"], self.old_ref)
+        self.assertEqual(len(self.calls("profile-applied")), 1)
+        self.assertEqual(self.preferences(), self.original)
+
+    async def test_live_selection_retired_mid_apply_has_unknown_outcome_and_preserves_record(self):
+        await self.load()
+        saved = self.preferences()
+        candidate = self.write_profile(self.project, 1)
+        (self.root / "pause-apply").touch()
+        post = CASES["use-recorded-drift"]["post"]
+        pending = asyncio.create_task(self.client.request(post["method"], {
+            "sessionId": self.session, "bindingId": "b-22", "payload": {
+                **post["payload"], "profile": candidate,
+            },
+        }))
+        with self.assertRaises(RuntimeError) as failure:
+            await self.retire_paused_apply(pending, busy_message="Session is busy")
+        self.assertEqual(json.loads(str(failure.exception))["code"], -33100)
+        self.assertEqual(len(self.calls("profile-applied")), 2)
+        self.assertEqual(self.preferences(), saved)
+
+    async def test_failed_live_reload_fences_the_next_prompt(self):
+        await self.load()
+        (self.root / "wrong-restore-tools").touch()
+        with self.assertRaisesRegex(RuntimeError, "restrictions_unenforceable"):
+            await self.client.request("_aelix/manage", {"sessionId": self.session, "action": "resources/reload"})
+        resources = await self.client.request("_aelix/manage", {"sessionId": self.session, "action": "resources/list"})
+        self.assertEqual(resources["activeTools"], ["read"])
+        with self.assertRaisesRegex(RuntimeError, "Reopen the session"):
+            await self.client.request("session/prompt", {"sessionId": self.session,
+                                                         "prompt": [{"type": "text", "text": "/tools"}]})
+        self.assertEqual(self.calls("prompt"), [])
+
+
+    async def open_with_gate(self, name):
+        await self.client.close()
+        self.client = await self.start_client(gates=True, inherited_flag=True)
+        self.write_profile(self.project, 1)
+        pause = self.root / ("pause-" + name)
+        pause.touch()
+        self.addCleanup(pause.unlink, missing_ok=True)
+        pending = asyncio.create_task(self.load())
+        await self.wait_until(lambda: (self.root / (name + "-blocked")).exists())
+        return pause, pending
+
+    async def test_retirement_before_sqlite_commit_admission_rolls_back_restore(self):
+        pause, pending = await self.open_with_gate("commit")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "already starting"):
+                await self.client.request("session/load", {**self.open_params("b-replacement"),
+                                                           "sessionId": self.session})
+        finally:
+            pause.unlink()
+        with self.assertRaises(RuntimeError) as error:
+            await pending
+        self.assertEqual(json.loads(str(error.exception))["data"]["reason"], "outcome-unknown")
+        self.assertEqual(self.preferences(), self.original)
+
+    async def test_pending_publication_blocks_prompt_and_rechecks_binding_after_commit(self):
+        pause, pending = await self.open_with_gate("publication")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "already starting"):
+                await self.client.request("session/prompt", {"sessionId": self.session,
+                                                             "prompt": [{"type": "text", "text": "/tools"}]})
+            with self.assertRaisesRegex(RuntimeError, "already starting"):
+                await self.client.request("session/load", {**self.open_params("b-replacement"),
+                                                           "sessionId": self.session})
+        finally:
+            pause.unlink()
+        with self.assertRaises(RuntimeError) as error:
+            await pending
+        self.assertEqual(json.loads(str(error.exception))["data"]["reason"], "outcome-unknown")
+        self.assertEqual(self.preferences()["agentRef"]["scope"], "project")
+        self.assertFalse(self.calls("prompt"))
