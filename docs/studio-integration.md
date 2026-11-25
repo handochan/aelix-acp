@@ -93,22 +93,20 @@ If native supplies a structured `message.error` object, ACP reads its integer
 object is authoritative, including when the resulting cause is `unknown`.
 See [native #921](https://github.com/handochan/aelix-ai/issues/921).
 
-With native pin `83714045`, ACP falls back to the anchored status prefixes
-`Error code: NNN` and `OpenAI Codex request failed (NNN)`, the type at
-`error.type` in a complete SDK error envelope, or native's `Connection error.`
-prefix with its optional ` — ` cause suffix.
-The status takes precedence over the type. For example, the pinned Anthropic
-SDK exposes the type envelope in an HTTP 200 error stream. An OpenAI-compatible
-stream error may carry only display prose and map to `unknown`.
+Native pin `83714045` serializes failed HTTP responses, connection failures,
+and stream errors into the same `error_message` field. A provider can supply
+identical text in an HTTP 200 stream, including a complete SDK-formatted
+diagnostic. ACP uses `unknown` for every failure on this pin that lacks
+structured provenance.
 
-| HTTP status | Error type or native phrase | ACP `data.cause.kind` |
+| Structured HTTP status | Structured error type | ACP `data.cause.kind` |
 |---|---|---|
 | 400, 404, 422 | `invalid_request_error` | `provider_bad_request` |
 | 401, 403 | `authentication_error`, `permission_error` | `provider_auth` |
 | 429 | `rate_limit_error` | `provider_rate_limit` |
 | 500–599, including 529 | `overloaded_error`, `api_error` | `provider_unavailable` |
-| No mapped status | Structured `connection_error` or native `Connection error.` | `provider_network` |
-| No mapped status | No recognized type or native phrase | `unknown` |
+| No mapped status | `connection_error` | `provider_network` |
+| Absent or unrecognized | Absent or unrecognized | `unknown` |
 
 The cause contains only the enum and a boolean. Both `retryable` fields are
 `false` because replaying a dispatched turn could repeat model calls or tool
@@ -116,7 +114,7 @@ effects. Direct replies to standard clients keep the native diagnostic.
 ACP records a generic `Request failed.` entry for dispatched failures and
 redacts legacy failure entries during protected replay. `session/prompt`
 requires an ID. An ID-less prompt has no effect. This is the protected Studio
-Host error for an authentication failure.
+Host error for a structured authentication failure.
 
 ```json
 {

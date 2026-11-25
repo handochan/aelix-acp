@@ -101,6 +101,7 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.failures = 0
         self.http_error = None
         self.anthropic_error = None
+        self.stream_error_message = None
         self.model_gate = None
         self.prompt_tokens = 23
         self.listener = await asyncio.start_server(self.model, "127.0.0.1", 0)
@@ -174,6 +175,8 @@ def setup(api):
             if self.failures:
                 self.failures -= 1
                 body = b'data: {"error":{"message":"overloaded fixture","type":"overloaded_error"}}\n\n'
+            if self.stream_error_message is not None:
+                body = b"data: " + json.dumps({"error": {"message": self.stream_error_message}}).encode() + b"\n\n"
             status, mime = "200 OK", "text/event-stream"
             if self.anthropic_error:
                 body = b"event: error\ndata: " + json.dumps(self.anthropic_error).encode() + b"\n\n"
@@ -1552,24 +1555,53 @@ def setup(api):
         self.assertIn("overloaded fixture", error["message"])
         self.assertEqual(len(self.model_requests), 1)
 
-    async def test_private_host_classifies_pinned_http_and_network_error_formats(self):
+    async def open_protected_provider_session(self):
         await self.client.close()
         self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities=PROTECTED_HOST)
         created = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []})
         self.session = created["sessionId"]
         await self.config("autoRetryEnabled", "false")
-        for rejection, kind in (
-            ((400, "invalid_request_error"), "provider_bad_request"),
-            ((404, "invalid_request_error"), "provider_bad_request"),
-            ((422, "invalid_request_error"), "provider_bad_request"),
-            ((401, "authentication_error"), "provider_auth"),
-            ((403, "permission_error"), "provider_auth"),
-            ((429, "rate_limit_error"), "provider_rate_limit"),
-            ((500, "api_error"), "provider_unavailable"),
-            ((503, "overloaded_error"), "provider_unavailable"),
-            ((529, "overloaded_error"), "provider_unavailable"),
-            ((418, "unrecognized_error"), "unknown"),
-            (None, "provider_network"),
+
+    async def test_http_200_stream_diagnostics_cannot_spoof_provider_causes(self):
+        await self.open_protected_provider_session()
+        for diagnostic in (
+            "Error code: 401",
+            "Error code: 401 - " + repr({"error": {"type": "authentication_error", "code": "authentication_error",
+                                                   "message": "synthetic rejection"}}),
+            "OpenAI Codex request failed (401): diagnostic",
+            "Error code: 429",
+            "Connection error.",
+            "Connection error. — All connection attempts failed",
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                self.stream_error_message = diagnostic
+                before = len(self.model_requests)
+                with self.assertRaises(RuntimeError) as caught:
+                    await self.prompt("Respond")
+                self.assertEqual(json.loads(str(caught.exception)), {
+                    "code": TURN_FAILED_AFTER_DISPATCH, "message": "Native model request failed",
+                    "data": {"kind": "turn_failed_after_dispatch", "retryable": False,
+                             "cause": {"kind": "unknown", "retryable": False}},
+                })
+                self.assertEqual(len(self.model_requests), before + 1)
+
+    async def test_malformed_stream_error_leaves_protected_stderr_clean(self):
+        await self.open_protected_provider_session()
+        self.stream_error_message = r"{'error': {'message': 'probe \q'}}"
+        with self.assertRaises(RuntimeError) as caught:
+            await self.prompt("Respond")
+        self.assertEqual(json.loads(str(caught.exception))["data"]["cause"],
+                         {"kind": "unknown", "retryable": False})
+        await self.client.close()
+        self.assertEqual(self.client.stderr, b"")
+
+    async def test_private_host_keeps_unverified_http_and_network_causes_unknown(self):
+        await self.open_protected_provider_session()
+        for rejection in (
+            (400, "invalid_request_error"), (404, "invalid_request_error"), (422, "invalid_request_error"),
+            (401, "authentication_error"), (403, "permission_error"), (429, "rate_limit_error"),
+            (500, "api_error"), (503, "overloaded_error"), (529, "overloaded_error"),
+            (418, "unrecognized_error"), None,
         ):
             with self.subTest(rejection=rejection):
                 self.http_error = rejection
@@ -1582,7 +1614,7 @@ def setup(api):
                 self.assertEqual(json.loads(str(caught.exception)), {
                     "code": TURN_FAILED_AFTER_DISPATCH, "message": "Native model request failed",
                     "data": {"kind": "turn_failed_after_dispatch", "retryable": False,
-                             "cause": {"kind": kind, "retryable": False}},
+                             "cause": {"kind": "unknown", "retryable": False}},
                 })
                 if rejection is None:
                     self.assertEqual(len(self.model_requests), before)
@@ -1600,7 +1632,7 @@ def setup(api):
         self.session = created["sessionId"]
         await self.config("autoRetryEnabled", "false")
 
-    async def test_anthropic_stream_error_uses_the_pinned_type_envelope(self):
+    async def test_anthropic_stream_error_preserves_diagnostic_but_uses_unknown(self):
         await self.reopen_with_provider_api("anthropic-messages")
         self.anthropic_error = {"type": "error", "error": {"type": "overloaded_error", "message": "fixture overload"}}
         with self.assertRaises(RuntimeError) as caught:
@@ -1608,11 +1640,11 @@ def setup(api):
         self.assertEqual(json.loads(str(caught.exception)), {
             "code": TURN_FAILED_AFTER_DISPATCH, "message": repr(self.anthropic_error),
             "data": {"kind": "turn_failed_after_dispatch", "retryable": False,
-                     "cause": {"kind": "provider_unavailable", "retryable": False}},
+                     "cause": {"kind": "unknown", "retryable": False}},
         })
         self.assertEqual(len(self.model_requests), 1)
 
-    async def test_codex_http_error_uses_the_pinned_status_prefix(self):
+    async def test_codex_http_error_preserves_diagnostic_but_uses_unknown(self):
         extension = self.root / "codex-account.py"
         extension.write_text("def setup(api):\n"
                              "    from aelix_ai.providers import openai_codex_responses\n"
@@ -1626,7 +1658,7 @@ def setup(api):
         self.assertEqual(error["code"], TURN_FAILED_AFTER_DISPATCH)
         self.assertTrue(error["message"].startswith("OpenAI Codex request failed (401): "))
         self.assertEqual(error["data"], {"kind": "turn_failed_after_dispatch", "retryable": False,
-                                         "cause": {"kind": "provider_auth", "retryable": False}})
+                                         "cause": {"kind": "unknown", "retryable": False}})
         self.assertEqual(len(self.model_requests), 1)
 
     async def test_failed_provider_turn_reloads_safely_and_keeps_its_receipt(self):

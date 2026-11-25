@@ -943,7 +943,7 @@ class Session:
             assistant_error = message.get("role") == "assistant" and stop_reason == "error"
             if error or (assistant_error and isinstance(structured, dict)):
                 detail = "Native model request failed" if self.private_host or not error else error
-                cause_kind = provider_failure_kind(structured, error) if assistant_error else None
+                cause_kind = provider_failure_kind(structured) if assistant_error else None
                 self.failure = TurnFailure(detail, cause_kind)
                 self.clear_image_sample()
             await self.settle_message(event, message)

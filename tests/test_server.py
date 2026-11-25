@@ -619,7 +619,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(caught.exception.code, TURN_FAILED_AFTER_DISPATCH)
                 self.assertEqual(str(caught.exception), "Native model request failed" if private else detail)
                 self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False,
-                    "cause": {"kind": "provider_rate_limit" if private else "provider_auth", "retryable": False}})
+                    "cause": {"kind": "provider_rate_limit" if private else "unknown", "retryable": False}})
 
     async def test_bookkeeping_failure_keeps_the_not_retryable_marking(self):
         self.native(failure={"role": "assistant", "stop_reason": "error", "error_message": "provider rejected the request"})
