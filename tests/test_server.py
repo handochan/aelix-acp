@@ -112,6 +112,67 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         await self.session.save()
         await self.assert_close_rejected_during_start("session/load", {"cwd": self.session.cwd, "sessionId": self.session.id})
 
+    async def test_failed_second_transcript_page_publishes_no_replay_or_success(self):
+        await self.server.dispatch("initialize", {"protocolVersion": 1,
+            "clientCapabilities": {"_meta": {"aelix/transcript": {"version": 1}}}})
+        self.session.cwd = str(Path(self.tmp.name).resolve())
+        await self.session.save()
+        requests = []
+
+        async def rpc(command, *, method, params):
+            self.assertEqual((command, method), ("aelix_control", "transcript/list"))
+            requests.append(params.get("cursor"))
+            if len(requests) == 2:
+                raise BackendError("fixture second page failure", command)
+            return {"nativeSessionId": "native", "bindingId": "binding", "leafId": "last",
+                    "totalMessages": 2, "nextCursor": "next",
+                    "entries": [{"entryId": "first", "parentEntryId": None, "sequence": 1,
+                                 "message": {"role": "user", "content": "Unpublished partial page"}}]}
+
+        async def start(session, _session_file):
+            session.controls.capabilities = {"version": 1, "methods": ["transcript/list"]}
+            session.rpc = rpc
+
+        with (patch.object(Session, "start", start), patch.object(Session, "commands"),
+              patch.object(Session, "close")):
+            await self.server.handle({"jsonrpc": "2.0", "id": 10, "method": "session/load",
+                                      "params": {"cwd": self.session.cwd, "sessionId": self.session.id}})
+
+        self.assertEqual(requests, [None, "next"])
+        self.assertEqual(self.events, [{"jsonrpc": "2.0", "id": 10,
+            "error": {"code": -32603, "message": "Native session history is unavailable",
+                      "data": {"kind": "native_history_unavailable"}}}])
+        self.assertNotIn(self.session.id, self.server.sessions)
+
+    async def test_transcript_tool_with_unresolvable_home_keeps_its_card(self):
+        path = "~fixture-user/file.txt"
+        message = {"role": "assistant", "content": [{"type": "toolCall", "tool_call_id": "read-1",
+                                                     "tool_name": "read", "input": {"path": path}}]}
+        with patch.object(
+            Path, "expanduser", autospec=True, side_effect=RuntimeError("Home directory unavailable")
+        ) as expand:
+            card, = self.server.native_message_updates(self.session, message, canonical=True)
+        expand.assert_called_once_with(Path(path))
+        self.assertEqual(card["sessionUpdate"], "tool_call")
+        self.assertEqual(card["toolCallId"], "read-1")
+        self.assertEqual(card["rawInput"], {"path": path})
+        self.assertNotIn("locations", card)
+
+    async def test_legacy_session_ignores_native_live_transcript_annotations(self):
+        await self.server.dispatch("initialize", {"protocolVersion": 1,
+            "clientCapabilities": {"_meta": {"aelix/transcript": {"version": 1}}}})
+        self.session.controls.capabilities = {"version": 1, "methods": []}
+        coordinates = {"nativeSessionId": "native", "bindingId": "binding", "streamId": "stream"}
+        await self.session.event({"type": "message_update", "transcript": coordinates,
+                                  "assistant_message_event": {"type": "text_delta", "delta": "plain"}})
+        await self.session.event({"type": "message_end", "message": {"role": "assistant"},
+                                  "transcript": {**coordinates, "entryId": "entry", "parentEntryId": None,
+                                                 "sequence": 1, "status": "stored"}})
+        self.assertNotIn("aelix/transcriptCapability", self.session.selectors()["_meta"])
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0]["params"]["update"], {
+            "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "plain"}})
+
     async def test_initialize_advertises_session_close(self):
         result = await self.server.dispatch("initialize", {"protocolVersion": 1})
         capabilities = result["agentCapabilities"]["sessionCapabilities"]

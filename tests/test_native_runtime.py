@@ -1532,6 +1532,129 @@ def setup(api):
         prefix = f"[aelix:{self.session[:8]}] ".encode()
         self.assertIn(b".-" * 8192, self.client.stderr.replace(prefix, b""))
 
+    async def test_cli_appends_native_turns_with_stable_live_and_replay_ids(self):
+        meta = "aelix/transcript"
+        offer = {"_meta": {meta: {"version": 1}}}
+        await self.client.close()
+        extensions = [self.root / "commands.py"]
+        self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities=offer, extensions=extensions)
+        load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        initial = await self.client.request("session/load", load)
+        if meta not in initial["_meta"]:
+            if os.environ.get("AELIX_ACP_REQUIRE_TRANSCRIPT") == "1":
+                self.fail("The transcript candidate must advertise transcript/list")
+            self.skipTest("This native runtime does not advertise transcript/list")
+        self.assertEqual(initial["_meta"][meta]["totalMessages"], 0)
+
+        await self.config("permission_mode", "yolo")
+        self.client.updates.clear()
+        self.assertEqual(await self.prompt("Studio first turn", key="studio-first"), {"stopReason": "end_turn"})
+        live = self.client.updates.copy()
+        settlements = [event["params"] for event in live if event["method"] == "_aelix/transcript/settled"]
+        self.assertEqual([(item["role"], item["status"], item["sequence"]) for item in settlements],
+                         [("user", "stored", 1), ("assistant", "stored", 2)])
+        deltas = [event["params"]["update"] for event in live if event["method"] == "session/update"]
+        assistant = next(update for update in deltas if update["sessionUpdate"] == "agent_message_chunk")
+        coordinates = assistant["_meta"][meta]
+        self.assertNotIn("entryId", coordinates)
+        self.assertEqual((coordinates["bindingId"], coordinates["streamId"]),
+                         (settlements[1]["bindingId"], settlements[1]["streamId"]))
+        self.assertEqual(sum(update["sessionUpdate"] == "user_message_chunk" for update in deltas), 1)
+        await self.client.close()
+
+        # Model a pre-upgrade ACP event table. The original display is still
+        # present, but its messages have no native coordinates.
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db, db:
+            session_file, = db.execute("SELECT file FROM sessions WHERE id=?", (self.session,)).fetchone()
+            for seq, value in db.execute("SELECT sequence,value FROM events WHERE session_id=?", (self.session,)):
+                update = json.loads(value)
+                if meta in update.get("_meta", {}):
+                    update["_meta"].pop(meta)
+                    db.execute("UPDATE events SET value=? WHERE sequence=?", (json.dumps(update), seq))
+
+        env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP") if key in os.environ}
+        env.update(HOME=str(self.root / "home"), USERPROFILE=str(self.root / "home"),
+                   AELIX_CODING_AGENT_DIR=str(self.root / "agent"),
+                   AELIX_SETTINGS_PATH=str(self.root / "agent/settings.json"))
+        cli = await asyncio.create_subprocess_exec(
+            EXECUTABLE, "--mode", "rpc", "--offline", "--no-extensions", "--session", session_file,
+            cwd=self.root, env=env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+        appended = []
+        try:
+            for request_id in ("cli-1", "cli-2"):
+                request = {"id": request_id, "type": "prompt", "message": "Identical CLI input"}
+                cli.stdin.write((json.dumps(request) + "\n").encode())
+                await cli.stdin.drain()
+                async with asyncio.timeout(30):
+                    while line := await cli.stdout.readline():
+                        event = json.loads(line)
+                        if event.get("id") == request_id:
+                            self.assertTrue(event["success"], event)
+                        if event["type"] == "message_end":
+                            appended.append(event["transcript"])
+                        if event["type"] == "agent_end":
+                            break
+                    else:
+                        self.fail("CLI exited before settling the appended prompt")
+            self.assertEqual(len(appended), 4)
+            self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities=offer, extensions=extensions)
+            with self.assertRaises(RuntimeError) as caught:
+                await self.client.request("session/load", load)
+            self.assertEqual(json.loads(str(caught.exception))["code"], SESSION_LOCKED)
+        finally:
+            cli.stdin.close()
+            try:
+                await asyncio.wait_for(cli.wait(), 10)
+            except TimeoutError:
+                cli.kill()
+                await cli.wait()
+        self.assertEqual(cli.returncode, 0)
+        self.assertEqual(len(self.model_requests), 3)
+
+        replays = []
+        for _ in range(2):
+            self.client.updates.clear()
+            result = await self.client.request("session/load", load)
+            marker = result["_meta"][meta]
+            self.assertEqual(marker["totalMessages"], 6)
+            self.assertFalse(marker["recovered"])
+            self.assertEqual(result["modes"]["currentModeId"], "yolo")
+            updates = [event["params"]["update"] for event in self.client.updates if event["method"] == "session/update"]
+            replay = [(update["_meta"][meta], update["content"]["text"]) for update in updates
+                      if update["sessionUpdate"] in {"agent_message_chunk", "user_message_chunk"}]
+            self.assertEqual([text for _, text in replay],
+                             ["Studio first turn", "NATIVE_OK", "Identical CLI input", "NATIVE_OK",
+                              "Identical CLI input", "NATIVE_OK"])
+            self.assertEqual([item["sequence"] for item, _ in replay], list(range(1, 7)))
+            self.assertEqual(len({item["entryId"] for item, _ in replay}), 6)
+            for expected, (item, _) in zip(settlements + appended, replay, strict=True):
+                self.assertEqual(item["source"], "replay")
+                self.assertEqual(item["part"], 0)
+                self.assertEqual(item["nativeSessionId"], marker["nativeSessionId"])
+                for key in ("nativeSessionId", "entryId", "parentEntryId", "sequence"):
+                    self.assertEqual(item[key], expected[key])
+            replays.append((marker, replay))
+        self.assertEqual(replays[0], replays[1])
+        self.assertEqual(await self.prompt("/help"), {"stopReason": "end_turn"})
+        self.assertEqual(await self.prompt("/echo local-only"), {"stopReason": "end_turn"})
+        adapter_replays = []
+        for _ in range(2):
+            self.client.updates.clear()
+            result = await self.client.request("session/load", load)
+            self.assertEqual(result["_meta"][meta], replays[0][0])
+            updates = [event["params"]["update"] for event in self.client.updates if event["method"] == "session/update"]
+            display = [update for update in updates if update.get("_meta", {}).get(meta, {}).get("source") == "adapter"]
+            self.assertEqual(len(display), 4)
+            self.assertEqual(display[0]["content"]["text"], "/help")
+            self.assertEqual([update["content"]["text"] for update in display[2:]], ["/echo local-only", "echo:local-only"])
+            coords = [update["_meta"][meta] for update in display]
+            self.assertEqual(len({event["bindingId"] for event in coords}), 1)
+            self.assertEqual([event["sequence"] for event in coords], list(range(1, 5)))
+            self.assertEqual(len({event["eventId"] for event in coords}), 4)
+            adapter_replays.append(display)
+        self.assertEqual(adapter_replays[0], adapter_replays[1])
+        self.assertEqual(len(self.model_requests), 3, "load cannot resend a prompt")
+
     async def test_process_restart_restores_history_and_model_selection(self):
         await self.config("model", "fixture/two")
         await self.prompt("Respond")

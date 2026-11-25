@@ -59,6 +59,7 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
         self.child_gate, self.parent_gate = asyncio.Event(), asyncio.Event()
         self.child_waiting = asyncio.Event()
         self.calls = 0
+        self.agent_call_id = None
         self.listener = await asyncio.start_server(self.model, "127.0.0.1", 0)
         port = self.listener.sockets[0].getsockname()[1]
         (self.root / "agent/models.json").write_text(json.dumps({"providers": {"fixture": {
@@ -83,14 +84,16 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
                                             capabilities={"_meta": dict(capabilities)},
                                             adapter_args=["--enable-agents", "--permission-mode", mode])
         self.clients.append(self.client)
-        self.session = (await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []},
-                                                  timeout=120))["sessionId"]
+        opened = await self.client.request("session/new", {"cwd": str(self.root), "mcpServers": []}, timeout=120)
+        self.session = opened["sessionId"]
+        return opened
 
     # === the scripted model ===
 
     def call(self, name, arguments):
         self.calls += 1
-        return {"role": "assistant", "tool_calls": [{"index": 0, "id": f"call_{name}_{self.calls}", "type": "function",
+        call_id = self.agent_call_id if name == "agent" and self.agent_call_id else f"call_{name}_{self.calls}"
+        return {"role": "assistant", "tool_calls": [{"index": 0, "id": call_id, "type": "function",
                 "function": {"name": name, "arguments": json.dumps(arguments)}}]}, "tool_calls"
 
     async def parent_turn(self, request):
@@ -503,6 +506,173 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: (self.root / "child.txt").exists())
         self.assertEqual((self.root / "parent.txt").read_text(), "parent")
 
+    async def open_with_transcript(self, *, extensions=()):
+        opened = await self.open(capabilities={**NESTING, "aelix/transcript": {"version": 1}}, extensions=extensions)
+        self.require_transcript(opened)
+
+    def require_transcript(self, opened):
+        capability = opened["_meta"].get("aelix/transcriptCapability")
+        if capability is None and os.environ.get("AELIX_ACP_REQUIRE_TRANSCRIPT") != "1":
+            self.skipTest("This native runtime does not advertise transcript/list")
+        self.assertEqual(capability, {"version": 1})
+
+    async def test_transcript_replays_rewritten_tool_result_on_its_original_card(self):
+        extension = self.root / "rewrite_result.py"
+        extension.write_text("""
+from dataclasses import replace
+from aelix_agent_core.harness.hooks import MessageEndEventResult
+from aelix_ai.messages import AssistantMessage, TextContent, ToolCallContent, ToolResultMessage
+
+def setup(api):
+    def rewrite(event, ctx):
+        message = event.message
+        if isinstance(message, AssistantMessage):
+            content = [replace(block, tool_call_id="accepted-agent-call")
+                       if isinstance(block, ToolCallContent) and block.tool_name == "agent" else block
+                       for block in message.content]
+            if content != message.content:
+                return MessageEndEventResult(message=replace(message, content=content))
+        if isinstance(message, ToolResultMessage) and message.tool_name == "agent":
+            return MessageEndEventResult(message=replace(
+                message, tool_call_id="rewritten-by-reducer",
+                content=[TextContent(text="Rewritten native report")]))
+    api.on("message_end", rewrite)
+""", encoding="utf-8")
+        await self.open_with_transcript(extensions=[extension])
+        self.assertEqual(await self.prompt("DELEGATE_WRITE"), {"stopReason": "end_turn"})
+        original = self.agent_call()
+        self.assertEqual(original, "accepted-agent-call")
+        live_card = self.card(original)
+        live_done = next(update for update in live_card if update.get("status") == "completed")
+        live_result = live_done["_meta"]["aelix/transcript"]
+        receipt, = [event["params"] for event in self.client.updates
+                    if event["method"] == "_aelix/transcript/settled"
+                    and event["params"]["streamId"] == live_result["streamId"]]
+        self.assertTrue(receipt["replaced"])
+        self.assertEqual(receipt["status"], "stored")
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            session_file, = db.execute("SELECT file FROM sessions WHERE id=?", (self.session,)).fetchone()
+        entries = [json.loads(line) for line in Path(session_file).read_text(encoding="utf-8").splitlines()]
+        stored = next(entry["message"] for entry in entries if entry.get("id") == receipt["entryId"])
+        self.assertEqual(stored.get("tool_call_id") or stored.get("toolCallId"), "rewritten-by-reducer")
+
+        load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        for _ in range(2):
+            self.client.updates.clear()
+            await self.client.request("session/load", load, timeout=120)
+            self.assertFalse(self.card("rewritten-by-reducer"))
+            card = self.card(original)
+            self.assertEqual([update["sessionUpdate"] for update in card], ["tool_call", "tool_call_update"])
+            done = card[-1]
+            self.assertEqual(done["status"], "completed")
+            self.assertEqual(done["content"][0]["content"]["text"], "Rewritten native report")
+            self.assertEqual(done["_meta"]["aelix/transcript"]["entryId"], receipt["entryId"])
+            self.assertEqual(done["_meta"]["aelix/transcript"]["nativeSessionId"], receipt["nativeSessionId"])
+            children = done["_meta"]["aelix/subagents"]["children"]
+            self.assertEqual(children[0]["id"], live_done["_meta"]["aelix/subagents"]["children"][0]["id"])
+
+    async def test_transcript_replays_subagents_separately_when_call_id_is_reused(self):
+        self.agent_call_id = "call_agent_reused"
+        # Record from a client that has not opted into live transcript metadata.
+        self.require_transcript(await self.open())
+        children_per_turn = []
+        for _ in range(2):
+            self.client.updates.clear()
+            self.assertEqual(await self.prompt("DELEGATE_WRITE"), {"stopReason": "end_turn"})
+            self.assertEqual(self.agent_call(), self.agent_call_id)
+            completed, = [frame for frame in self.card(self.agent_call_id) if frame.get("status") == "completed"]
+            children_per_turn.append(completed["_meta"]["aelix/subagents"])
+        self.assertNotEqual(children_per_turn[0]["children"][0]["id"], children_per_turn[1]["children"][0]["id"])
+        request_counts = len(self.parent_requests), len(self.child_requests)
+        await self.client.close()
+        self.clients.remove(self.client)
+        self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=["--enable-agents"],
+            capabilities={"_meta": {**NESTING, "aelix/transcript": {"version": 1}}})
+        self.clients.append(self.client)
+        previous_ids = None
+        load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        for _ in range(2):
+            self.client.updates.clear()
+            await self.client.request("session/load", load, timeout=120)
+            starts = [frame for frame in self.updates()
+                      if frame.get("sessionUpdate") == "tool_call" and frame.get("title") == "agent"]
+            card_ids = [start["toolCallId"] for start in starts]
+            self.assertEqual(len(set(card_ids)), 2)
+            for card_id, expected in zip(card_ids, children_per_turn, strict=True):
+                start, end = self.card(card_id)
+                self.assertEqual(end["status"], "completed")
+                self.assertEqual(start["_meta"]["aelix/subagents"], expected)
+                self.assertEqual(end["_meta"]["aelix/subagents"], expected)
+            if previous_ids is not None:
+                self.assertEqual(card_ids, previous_ids)
+            previous_ids = card_ids
+        self.assertEqual((len(self.parent_requests), len(self.child_requests)), request_counts)
+
+    async def test_transcript_keeps_late_child_progress_off_a_reused_call_card(self):
+        waiting = [asyncio.Event(), asyncio.Event()]
+        release = [asyncio.Event(), asyncio.Event()]
+
+        async def gated_child(request):
+            index = len(self.child_requests)
+            self.child_requests.append(request)
+            waiting[index].set()
+            await release[index].wait()
+            return {"role": "assistant", "content": f"CHILD_DONE {index}"}, "stop"
+
+        self.child_turn = gated_child
+        self.agent_call_id = "call_agent_reused"
+        await self.open_with_transcript()
+        turn = None
+        try:
+            self.assertEqual(await self.prompt("SPAWN_HOLD"), {"stopReason": "end_turn"})
+            await asyncio.wait_for(waiting[0].wait(), 60)
+            first = self.last_child(self.agent_call_id)["id"]
+            self.client.updates.clear()
+            turn = asyncio.create_task(self.prompt("DELEGATE_HOLD"))
+            await asyncio.wait_for(waiting[1].wait(), 60)
+            release[0].set()
+            await self.until(lambda: any(
+                child.get("id") == first and child.get("end")
+                for update in self.card(self.agent_call_id)
+                if (child := update.get("_meta", {}).get("aelix/child"))))
+            release[1].set()
+            self.assertEqual(await turn, {"stopReason": "end_turn"})
+        finally:
+            for gate in release:
+                gate.set()
+            if turn is not None:
+                await asyncio.gather(turn, return_exceptions=True)
+
+        completed, = [frame for frame in self.card(self.agent_call_id) if frame.get("status") == "completed"]
+        current = [child["id"] for child in completed["_meta"]["aelix/subagents"]["children"] if child["id"] != first]
+        self.assertEqual(len(current), 1)
+        self.client.updates.clear()
+        await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []},
+                                  timeout=120)
+        starts = [frame for frame in self.updates()
+                  if frame.get("sessionUpdate") == "tool_call" and frame.get("title") == "agent"]
+        self.assertEqual(len(starts), 2)
+        children = [[child["id"] for child in self.card(start["toolCallId"])[-1]["_meta"]["aelix/subagents"]["children"]]
+                    for start in starts]
+        self.assertEqual(children, [[first], current])
+
+    async def test_transcript_preserves_standalone_nested_tool_updates(self):
+        await self.open_with_transcript()
+        result = await self.manage("agents/run", {"name": "worker", "task": "CHILD_WRITE child.txt"}, timeout=120)
+        self.assertTrue(result["result"]["ok"], result)
+        nested = [update for update in self.updates() if "parentToolCallId" in update.get("_meta", {})]
+        self.assertEqual([update["sessionUpdate"] for update in nested], ["tool_call", "tool_call_update"])
+        self.assertEqual(nested[-1]["status"], "completed")
+        parent = nested[0]["_meta"]["parentToolCallId"]
+        self.assertTrue(parent.startswith("aelix-child:"))
+        load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        for _ in range(2):
+            self.client.updates.clear()
+            opened = await self.client.request("session/load", load, timeout=120)
+            self.assertEqual(opened["_meta"]["aelix/transcript"]["totalMessages"], 0)
+            self.assertEqual(self.card(parent)[-1]["status"], "completed")
+            self.assertEqual(self.card(nested[0]["toolCallId"]), nested)
+
     # === #800 on ACP ===
 
     async def test_a_cancelled_calls_report_is_replayed_by_session_load(self):
@@ -519,12 +689,44 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(report)
         await self.client.close()
         self.clients.remove(self.client)
-        self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=["--enable-agents"])
+        meta = "aelix/transcript"
+        self.client = await AcpClient.start(self.root, EXECUTABLE, adapter_args=["--enable-agents"],
+                                          capabilities={"_meta": {meta: {"version": 1}}})
         self.clients.append(self.client)
-        await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []},
-                                  timeout=120)
+        load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        result = await self.client.request("session/load", load, timeout=120)
         replayed = [u for u in self.card(agent) if u.get("status") == "failed"]
-        self.assertEqual(replayed[-1]["content"][0]["content"]["text"], report)
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(replayed[0]["content"][0]["content"]["text"], report)
+        if meta not in result["_meta"]:
+            if os.environ.get("AELIX_ACP_REQUIRE_TRANSCRIPT") == "1":
+                self.fail("The transcript candidate must advertise transcript/list")
+            return  # Legacy native can only replay the recorded terminal frame.
+        self.assertEqual(replayed[0]["_meta"][meta]["role"], "toolResult")
+        child_meta = replayed[0]["_meta"]["aelix/subagents"]
+        self.assertTrue(child_meta)
+
+        # Reproduce the native write succeeding before ACP records the last
+        # frame, then repeat with the entire ACP display table empty.
+        for delete_all in (False, True):
+            await self.client.request("session/close", {"sessionId": self.session})
+            with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db, db:
+                if delete_all:
+                    db.execute("DELETE FROM events WHERE session_id=?", (self.session,))
+                else:
+                    db.execute("DELETE FROM events WHERE session_id=? AND json_extract(value, '$.toolCallId')=? "
+                               "AND json_extract(value, '$.status')='failed'", (self.session, agent))
+            for _ in range(2):
+                self.client.updates.clear()
+                await self.client.request("session/load", load, timeout=120)
+                card = self.card(agent)
+                self.assertEqual(sum(update["sessionUpdate"] == "tool_call" for update in card), 1)
+                terminal = [update for update in card if update.get("status") == "failed"]
+                self.assertEqual(len(terminal), 1)
+                self.assertEqual(terminal[0]["content"], replayed[0]["content"])
+                self.assertEqual(terminal[0]["_meta"][meta], replayed[0]["_meta"][meta])
+                if not delete_all:
+                    self.assertIn("aelix/subagents", terminal[0]["_meta"])
 
     async def test_one_session_cancel_sends_one_native_abort_in_the_first_two_seconds(self):
         extension = self.root / "slow_abort.py"

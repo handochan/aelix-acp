@@ -14,6 +14,7 @@ from time import monotonic
 
 from ..stdio import write_diagnostic
 from ..wire.errors import ProtocolError
+from .transcript import META as TRANSCRIPT_META
 
 WRITE_TIMEOUT = 10
 
@@ -138,6 +139,16 @@ def append_event(db: sqlite3.Connection, session_id: str, update: dict) -> None:
 def insert_history(db: sqlite3.Connection, session_id: str, updates) -> None:
     db.executemany("INSERT INTO events(session_id,value) VALUES(?,?)",
                    ((session_id, json.dumps(update, ensure_ascii=False, allow_nan=False)) for update in updates))
+
+
+def confirm_adapter_input(db, session_id, binding, first, last):
+    """A slash command completed locally. Keep its previously recorded input."""
+    prefix = '$._meta."' + TRANSCRIPT_META + '".'
+    db.execute("UPDATE events SET value=json_set(value, ?, 'adapter') WHERE session_id=? "
+               "AND json_extract(value, ?)='composer' AND json_extract(value, ?)=? "
+               "AND json_extract(value, ?) BETWEEN ? AND ?",
+               (prefix + "source", session_id, prefix + "source", prefix + "bindingId", binding,
+                prefix + "sequence", first, last))
 
 
 def _write_busy(error):
