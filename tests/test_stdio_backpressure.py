@@ -69,6 +69,15 @@ def snapshot(name):
     pending.write_text(json.dumps(metrics), encoding="utf-8")
     pending.replace(path)
 
+deliver = StdinReader._deliver
+def observe_delivery(self, item):
+    if isinstance(item, bytes) and b'"id": "queued-third"' in item and self.queue.full():
+        Path("stdin-delivery-blocked").touch()
+        if Path("break-stdin").exists():
+            os.close(self.fd)
+    return deliver(self, item)
+StdinReader._deliver = observe_delivery
+
 readline = StdinReader.readline
 async def observe_eof(self):
     line = await readline(self)
@@ -80,6 +89,8 @@ async def observe_eof(self):
         line = await readline(self)
     if not line:
         Path('stdin-eof').touch()
+        if Path('hold-eof-dispatch').exists():
+            await asyncio.Future()
     elif b'"method": "fixture/snapshot"' in line:
         snapshot(json.loads(line)["params"]["name"])
     return line
@@ -91,6 +102,13 @@ class FixtureServer(entry.Server):
         type(self).instance = self
         if Path("small-error-budget").exists():
             self.error_replies.byte_limit = 256
+        if Path("observe-error-budget").exists():
+            end_input = self.error_replies.end_input
+            def observe_end():
+                end_input()
+                Path("input-ended").touch()
+            self.error_replies.end_input = observe_end
+        if Path("small-error-budget").exists() or Path("observe-error-budget").exists():
             wait = self.error_replies.space.wait
             async def observe_backpressure():
                 snapshot("error-lane-full")
@@ -474,6 +492,64 @@ class BackpressureTests(unittest.TestCase):
         self.assertEqual(self.proc.wait(timeout=5), 2)
         self.assertIn(b"ACP stdout drain timed out", self.proc.stderr.read())
 
+    def saturate_input_delivery(self, *, break_stdin=False):
+        (self.root / "observe-error-budget").touch()
+        if break_stdin:
+            (self.root / "break-stdin").touch()
+        self.start()
+        self.large_reply()
+        ids = ["a" * (600 * 1024), "b" * 8192]
+        for key in ids:
+            self.send("session/cancel", key, {"sessionId": "missing"})
+        self.wait_for("error-lane-full")
+        full = json.loads((self.root / "error-lane-full").read_text(encoding="utf-8"))
+        self.assertEqual(full["errorFrames"], 1)
+        self.assertGreater(full["errorBytes"], 600 * 1024)
+        tail = ["queued-first", "queued-second", "queued-third"]
+        for key in tail:
+            self.send("session/list", key)
+        self.wait_for("stdin-delivery-blocked")
+        return ids, tail
+
+    def test_eof_with_stdin_delivery_and_error_admission_both_blocked(self):
+        self.saturate_input_delivery()
+        self.proc.stdin.close()
+        self.assertEqual(self.proc.wait(timeout=3), 2)
+        self.assertIn(b"ACP stdout drain timed out", self.proc.stderr.read())
+
+    def test_eof_with_unread_kernel_bytes_and_both_queues_full(self):
+        self.saturate_input_delivery()
+        self.send("session/list", "in-kernel")
+        self.proc.stdin.close()
+        self.assertEqual(self.proc.wait(timeout=3), 2)
+        self.assertIn(b"ACP stdout drain timed out", self.proc.stderr.read())
+
+    def test_eof_during_blocked_delivery_allows_the_active_frame_to_finish(self):
+        self.saturate_input_delivery()
+        self.proc.stdin.close()
+        self.wait_for("input-ended")
+        self.assertEqual(self.reply(), {"jsonrpc": "2.0", "id": 3, "result": {"text": "x" * 2**20}})
+        self.assertEqual(self.proc.wait(timeout=3), 0)
+        self.assertEqual(self.proc.stdout.read(), b"")
+
+    def test_read_error_with_stdin_delivery_and_error_admission_both_blocked(self):
+        self.saturate_input_delivery(break_stdin=True)
+        self.assertEqual(self.proc.wait(timeout=3), 2)
+        self.assertIn(b"ACP stdout drain timed out", self.proc.stderr.read())
+
+    def test_open_stdin_with_blocked_delivery_preserves_all_frames(self):
+        ids, tail = self.saturate_input_delivery()
+        self.send("session/list", "in-kernel")
+        # Hold both queues full past the EOF grace with the writer still open.
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.proc.wait(timeout=1.4)
+        answered, _ = self.collect_responses([3, *ids, *tail, "in-kernel"])
+        self.assertEqual(len(answered[3]["result"]["text"]), 2**20)
+        for key in ids:
+            self.assertEqual(answered[key]["error"]["code"], -32000)
+        self.proc.stdin.close()
+        self.assertEqual(self.proc.wait(timeout=5), 0)
+
     def test_first_stop_at_both_limits_preserves_every_reply_and_withdrawal(self):
         (self.root / "small-error-budget").touch()
         session = self.start_native_prompt("ask")
@@ -592,6 +668,15 @@ class BackpressureTests(unittest.TestCase):
         self.assertEqual(self.reply(), {"jsonrpc": "2.0", "id": 3, "result": {"text": "x" * 2**20}})
         self.assertEqual(self.proc.wait(timeout=5), 0)
         self.assertEqual(self.proc.stdout.read(), b"")
+
+    def test_eof_deadline_starts_before_dispatch_resumes(self):
+        (self.root / "hold-eof-dispatch").touch()
+        self.start()
+        self.large_reply()
+        self.proc.stdin.close()
+        self.wait_for("stdin-eof")
+        self.assertEqual(self.proc.wait(timeout=3), 2)
+        self.assertIn(b"ACP stdout drain timed out", self.proc.stderr.read())
 
     def test_eof_exits_with_an_error_when_the_reader_never_drains(self):
         self.start()

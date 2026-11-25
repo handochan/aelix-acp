@@ -823,7 +823,6 @@ class Server:
         await started.wait()
 
     async def run(self):
-        reader = StdinReader(on_eof=self.error_replies.end_input)
         loop = asyncio.get_running_loop()
         self.run_task = run_task = asyncio.current_task()
 
@@ -831,6 +830,15 @@ class Server:
             if not self.closing:
                 run_task.cancel()
 
+        input_deadline = None
+
+        def end_input():
+            nonlocal input_deadline
+            if input_deadline is None and not self.closing:
+                input_deadline = loop.call_later(STDOUT_DRAIN_SECONDS, stop)
+                self.error_replies.end_input()
+
+        reader = StdinReader(on_eof=end_input)
         installed_signals = []
         for sig in [signal.SIGTERM, *([signal.SIGHUP] if hasattr(signal, "SIGHUP") else [])]:
             with contextlib.suppress(NotImplementedError):
@@ -885,20 +893,25 @@ class Server:
         except EOFError:
             eof = True  # EOF observed while stdin admission was waiting on stdout.
         except asyncio.CancelledError:
-            if self.output_error is None:
+            if input_deadline is None and self.output_error is None:
                 raise
         finally:
             reader.close()
             self.closing = True
+            if input_deadline is not None:
+                input_deadline.cancel()
+                eof = self.output_error is None
             tasks = self.tasks | self.validation_replies | self.withdrawals
             tasks.update(pending.task for pending in self.cancel_tasks.values())
             tasks.update((cancel_writer, error_writer))
             for task in tasks:
                 task.cancel()
             if self.output:
-                if eof:
+                if eof and self.output.pending:
+                    remaining = (STDOUT_DRAIN_SECONDS if input_deadline is None
+                                 else max(0, input_deadline.when() - loop.time()))
                     try:
-                        await self.output.drain(STDOUT_DRAIN_SECONDS)
+                        await self.output.drain(remaining)
                     except TimeoutError:
                         self.output_error = TimeoutError(errno.ETIMEDOUT, "ACP stdout drain timed out")
                 self.output.close()

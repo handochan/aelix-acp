@@ -92,9 +92,17 @@ At capacity, ACP denies a new child approval before opening a client dialog.
 Native stderr drains continuously into a shared best-effort sink. A full
 inherited stderr queue can discard whole chunks and diagnostics.
 
-On stdin EOF, the adapter discards queued frames and gives an active stdout
-write one second to finish. A closed stdout reader ends the connection, even
-with stdin open. An EOF drain timeout exits with status 2. A client that never
+Stdin EOF or a terminal read error starts one shutdown deadline on the event
+loop. While a frame waits for space in the two-slot input queue, the reader
+checks the pipe for hangup or error at 100 ms intervals. This detects a
+writer disconnect even with bytes left in the kernel. POSIX sockets also
+report a write-half close. An open writer retains ordinary backpressure and
+all queued bytes.
+
+End of input wakes a dispatcher waiting for error-reply space. Shutdown
+discards queued frames and gives the active stdout write the remainder of
+the one-second deadline to finish. A closed stdout reader ends the connection,
+even with stdin open. An EOF drain timeout exits with status 2. A client that never
 resumes reading can see a truncated final line and must recover through
 history.
 
