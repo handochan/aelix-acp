@@ -103,11 +103,18 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                 writer.write(b"x\n" * 256)
                 writer.close()
                 # No individual put needs to wait through an entire probe interval.
+                consumed = 0
                 async with asyncio.timeout(1):
                     while not ended.is_set():
                         self.assertEqual(await reader.readline(), b"x\n")
+                        consumed += 1
                         await asyncio.sleep(0.01)
-                self.assertTrue(reader.queue.full())
+                # EOF was reported while frames were still pending delivery, and
+                # reporting it early must not drop any of them.
+                self.assertLess(consumed, 256)
+                async with asyncio.timeout(3):
+                    rest = [await reader.readline() for _ in range(256 - consumed + 1)]
+                self.assertEqual(rest, [b"x\n"] * (256 - consumed) + [b""])
             finally:
                 reader.close()
                 await asyncio.to_thread(reader.thread.join, 1)
