@@ -778,7 +778,10 @@ class Session:
             if future is None:
                 return
             try:
-                return await asyncio.wait_for(future, _timeout)
+                # On Python 3.11 wait_for can swallow the turn deadline's
+                # cancellation when the native reply completes concurrently.
+                async with asyncio.timeout(_timeout):
+                    return await future
             except TimeoutError:
                 if command == "aelix_control" and kwargs.get("method") in LONG_CONTROLS:
                     with contextlib.suppress(ProtocolError, TimeoutError):
@@ -1522,8 +1525,7 @@ class Session:
 
         Each one native has not answered yet has its line on native's stdin, so it
         answers that its delivery is unknown (`intervene`). One native answered
-        before the fence rose returns that answer, on every Python version (fix
-        round 1, Codex C-M1: 3.11's `wait_for` returned it and 3.12's raised).
+        before the fence rose returns that answer even if its waiter resumes later.
         New ones are refused until the fence is lowered. Only this ends any:
         restart()'s own raise of the counter, before its close, refuses new
         ones alone (fix round 2, F1).
@@ -1554,7 +1556,7 @@ class Session:
                     if action in ("children/list", "children/events") and isinstance(answer, dict):
                         self.observe_epoch(answer.get("epoch"))  # P-LOW-1: a reply names native's epoch too
                     return answer
-                # Python 3.11's wait_for returns an answer that came after the fence's cancel.
+                # The fence owns the outcome of requests that were still unanswered.
             if task.cancelling():
                 task.uncancel()
             raise delivery_unknown(action) from None

@@ -600,11 +600,30 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False})
 
     async def test_turn_timeout_after_acknowledgment_has_no_provider_cause(self):
-        self.args.turn_timeout = 0.01
+        self.args.turn_timeout = 1
         written = self.native(streaming=True)
-        with self.assertRaises(ProtocolError) as caught:
-            await self.session.prompt([{"type": "text", "text": "Respond"}])
-        # The deadline can expire before the first idle-state poll.
+        loop = asyncio.get_running_loop()
+        timeout = asyncio.timeout
+        turn_deadline = timeout(None)
+        native_write = self.session.proc.stdin.write
+
+        def controlled_timeout(delay):
+            return turn_deadline if delay == self.args.turn_timeout else timeout(delay)
+
+        def write(raw):
+            if json.loads(raw)["type"] != "get_state":
+                native_write(raw)
+            elif "get_state" not in written:
+                # Deliver the busy reply and expire the turn in one event-loop step.
+                native_write(raw)
+                turn_deadline.reschedule(loop.time())
+            # Leave any later poll unanswered so the test watchdog can cancel it.
+
+        self.session.proc.stdin.write = write
+        with patch.object(asyncio, "timeout", side_effect=controlled_timeout):
+            with self.assertRaises(ProtocolError) as caught:
+                await asyncio.wait_for(self.session.prompt([{"type": "text", "text": "Respond"}]), timeout=5)
+
         self.assertEqual([command for command in written if command in ("prompt", "abort")], ["prompt", "abort"])
         self.assertEqual((caught.exception.code, str(caught.exception)), (TURN_FAILED_AFTER_DISPATCH, "Aelix turn timed out"))
         self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False})
