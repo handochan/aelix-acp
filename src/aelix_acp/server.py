@@ -23,8 +23,9 @@ from .image_policy import VERIFIED_IMAGE_POLICIES
 from . import __version__
 from .wire.errors import (ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH,
                           fork_head_changed, require_object, require_string)
-from .runtime.store import (open_store, load_preferences, history, history_records, legacy_permission_mode,
-                            save_preferences, cache_recovered_history, write_store)
+from .runtime.store import (open_store, load_preferences, history_records, legacy_permission_mode,
+                            save_preferences, cache_recovered_history, display_recorded_update,
+                            with_assistant_origin, write_store)
 from .runtime.controls import MODE_IDS
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
@@ -342,7 +343,8 @@ class Server:
             raise native_history.unavailable() from None
         if updates:
             try:
-                await cache_recovered_history(self.args.state_dir, session.id, updates)
+                recorded = (with_assistant_origin(update, "model") for update in updates)
+                await cache_recovered_history(self.args.state_dir, session.id, recorded)
             except (OSError, sqlite3.Error, ValueError):
                 raise native_history.unavailable() from None
         return updates
@@ -393,22 +395,23 @@ class Server:
 
     async def replay_history(self, session):
         await session.live_history.flush()
+        recorded = ((store, sequence, display_recorded_update(update, protected=session.private_host))
+                    for store, sequence, update in history_records(self.db, session.id))
         nesting = session.declares(NESTED_TOOL_CALLS)
         if session.transcript_enabled():
             snapshot = await transcript.read(
                 session.rpc, lambda message: self.native_message_updates(session, message, canonical=True))
             session.require_live_worker()
-            recorded = history_records(self.db, session.id)
             async for update in transcript.reconcile(snapshot, recorded, session_id=session.id, nesting=nesting):
                 if session.private_host:
                     update = {key: value for key, value in update.items() if key != "rawOutput"}
                 await session.notify("session/update", {"sessionId": session.id, "update": update})
                 await asyncio.sleep(0)
             return snapshot.marker
-        recorded = (transcript.display_update(update) for update in history(self.db, session.id)
-                    if transcript.result_link(update) is None)
-        if (first := next(recorded, None)) is not None:
-            for update in chain((first,), recorded):
+        display = (transcript.display_update(update) for _, _, update in recorded
+                   if transcript.result_link(update) is None)
+        if (first := next(display, None)) is not None:
+            for update in chain((first,), display):
                 if not nesting and nested_only(update):
                     continue
                 if session.private_host:
@@ -820,8 +823,8 @@ class Server:
         replied = False
         try:
             method = message["method"]
-            if request_id is None and method.startswith(session_relay.METHOD_PREFIX):
-                return  # v1 has no client-to-agent session relay notifications.
+            if request_id is None and (method == "session/prompt" or method.startswith(session_relay.METHOD_PREFIX)):
+                return  # These methods are requests and require a correlated reply.
             result = await self.dispatch(method, message.get("params") or {})
             if request_id is not None:
                 response = {"jsonrpc": "2.0", "id": request_id, "result": result}

@@ -7,6 +7,7 @@ import codecs
 import asyncio
 import contextlib
 from collections import Counter
+from dataclasses import dataclass
 import json
 import hmac
 import hashlib
@@ -19,8 +20,9 @@ import tempfile
 import time
 import uuid
 
-from .wire.errors import (ProtocolError, BackendError, SOCKET_PATH_TOO_LONG, after_dispatch, delivery_unknown, fork_head_changed,
-                          is_native_session_locked, require_object, require_string, session_changing, session_locked)
+from .wire.errors import (ProtocolError, BackendError, NativeAssistantError, SOCKET_PATH_TOO_LONG, after_dispatch,
+                          delivery_unknown, fork_head_changed, is_native_session_locked, require_object, require_string,
+                          session_changing, session_locked)
 from .wire.process import terminate_owned
 from .stdio import write_diagnostic
 from .wire.transport import encode_frame
@@ -28,8 +30,10 @@ from . import image_policy
 from .runtime import native_frames, native_history, transcript
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
-from .runtime.store import (LiveHistory, begin_turn, confirm_adapter_input, finish_turn, legacy_permission_mode, load_preferences,
-                            recorded_turn, save_session, write_store)
+from .runtime.provider_errors import provider_failure_kind
+from .runtime.store import (LiveHistory, PROMPT_FAILURE_PREFIX, PROMPT_FAILURE_TEXT, begin_turn, confirm_adapter_input,
+                            finish_turn, legacy_permission_mode, load_preferences, recorded_turn, save_session,
+                            with_assistant_origin, write_store)
 from .runtime.commands import (ALIASES, BUILTINS, PRIVATE_NATIVE_COMMANDS, SELECTOR_STARTUP_COMMAND,
                                compact_instructions, execute as execute_slash)
 from .runtime.extensions import extension_reference
@@ -179,6 +183,12 @@ def profile_unavailable(name):
                          -32004, {"kind": "profile_unavailable", "profile": name})
 
 
+@dataclass(frozen=True)
+class TurnFailure:
+    message: str
+    cause_kind: str | None = None
+
+
 class Session:
     def __init__(self, server, session_id, cwd, *, initial_mode=None):
         self.server, self.id, self.cwd = server, session_id, cwd
@@ -188,7 +198,7 @@ class Session:
         self.history_requests = set()
         self.tasks = set()
         self.done = None
-        self.failure = None
+        self.failure: TurnFailure | None = None
         self.rpc_closed = False
         self.cancelled = False
         self.cancel_generation = 0
@@ -554,7 +564,7 @@ class Session:
         path = Path(self.socket_dir) / "fork-history.jsonl"
         with path.open(encoding="utf-8") as stream:
             for line in stream:
-                yield json.loads(line)
+                yield with_assistant_origin(json.loads(line), "model")
         path.unlink()
 
     async def listen(self, socket_path, *, tcp):
@@ -745,7 +755,7 @@ class Session:
             self.interventions[task] = future  # raise_fence reads whether native answered.
         try:
             if self.rpc_closed:
-                raise ProtocolError(self.failure or "Aelix RPC stream is closed", -32603)
+                raise ProtocolError(self.failure.message if self.failure else "Aelix RPC stream is closed", -32603)
             if not self.proc or self.proc.returncode is not None:
                 raise ProtocolError("Aelix child is not running", -32603)
             frame = {"id": request_id, "type": command, **kwargs}
@@ -769,7 +779,10 @@ class Session:
             if future is None:
                 return
             try:
-                return await asyncio.wait_for(future, _timeout)
+                # On Python 3.11 wait_for can swallow the turn deadline's
+                # cancellation when the native reply completes concurrently.
+                async with asyncio.timeout(_timeout):
+                    return await future
             except TimeoutError:
                 if command == "aelix_control" and kwargs.get("method") in LONG_CONTROLS:
                     with contextlib.suppress(ProtocolError, TimeoutError):
@@ -849,7 +862,8 @@ class Session:
                 else:
                     await self.event(event)
         except Exception as exc:
-            self.failure = "Aelix stream failed" if self.private_host else f"Aelix stream failed: {exc}"
+            detail = "Aelix stream failed" if self.private_host else f"Aelix stream failed: {exc}"
+            self.failure = TurnFailure(detail)
         finally:
             self.rpc_closed = True
             self.invalidate_image_acceptance()
@@ -858,7 +872,7 @@ class Session:
                 if not future.done():
                     future.set_exception(ProtocolError("Aelix process closed its RPC stream", -32603))
             if self.done and not self.done.done():
-                self.failure = self.failure or "Aelix process closed during a turn"
+                self.failure = self.failure or TurnFailure("Aelix process closed during a turn")
                 self.done.set_result(None)
             if self._close_task is None:
                 task = asyncio.create_task(self.close())
@@ -929,8 +943,13 @@ class Session:
         elif kind == "message_end":
             message = event.get("message") or {}
             error = message.get("errorMessage") or message.get("error_message")
-            if error:
-                self.failure = "Native model request failed" if self.private_host else error
+            structured = message.get("error")
+            stop_reason = message.get("stopReason") or message.get("stop_reason")
+            assistant_error = message.get("role") == "assistant" and stop_reason == "error"
+            if error or (assistant_error and isinstance(structured, dict)):
+                detail = "Native model request failed" if self.private_host or not error else error
+                cause_kind = provider_failure_kind(structured) if assistant_error else None
+                self.failure = TurnFailure(detail, cause_kind)
                 self.clear_image_sample()
             await self.settle_message(event, message)
         elif kind == "aelix_subagent":
@@ -1155,7 +1174,7 @@ class Session:
                         **coordinates, "previousChildren": sorted(previous_children)}
             recorded_meta[transcript.TOOL_ORIGIN_META] = origin
         recorded = {**update, "_meta": {**update.get("_meta", {}), **recorded_meta}} if recorded_meta else None
-        await self.record_update(update, recorded=recorded)
+        await self.record_update(update, recorded=recorded, origin="model")
 
     async def settle_message(self, event, message):
         role = message.get("role")
@@ -1192,8 +1211,9 @@ class Session:
             update = self.adapter_message(update)
         await self.record_update(update)
 
-    async def record_update(self, update, *, recorded=None):
-        self.live_history.append(update if recorded is None else recorded)
+    async def record_update(self, update, *, recorded=None, origin="adapter"):
+        saved = update if recorded is None else recorded
+        self.live_history.append(with_assistant_origin(saved, origin))
         await self.notify("session/update", {"sessionId": self.id, "update": update})
 
     async def notify(self, method, params):
@@ -1510,8 +1530,7 @@ class Session:
 
         Each one native has not answered yet has its line on native's stdin, so it
         answers that its delivery is unknown (`intervene`). One native answered
-        before the fence rose returns that answer, on every Python version (fix
-        round 1, Codex C-M1: 3.11's `wait_for` returned it and 3.12's raised).
+        before the fence rose returns that answer even if its waiter resumes later.
         New ones are refused until the fence is lowered. Only this ends any:
         restart()'s own raise of the counter, before its close, refuses new
         ones alone (fix round 2, F1).
@@ -1542,7 +1561,7 @@ class Session:
                     if action in ("children/list", "children/events") and isinstance(answer, dict):
                         self.observe_epoch(answer.get("epoch"))  # P-LOW-1: a reply names native's epoch too
                     return answer
-                # Python 3.11's wait_for returns an answer that came after the fence's cancel.
+                # The fence owns the outcome of requests that were still unanswered.
             if task.cancelling():
                 task.uncancel()
             raise delivery_unknown(action) from None
@@ -1622,9 +1641,12 @@ class Session:
             # Once native may have started work, a failure is final: an
             # automatic replay could repeat model calls and tool effects.
             error = after_dispatch(failure) if self.dispatched else failure
+            history_text = PROMPT_FAILURE_TEXT if self.dispatched else PROMPT_FAILURE_PREFIX + str(error)
             update = {"sessionUpdate": "agent_message_chunk",
-                      "content": {"type": "text", "text": "Request failed: " + str(error)}}
-            self.live_history.append(self.adapter_message(update) if transcript.supported(self.controls.capabilities) else update)
+                      "content": {"type": "text", "text": history_text}}
+            if transcript.supported(self.controls.capabilities):
+                update = self.adapter_message(update)
+            self.live_history.append(with_assistant_origin(update, "prompt_failure"))
             if error is failure:
                 raise
             raise error from None
@@ -1806,7 +1828,9 @@ class Session:
             await self.context.finish_compaction("failed")
             await self.publish_context_usage()
             if self.failure and not self.cancelled:
-                raise ProtocolError(self.failure, -32603)
+                if self.failure.cause_kind is not None:
+                    raise NativeAssistantError(self.failure.message, self.failure.cause_kind)
+                raise ProtocolError(self.failure.message, -32603)
             stop_reason = "cancelled" if self.cancelled else "end_turn"
             await self.save()
             return {"stopReason": stop_reason}

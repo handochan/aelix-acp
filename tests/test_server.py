@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import ProtocolError, Server, Session
 from aelix_acp.wire.errors import BackendError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH, after_dispatch, is_native_session_locked
 from aelix_acp.runtime.leases import acquire
-from aelix_acp.runtime.store import load_preferences
+from aelix_acp.runtime.store import append_event, load_preferences, with_assistant_origin
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -547,24 +547,33 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.code, -32007)
         self.assertEqual(calls, ["compact", "abort"])
 
-    def native(self, *, failure=None, running=True):
+    def native(self, *, failure=None, running=True, streaming=False, crash_reader=None):
         """Answer the real rpc() path in-process, as a native child would."""
         session, written = self.session, []
         class Input:
             def write(self, raw):
                 payload = json.loads(raw)
                 written.append(payload["type"])
-                if payload["type"] == "prompt" and failure:
-                    session.failure = failure
-                data = {"isStreaming": False} if payload["type"] == "get_state" else {}
-                asyncio.get_running_loop().call_soon(session.pending[payload["id"]].set_result, data)
+                self.command = payload["type"]
+                if self.command == "get_state" and crash_reader is not None:
+                    crash_reader.feed_eof()
+                    return
+                data = {"isStreaming": streaming} if self.command == "get_state" else {}
+                future = session.pending[payload["id"]]
+
+                def reply():
+                    if not future.done():
+                        future.set_result(data)
+
+                asyncio.get_running_loop().call_soon(reply)
             async def drain(self):
-                pass
-        self.session.proc = SimpleNamespace(stdin=Input(), returncode=None if running else 1)
+                if self.command == "prompt" and failure:
+                    await session.event({"type": "message_end", "message": failure})
+        self.session.proc = SimpleNamespace(stdin=Input(), stdout=crash_reader, returncode=None if running else 1)
         return written
 
     async def test_failure_after_dispatch_is_marked_not_retryable(self):
-        written = self.native(failure="provider rejected the request")
+        written = self.native(failure={"error_message": "provider rejected the request"})
         with self.assertRaises(ProtocolError) as caught:
             await self.session.prompt([{"type": "text", "text": "Respond"}])
         self.assertEqual(caught.exception.code, TURN_FAILED_AFTER_DISPATCH)
@@ -572,8 +581,138 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("provider rejected", str(caught.exception))
         self.assertEqual(written[0], "prompt")
 
+    async def test_idless_prompt_never_dispatches_or_logs(self):
+        self.server.sessions[self.session.id] = self.session
+        written = self.native(failure={"role": "assistant", "stop_reason": "error",
+                                       "error_message": "fixture-secret"})
+        with redirect_stderr(io.StringIO()) as diagnostics:
+            await self.server.handle({"jsonrpc": "2.0", "method": "session/prompt", "params": {
+                "sessionId": self.session.id, "prompt": [{"type": "text", "text": "Respond"}]}})
+        self.assertEqual(written, [])
+        self.assertEqual(self.events, [])
+        self.assertEqual(diagnostics.getvalue(), "")
+
+    async def test_canonical_protected_load_counts_and_coordinates_failure_replay(self):
+        meta = "aelix/transcript"
+        await self.server.dispatch("initialize", {"protocolVersion": 1,
+            "clientCapabilities": {"_meta": {meta: {"version": 1}}}})
+        self.session.cwd = str(Path(self.tmp.name).resolve())
+        await self.session.save()
+        legacy = {"sessionUpdate": "agent_message_chunk",
+                  "content": {"type": "text", "text": "Request failed: fixture-secret"}}
+        tagged_legacy = self.session.adapter_message(legacy)
+        current = self.session.adapter_message({**legacy, "content": {"type": "text", "text": "Request failed."}})
+        for update in (legacy, tagged_legacy, with_assistant_origin(current, "prompt_failure")):
+            append_event(self.server.db, self.session.id, update)
+
+        async def rpc(command, **kwargs):
+            if command == "get_session_stats":
+                return {}
+            self.assertEqual((command, kwargs["method"]), ("aelix_control", "transcript/list"))
+            return {"nativeSessionId": "native", "bindingId": "binding", "leafId": "first", "totalMessages": 1,
+                    "nextCursor": None,
+                    "entries": [{"entryId": "first", "parentEntryId": None, "sequence": 1,
+                                 "message": {"role": "assistant", "content": "Request failed: ordinary model text"}}]}
+
+        async def start(session, _session_file):
+            session.private_host = True
+            session.controls.capabilities = {"version": 1, "methods": ["transcript/list"]}
+            session.proc = SimpleNamespace(returncode=None)
+            session.lease = SimpleNamespace(closed=False)
+            session.rpc = rpc
+
+        async def write(raw, *, after_queue=None):
+            self.events.append(json.loads(raw))
+            if after_queue is not None:
+                after_queue()
+
+        self.server.output = SimpleNamespace(write=write)
+        self.server.send = Server.send.__get__(self.server)
+        with patch.object(Session, "start", start), patch.object(Session, "commands"):
+            await self.server.handle({"jsonrpc": "2.0", "id": 10, "method": "session/load",
+                                      "params": {"cwd": self.session.cwd, "sessionId": self.session.id}})
+
+        reply_index = next(index for index, frame in enumerate(self.events) if frame.get("id") == 10)
+        marker = self.events[reply_index]["result"]["_meta"][meta]
+        updates = [frame["params"]["update"] for frame in self.events[:reply_index]
+                   if frame.get("method") == "session/update"]
+        native, legacy_failure, current_failure = updates
+        self.assertEqual((marker["totalMessages"], marker["totalFrames"]), (1, len(updates)))
+        self.assertEqual(native["content"]["text"], "Request failed: ordinary model text")
+        self.assertEqual(native["_meta"][meta], {"source": "replay", "nativeSessionId": "native",
+                         "entryId": "first", "parentEntryId": None, "sequence": 1, "role": "assistant", "part": 0})
+        self.assertEqual(legacy_failure, {**tagged_legacy, "content": current["content"]})
+        self.assertEqual(current_failure, current)
+
+    async def test_native_abort_has_no_provider_cause(self):
+        self.native(failure={"role": "assistant", "stop_reason": "aborted", "error_message": "Connection error."})
+        with self.assertRaises(ProtocolError) as caught:
+            await self.session.prompt([{"type": "text", "text": "Respond"}])
+        self.assertEqual(caught.exception.code, TURN_FAILED_AFTER_DISPATCH)
+        self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False})
+
+    async def test_native_crash_after_acknowledgment_has_no_provider_cause(self):
+        reader = asyncio.StreamReader()
+        written = self.native(crash_reader=reader)
+        self.session._close_task = asyncio.get_running_loop().create_future()
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(self.session.read_rpc())
+            with self.assertRaises(ProtocolError) as caught:
+                await asyncio.wait_for(self.session.prompt([{"type": "text", "text": "Respond"}]), 2)
+        self.assertEqual(written[:2], ["prompt", "get_state"])
+        self.assertEqual(caught.exception.code, TURN_FAILED_AFTER_DISPATCH)
+        self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False})
+
+    async def test_turn_timeout_after_acknowledgment_has_no_provider_cause(self):
+        self.args.turn_timeout = 1
+        written = self.native(streaming=True)
+        loop = asyncio.get_running_loop()
+        timeout = asyncio.timeout
+        turn_deadline = timeout(None)
+        native_write = self.session.proc.stdin.write
+
+        def controlled_timeout(delay):
+            return turn_deadline if delay == self.args.turn_timeout else timeout(delay)
+
+        def write(raw):
+            if json.loads(raw)["type"] != "get_state":
+                native_write(raw)
+            elif "get_state" not in written:
+                # Deliver the busy reply and expire the turn in one event-loop step.
+                native_write(raw)
+                turn_deadline.reschedule(loop.time())
+            # Leave any later poll unanswered so the test watchdog can cancel it.
+
+        self.session.proc.stdin.write = write
+        with patch.object(asyncio, "timeout", side_effect=controlled_timeout):
+            with self.assertRaises(ProtocolError) as caught:
+                await asyncio.wait_for(self.session.prompt([{"type": "text", "text": "Respond"}]), timeout=5)
+
+        self.assertEqual([command for command in written if command in ("prompt", "abort")], ["prompt", "abort"])
+        self.assertEqual((caught.exception.code, str(caught.exception)), (TURN_FAILED_AFTER_DISPATCH, "Aelix turn timed out"))
+        self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False})
+
+    async def test_native_assistant_error_classifies_without_copying_provider_details(self):
+        self.session.socket_dir = self.tmp.name
+        for private, stop_key, error_key in ((False, "stop_reason", "error_message"),
+                                              (True, "stopReason", "errorMessage")):
+            with self.subTest(private=private):
+                detail = 'Error code: 401 - {"type":"authentication_error","key":"fixture-secret"}'
+                self.session.private_host = private
+                failure = {"role": "assistant", stop_key: "error", error_key: detail}
+                if private:
+                    failure["error"] = {"status": 429, "type": "authentication_error", "retryable": True,
+                                        "url": "https://example.invalid/fixture-secret"}
+                self.native(failure=failure)
+                with self.assertRaises(ProtocolError) as caught:
+                    await self.session.prompt([{"type": "text", "text": "Respond"}])
+                self.assertEqual(caught.exception.code, TURN_FAILED_AFTER_DISPATCH)
+                self.assertEqual(str(caught.exception), "Native model request failed" if private else detail)
+                self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False,
+                    "cause": {"kind": "provider_rate_limit" if private else "unknown", "retryable": False}})
+
     async def test_bookkeeping_failure_keeps_the_not_retryable_marking(self):
-        self.native(failure="provider rejected the request")
+        self.native(failure={"role": "assistant", "stop_reason": "error", "error_message": "provider rejected the request"})
         insert_batch = self.session.live_history.insert_batch
 
         def broken_history(db, rows):
@@ -668,7 +807,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.session.done = asyncio.get_running_loop().create_future()
         await self.session.read_rpc()
         self.assertTrue(self.session.done.done())
-        self.assertIn("closed", self.session.failure)
+        self.assertIn("closed", self.session.failure.message)
 
     async def test_saved_analytics_session_cannot_load_as_coding(self):
         self.server.db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?)",
@@ -682,7 +821,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stream_errors_are_preserved(self):
         await self.session.event({"type": "message_end", "message": {"error_message": "provider unavailable"}})
-        self.assertEqual(self.session.failure, "provider unavailable")
+        self.assertEqual(self.session.failure.message, "provider unavailable")
 
     async def test_unknown_permission_mode_is_rejected_without_backend_mutation(self):
         self.server.sessions[self.session.id] = self.session

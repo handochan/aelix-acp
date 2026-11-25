@@ -17,6 +17,9 @@ from ..wire.errors import ProtocolError
 from .transcript import META as TRANSCRIPT_META
 
 WRITE_TIMEOUT = 10
+PROMPT_FAILURE_PREFIX = "Request failed: "
+PROMPT_FAILURE_TEXT = "Request failed."
+ASSISTANT_ORIGIN_META = "aelix/assistantOrigin"  # SQLite only
 
 
 def open_store(directory: str) -> sqlite3.Connection:
@@ -311,7 +314,11 @@ def history_records(db: sqlite3.Connection, session_id: str):
     if db.execute("SELECT 1 FROM recovered_history WHERE session_id=? AND position=-1", (session_id,)).fetchone():
         for position, value in db.execute("SELECT position,value FROM recovered_history WHERE session_id=? "
                                           "AND position>=0 ORDER BY position", (session_id,)):
-            yield "recovered", position + 1, json.loads(value)
+            update = json.loads(value)
+            if update.get("sessionUpdate") == "agent_message_chunk":
+                # Cache membership establishes native origin for pre-upgrade rows.
+                update.setdefault("_meta", {}).setdefault(ASSISTANT_ORIGIN_META, "model")
+            yield "recovered", position + 1, update
     for sequence, value in db.execute("SELECT sequence,value FROM events WHERE session_id=? AND sequence<=? "
                                       "ORDER BY sequence", (session_id, last)):
         yield "events", sequence, json.loads(value)
@@ -320,6 +327,38 @@ def history_records(db: sqlite3.Connection, session_id: str):
 def history(db: sqlite3.Connection, session_id: str):
     for _, _, update in history_records(db, session_id):
         yield update
+
+
+def with_assistant_origin(update: dict, origin: str) -> dict:
+    if update.get("sessionUpdate") != "agent_message_chunk":
+        return update
+    return {**update, "_meta": {**update.get("_meta", {}), ASSISTANT_ORIGIN_META: origin}}
+
+
+def _ambiguous_legacy_failure(update: dict, meta: object) -> bool:
+    coordinates = meta.get(TRANSCRIPT_META) if isinstance(meta, dict) else None
+    if isinstance(coordinates, dict) and coordinates.get("source") not in (None, "adapter"):
+        return False
+    content = update.get("content")
+    if not isinstance(content, dict) or content.get("type") != "text":
+        return False
+    text = content.get("text")
+    return isinstance(text, str) and text.startswith(PROMPT_FAILURE_PREFIX)
+
+
+def display_recorded_update(update: dict, *, protected: bool) -> dict:
+    """Project stored display events and consume the private origin marker."""
+    if update.get("sessionUpdate") != "agent_message_chunk":
+        return update
+    meta = update.get("_meta")
+    origin = None
+    if isinstance(meta, dict) and ASSISTANT_ORIGIN_META in meta:
+        origin = meta.pop(ASSISTANT_ORIGIN_META)
+        if not meta:
+            del update["_meta"]
+    if protected and (origin == "prompt_failure" or (origin is None and _ambiguous_legacy_failure(update, meta))):
+        return {**update, "content": {"type": "text", "text": PROMPT_FAILURE_TEXT}}
+    return update
 
 
 def recorded_turn(db: sqlite3.Connection, session_id: str, request_key: str, fingerprint: str | None = None) -> dict | None:
