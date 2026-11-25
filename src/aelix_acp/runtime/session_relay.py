@@ -529,29 +529,25 @@ class SessionRelay:
     async def apply_resource(self, method, value, operation):
         session = self.session
         resources = session.studio_resources
-        if (session.mutation_lock.locked() or session.changing or session.turn_active or session.stop_pending()
-                or session.rpc_closed
-                or session.proc is None or session.proc.returncode is not None
-                or session.compaction_recovery_needed):
+        if resources.waiting_operation is not None or self.resource_write_busy():
             return refusal("busy")
-        try:
-            lease = acquire_lease(session.server.args.state_dir, session.id, purpose="activity")
-        except ProtocolError as error:
-            if error.code == -32000:
+        async with resources.selection_write(operation):
+            # Slash writes can own mutation_lock while requesting selection_lock.
+            # Admission here must stay nonblocking to avoid reversing that order.
+            if self.resource_write_busy():
                 return refusal("busy")
-            raise
-        with lease:
-            async with session.mutation_lock:
-                if resources.uncertain:
+            try:
+                lease = acquire_lease(session.server.args.state_dir, session.id, purpose="activity")
+            except ProtocolError as error:
+                if error.code == -32000:
                     return refusal("busy")
-                session.reset_cancellation()
-                operation.generation = session.cancel_generation
-                resources.waiting_operation = operation
-                try:
-                    await resources.selection_lock.acquire()
-                finally:
-                    resources.waiting_operation = None
-                try:
+                raise
+            with lease:
+                async with session.mutation_lock:
+                    if resources.uncertain:
+                        return refusal("busy")
+                    session.reset_cancellation()
+                    operation.generation = session.cancel_generation
                     operation.require_current()
                     if method == "profiles/use":
                         expected = {"accepted": True, "activeAgent": value["name"] if value else None,
@@ -567,8 +563,12 @@ class SessionRelay:
                     if method == studio_selections.SET:
                         return await resources.set_selections(value, fits_resource_reply, operation)
                     return await resources.set_tools(value, fits_resource_reply, operation)
-                finally:
-                    resources.selection_lock.release()
+
+    def resource_write_busy(self):
+        session = self.session
+        return (session.mutation_lock.locked() or session.changing or session.turn_active or session.stop_pending()
+                or session.rpc_closed or session.proc is None or session.proc.returncode is not None
+                or session.compaction_recovery_needed)
 
     async def _write_images(self, command, turn, message, refs, receipt, issued, fence):
         session = self.session

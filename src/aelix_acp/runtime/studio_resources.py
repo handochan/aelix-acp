@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 import os
 from pathlib import Path
 import re
@@ -50,6 +51,7 @@ class StudioResources:
         self.tool_operation = None
         self.selection_operation = None
         self.waiting_operation = None
+        self.legacy_operation = None
         self.restore_operation = None
 
     def binding(self):
@@ -97,7 +99,7 @@ class StudioResources:
             field: identifiers.names("tool", profile[field]) for field in ("tools", "exclude_tools") if field in profile
         }}}
 
-    async def legacy_tools(self, arguments, *, timeout):
+    async def legacy_tools(self, arguments, *, timeout, before_write=None):
         names = arguments.get("names")
         if not isinstance(names, list) or not all(map(public_name, names)):
             raise ProtocolError("Expected tool identifiers")
@@ -109,8 +111,9 @@ class StudioResources:
                 raise ProtocolError("Tool identifier is unavailable")
             names = [available[name] for name in names]
         try:
+            fence = {"_before_native_write": before_write} if before_write is not None else {}
             return await self.session.rpc("aelix_control", method="tools/set_active",
-                                          params={**arguments, "names": names}, _timeout=timeout)
+                                          params={**arguments, "names": names}, _timeout=timeout, **fence)
         except BackendError as error:
             key = getattr(error, "studio_tool_lock", None) or tool_lock_key(str(error))
             data = {"kind": "tool_locked", "key": identifiers.key("tool", key)} if key in names else error.data
@@ -118,9 +121,26 @@ class StudioResources:
 
     def retire_approval(self):
         operation = (self.profile_operation or self.tool_operation or self.selection_operation
-                     or self.waiting_operation or self.restore_operation)
+                     or self.waiting_operation or self.legacy_operation or self.restore_operation)
         if operation is not None:
             operation.retire()
+
+    @asynccontextmanager
+    async def selection_write(self, operation):
+        # Wait before reserving session admission. Stop, close and replacement
+        # can still retire this operation while the outstanding read owns the lock.
+        self.waiting_operation = operation
+        try:
+            await self.selection_lock.acquire()
+        finally:
+            self.waiting_operation = None
+        try:
+            # A historical Stop does not prevent a new idle write. A Stop
+            # admitted during this wait retires the operation explicitly.
+            operation.require_current(allow_cancelled=True)
+            yield
+        finally:
+            self.selection_lock.release()
 
     def retire_replaced_approval(self, replacement):
         binding = self.binding()

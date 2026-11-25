@@ -626,12 +626,16 @@ class Session:
                 self.studio_resources.mark_uncertain()
             raise
 
-    async def reload_resources(self, arguments, *, timeout, refresh_first=False):
+    async def reload_resources(self, arguments, *, timeout, refresh_first=False, before_write=None):
+        fence = {"_before_native_write": before_write} if before_write is not None else {}
         try:
-            result = await self.rpc("aelix_control", method="resources/reload", params=arguments, _timeout=timeout)
+            result = await self.rpc("aelix_control", method="resources/reload", params=arguments, _timeout=timeout,
+                                    **fence)
             if refresh_first:
                 await self.controls.refresh()
             await self.restore_tools()
+        except profile_reselection.Stopped:
+            raise  # The pre-dispatch fence refused the reload before native changed.
         except BaseException:
             if self.active_tools is not None and not self.studio_resources.uncertain:
                 self.studio_resources.mark_uncertain()
@@ -639,7 +643,7 @@ class Session:
         self.studio_resources.invalidate_pages()
         return result
 
-    async def configure_mcp(self, servers):
+    async def configure_mcp(self, servers, *, before_write=None):
         before = await self.rpc("aelix_control", method="resources/list", params={})
         active = before.get("activeTools", [])
         available = {tool["name"] for tool in before.get("tools", [])}
@@ -647,7 +651,8 @@ class Session:
         desired = self.active_tools if self.active_tools is not None else active
         # Profile selection also installs native filters. Clear the actual
         # live filter for every idle reconfiguration, not just GUI selections.
-        await self.rpc("aelix_control", method="tools/set_active", params={"names": []})
+        fence = {"_before_native_write": before_write} if before_write is not None else {}
+        await self.rpc("aelix_control", method="tools/set_active", params={"names": []}, **fence)
         try:
             result = await self.rpc("aelix_control", method="mcp/configure", params={"servers": servers}, _timeout=60)
         except ProtocolError:
@@ -2009,6 +2014,9 @@ class Session:
             # Keep waiting for the actual manual compaction outcome.
             return False
         self.cancelled = True
+        for operation in (self.studio_resources.waiting_operation, self.studio_resources.legacy_operation):
+            if operation is not None:
+                operation.retire()
         self.invalidate_image_acceptance()
         self.image_epoch = None
         self.tool_arrived.set()

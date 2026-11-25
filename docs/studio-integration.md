@@ -395,6 +395,12 @@ tool, profile, reload, and selection writes so the override and native state
 are read after those writes finish. A read waits at most five seconds to
 acquire that lock, then returns the existing `unreadable` outcome if it
 cannot get a snapshot. `cursor-stale` applies to invalid continuations.
+Relay and legacy management writers wait for the selection lock before
+reserving session activity. Stop and Close retire an outstanding waiter.
+After acquiring the lock, a writer rechecks its lifetime and tries session
+admission without waiting for a prompt or slash command.
+Legacy management applies the Stop and Close fence again before its first
+native mutation, including after any inventory preflight.
 The shared pager sorts selection keys by UTF-8 bytes and binds
 each snapshot to its session binding, method, and kind. Repeat `kind` on
 continuations. A cursor expires 60 seconds after the snapshot is taken.

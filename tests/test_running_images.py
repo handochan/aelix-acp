@@ -22,6 +22,7 @@ import test_session_relay as text_relay
 
 from aelix_acp import image_policy
 from aelix_acp.runtime import host_bytes, native_frames, session_relay
+from aelix_acp.runtime.studio_resources import StudioResources
 from aelix_acp.session import Session
 from aelix_acp.wire.errors import ProtocolError
 from aelix_acp.wire.transport import StdoutWriter
@@ -705,6 +706,8 @@ class ImageRelayTests(unittest.IsolatedAsyncioTestCase):
                     self.session.controls = SimpleNamespace(capabilities={})
                     self.session.abort = AsyncMock()
                     self.session.cancel_generation = 0
+                    self.session.direct_cancels = 0
+                    self.session.studio_resources = StudioResources(self.session)
                     self.session.begin_cancel = Session.begin_cancel.__get__(self.session)
                     self.session.cancel_native = Session.cancel_native.__get__(self.session)
                     await Session.cancel(self.session)

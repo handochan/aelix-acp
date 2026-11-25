@@ -346,14 +346,110 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
             return await self.call("tools-set-empty")
 
         self.session.save = AsyncMock()
-        async with self.session.studio_resources.selection_lock:
-            write = asyncio.create_task(write_tools())
-            await asyncio.wait_for(started.wait(), 5)
-            self.assertTrue(self.session.mutation_lock.locked())
-            with self.assertRaises(ProtocolError):
-                await self.server.dispatch("session/close", {"sessionId": self.session.id})
+        self.server.close_session = AsyncMock(return_value={})
+        try:
+            async with self.session.studio_resources.selection_lock:
+                write = asyncio.create_task(write_tools())
+                await asyncio.wait_for(started.wait(), 5)
+                self.assertEqual(await self.server.dispatch("session/close", {"sessionId": self.session.id}), {})
+        finally:
+            result, = await asyncio.gather(write, return_exceptions=True)
+        self.assertIsInstance(result, ProtocolError)
+        self.assertFalse(self.calls)
+
+    async def test_stop_leaves_prompt_admission_free_while_relay_write_waits_for_read(self):
+        started = asyncio.Event()
+
+        async def write_tools():
+            started.set()
+            return await self.call("tools-set-empty")
+
+        self.session.cancel_native = AsyncMock()
+        self.session.prompt = AsyncMock(return_value={"stopReason": "end_turn"})
+        params = {"sessionId": self.session.id}
+        try:
+            async with self.session.studio_resources.selection_lock:
+                write = asyncio.create_task(write_tools())
+                await asyncio.wait_for(started.wait(), 5)
+                await self.server.dispatch("session/cancel", params)
+                result = await self.server.dispatch("session/prompt", {
+                    **params, "prompt": [{"type": "text", "text": "next"}],
+                })
+                self.assertEqual(result, {"stopReason": "end_turn"})
+        finally:
+            write_result, = await asyncio.gather(write, return_exceptions=True)
+        self.assertIsInstance(write_result, ProtocolError)
+        self.assertFalse(self.calls)
+
+    async def test_close_retires_queued_legacy_tool_change_before_dispatch(self):
+        started = asyncio.Event()
+        params = {"sessionId": self.session.id}
+
+        async def write_tools():
+            started.set()
+            return await self.server.dispatch("_aelix/manage", {
+                **params, "action": "tools/set_active", "arguments": {"names": []},
+            })
+
+        self.session.save = AsyncMock()
+        self.server.close_session = AsyncMock(return_value={})
+        try:
+            async with self.session.studio_resources.selection_lock:
+                write = asyncio.create_task(write_tools())
+                await asyncio.wait_for(started.wait(), 5)
+                self.assertEqual(await self.server.dispatch("session/close", params), {})
+        finally:
+            write_result, = await asyncio.gather(write, return_exceptions=True)
+        self.assertIsInstance(write_result, ProtocolError)
+        self.assertFalse(self.calls)
+
+    async def test_stop_fences_legacy_tool_change_during_inventory_preflight(self):
+        raw = str(self.root / "tool")
+        key = self.relay.identifiers.key("tool", raw)
+        held = []
+        params = {"sessionId": self.session.id}
+
+        def pause(request):
+            held.append(request)
+            self.requested.set()
+
+        self.controls["resources/list"] = pause
+        self.session.cancel_native = AsyncMock()
+        self.session.save = AsyncMock()
+        write = asyncio.create_task(self.server.dispatch("_aelix/manage", {
+            **params, "action": "tools/set_active", "arguments": {"names": [key]},
+        }))
+        await asyncio.wait_for(self.requested.wait(), 5)
+        await self.server.dispatch("session/cancel", params)
+        self.reply(held[0], {"tools": [{"name": raw}]})
         with self.assertRaises(ProtocolError):
             await write
+        self.assertEqual([call["method"] for call in self.calls], ["resources/list"])
+
+    async def test_queued_write_yields_to_admitted_slash_mutation(self):
+        write_waiting = asyncio.Event()
+        slash_started = asyncio.Event()
+        lock = self.session.studio_resources.selection_lock
+
+        async def write_tools():
+            write_waiting.set()
+            return await self.call("tools-set-empty")
+
+        async def slash(*_):
+            slash_started.set()
+            async with lock:
+                return {"stopReason": "end_turn"}
+
+        self.session.prompt = slash
+        async with lock:
+            write = asyncio.create_task(write_tools())
+            await asyncio.wait_for(write_waiting.wait(), 5)
+            prompt = asyncio.create_task(self.server.dispatch("session/prompt", {
+                "sessionId": self.session.id, "prompt": [{"type": "text", "text": "/tools read"}],
+            }))
+            await asyncio.wait_for(slash_started.wait(), 5)
+        self.assertEqual(await asyncio.wait_for(write, 5), CASES["relay-error-busy"]["result"])
+        self.assertEqual(await asyncio.wait_for(prompt, 5), {"stopReason": "end_turn"})
         self.assertFalse(self.calls)
 
     @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)

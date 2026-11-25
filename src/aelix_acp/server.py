@@ -36,7 +36,7 @@ from .wire.transport import decode_frame, encode_frame, ErrorReplies, InvalidFra
 from .runtime.extensions import run_extension_action, require_consent
 from .runtime.leases import acquire as acquire_lease
 from .runtime.leases import lease_path
-from .runtime import forks, host_bytes, native_history, session_relay, transcript
+from .runtime import forks, host_bytes, native_history, profile_reselection, session_relay, transcript
 from .runtime.children import NESTED_TOOL_CALLS, nested_only
 
 from .session import CONCURRENT_CONTROLS, LONG_CONTROLS, Session, text_content, tool_call
@@ -545,14 +545,28 @@ class Server:
             registered = session_id in self.sessions or self.db.execute(
                 "SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
             if registered:
-                with acquire_lease(self.args.state_dir, session_id, purpose="activity"):
-                    readback = method == "_aelix/manage" and params.get("action") in (
-                        "resources/list", "agents/list", "agents/show", "mcp/status", "permissions/get",
-                    )
-                    if (live is not None and live.studio_resources.uncertain and not readback
-                            and method not in {"session/load", "session/close", "session/delete"}):
-                        raise ProtocolError("Reopen the session to recover its profile and tool state.", -32004)
-                    return await self.dispatch_request(method, params)
+                action = params.get("action")
+                selection_write = (live is not None and method == "_aelix/manage"
+                                   and isinstance(action, str) and action in SELECTION_MUTATIONS)
+                selection_admission = contextlib.nullcontext()
+                if selection_write:
+                    resources = live.studio_resources
+                    if live.mutation_lock.locked() or resources.waiting_operation is not None or live.stop_pending():
+                        raise ProtocolError("Session is busy", -32000)
+                    selection_admission = resources.selection_write(profile_reselection.Operation(resources))
+                async with selection_admission:
+                    # A prompt can be admitted while this writer waits. Never
+                    # wait for its mutation lock with the selection lock held.
+                    if selection_write and (live.mutation_lock.locked() or live.changing or live.stop_pending()):
+                        raise ProtocolError("Session is busy", -32000)
+                    with acquire_lease(self.args.state_dir, session_id, purpose="activity"):
+                        readback = method == "_aelix/manage" and action in (
+                            "resources/list", "agents/list", "agents/show", "mcp/status", "permissions/get",
+                        )
+                        if (live is not None and live.studio_resources.uncertain and not readback
+                                and method not in {"session/load", "session/close", "session/delete"}):
+                            raise ProtocolError("Reopen the session to recover its profile and tool state.", -32004)
+                        return await self.dispatch_request(method, params)
             if method == "session/fork":
                 raise ProtocolError("Saved session does not match this workspace and profile")
         return await self.dispatch_request(method, params)
@@ -793,12 +807,8 @@ class Server:
                 return await self.close_session(session)
             if session.mutation_lock.locked():
                 raise ProtocolError("Session is busy", -32000)
-            selection_lock = (session.studio_resources.selection_lock if action in SELECTION_MUTATIONS
-                              else contextlib.nullcontext())
             already_cancelled = session.cancelled
-            async with session.mutation_lock, selection_lock:
-                if action in SELECTION_MUTATIONS and session.cancelled and not already_cancelled:
-                    raise ProtocolError("Resource change cancelled.", -32004)
+            async with session.mutation_lock:
                 if not session.studio_resources.uncertain:
                     await session.recover_after_compaction()
                 if action == "sessions/branch":
@@ -832,12 +842,8 @@ class Server:
                     raise ProtocolError("Unsupported management action")
                 if action == "children/notices":
                     return await session.notice_turn()
-                if action == "mcp/configure":
-                    result = await session.configure_mcp(arguments.get("servers"))
-                elif action == "resources/reload":
-                    result = await session.reload_resources(arguments, timeout=60)
-                elif action == "tools/set_active":
-                    result = await session.studio_resources.legacy_tools(arguments, timeout=60)
+                if action in SELECTION_MUTATIONS:
+                    result = await self.legacy_selection_write(session, action, arguments, already_cancelled)
                 else:
                     result = await session.rpc("aelix_control", method=action, params=arguments,
                         _timeout=(getattr(self.args, "command_timeout", 600) or None) if action in LONG_CONTROLS else 60)
@@ -863,6 +869,28 @@ class Server:
         if method == "authenticate":
             raise ProtocolError("Configure provider authentication using the existing Aelix CLI first")
         raise ProtocolError(f"Method not supported: {method}", -32601)
+
+    async def legacy_selection_write(self, session, action, arguments, already_cancelled):
+        resources = session.studio_resources
+        operation = profile_reselection.Operation(resources)
+
+        def before_write():
+            operation.require_current(allow_cancelled=already_cancelled)
+            if session.stop_pending():
+                raise profile_reselection.Stopped()
+
+        resources.legacy_operation = operation
+        try:
+            if action == "mcp/configure":
+                return await session.configure_mcp(arguments.get("servers"), before_write=before_write)
+            if action == "resources/reload":
+                return await session.reload_resources(arguments, timeout=60, before_write=before_write)
+            if action == "tools/set_active":
+                return await resources.legacy_tools(arguments, timeout=60, before_write=before_write)
+            return await session.rpc("aelix_control", method=action, params=arguments, _timeout=60,
+                                     _before_native_write=before_write)
+        finally:
+            resources.legacy_operation = None
 
     async def handle(self, message):
         request_id = message.get("id")
