@@ -329,6 +329,21 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["activeTools"], ["read"])
         self.assertIsNone(result["toolOverride"])
 
+    async def test_contended_selection_reads_return_the_d16_refresh_outcome(self):
+        stale = CASES["relay-error-stale-cursor"]["result"]
+        async with self.session.mutation_lock:
+            self.assertEqual(await self.call("selections-list-tool-first"), stale)
+        self.assertFalse(self.calls)
+
+        self.controls["selections/set"] = lambda _: self.requested.set()
+        write = asyncio.create_task(self.call("selections-set-mcp"))
+        await asyncio.wait_for(self.requested.wait(), 5)
+        try:
+            self.assertEqual(await self.call("selections-list-mcp"), stale)
+        finally:
+            self.finish_set(self.selection_frame)
+            await write
+
     @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)
     async def test_confirm_approve_refuse_cancel_and_timeout(self, _):
         self.confirm = True

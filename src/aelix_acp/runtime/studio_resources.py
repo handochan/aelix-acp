@@ -93,12 +93,14 @@ class StudioResources:
         if not self.supports_selection(kind, selections.LIST):
             return refusal("unsupported")
         if self.selection_operation is not None:
-            return refusal("busy")
+            return refusal("cursor-stale")
         if kind == "tool":
             # The pin reports native rows and loaded/active tools in two RPCs.
             # Keep tool/profile writes and override publication outside both reads.
             if self.session.mutation_lock.locked():
-                return refusal("busy")
+                # D16 reads can refresh. A lock owner may be an entire prompt,
+                # so the list returns without joining that wait.
+                return refusal("cursor-stale")
             async with self.session.mutation_lock:
                 return await self._selections_catalog(kind)
         return await self._selections_catalog(kind)
