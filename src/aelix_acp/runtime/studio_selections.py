@@ -240,7 +240,7 @@ def check_snapshot(kind, data, identifiers):
     return rows
 
 
-def public_row(kind, key, row, tools):
+def public_row(kind, key, row):
     result = {field: row[field] for field in ("role", "saved", "decidedBy",
                                               "applied", "inForce", "live", "pending")}
     label = row["label"]
@@ -257,8 +257,15 @@ def public_row(kind, key, row, tools):
             raise ValueError("Invalid selection lock")
         result["lock"] = {"kind": lock["kind"] if safe_label(lock["kind"]) else "unknown", "value": lock["value"],
                           "reason": LOCK_REASONS.get(lock["kind"], "locked")}
-    result["loaded"] = (result["role"] == "item" and row["key"] in tools
-                        if kind == "tool" else result["applied"])
+    if kind == "tool":
+        # ToolKind enumerates the registered tools and the excluded ones.
+        # The latter carry the pin's "excluded" lock tag. Placeholders never load.
+        loaded = result["role"] == "item" and not (lock and lock.get("tag") == "excluded")
+        if type(result["live"]) is not bool or (result["live"] and not loaded):
+            raise ValueError("Invalid native tool snapshot")
+        result["loaded"] = loaded
+    else:
+        result["loaded"] = result["applied"]
     result["problem"] = "native-problem" if row["problem"] is not None else None
     return result
 

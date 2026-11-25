@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import shlex
+from contextlib import nullcontext
 
 from ..wire.errors import BackendError, ProtocolError
 from .resource_identifiers import public_text_fields
+from .studio_resources import SELECTION_MUTATIONS
 
 BUILTINS = {
     "help": "List commands and runtime support",
@@ -94,6 +96,8 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         await session.update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": rendered}})
 
     async def control(method, params=None):
+        if session.cancelled and method in SELECTION_MUTATIONS:
+            raise ProtocolError("Resource change cancelled.", -32004)
         if method not in session.controls.capabilities.get("methods", []):
             raise ProtocolError(f"/{name} needs Aelix runtime control v1 ({method}); update the Aelix runtime", -32004)
         timeout = getattr(session.server.args, "command_timeout", 600) or None
@@ -160,13 +164,16 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
                 raise ProtocolError("Unknown ACP session for this workspace and profile")
             await output(await session.server.client_action(session, "open_session", {"sessionId": args}))
     elif name == "reload":
-        await output(await control("resources/reload"))
+        async with session.studio_resources.selection_lock:
+            result = await control("resources/reload")
+        await output(result)
         await session.commands()
     elif name in {"tools", "skills", "hooks", "mcp"}:
         if name == "tools" and args:
-            result = await control("tools/set_active", {"names": shlex.split(args)})
-            session.active_tools = result["activeTools"]
-            session.studio_resources.invalidate_pages()
+            async with session.studio_resources.selection_lock:
+                result = await control("tools/set_active", {"names": shlex.split(args)})
+                session.active_tools = result["activeTools"]
+                session.studio_resources.invalidate_pages()
             await output(session.studio_resources.public_inventory(result))
         else:
             resources = await control("resources/list")
@@ -180,7 +187,9 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
             key, separator, value = args.partition(" ")
             if not separator:
                 raise ProtocolError("Use /settings KEY JSON_VALUE, or /settings to list supported settings")
-            await output(await control("settings/set", {"key": key, "value": json_argument(value)}))
+            async with session.studio_resources.selection_lock:
+                result = await control("settings/set", {"key": key, "value": json_argument(value)})
+            await output(result)
     elif name == "scoped-models":
         if args:
             await output(await control("settings/set", {"key": "enabled_models", "value": shlex.split(args)}))
@@ -195,13 +204,15 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         if operation == "list":
             await output(await control("agents/list"))
         elif operation in {"show", "use"}:
-            result = await control("agents/" + operation, {"name": remainder.strip()})
-            await output(session.studio_resources.public_native_profile(result) if operation == "show" else result)
-            if operation == "use":
-                await session.controls.refresh()
-                await session.sync_profile_tools()
-                await session.save()
-                await session.commands()
+            lock = session.studio_resources.selection_lock if operation == "use" else nullcontext()
+            async with lock:
+                result = await control("agents/" + operation, {"name": remainder.strip()})
+                await output(session.studio_resources.public_native_profile(result) if operation == "show" else result)
+                if operation == "use":
+                    await session.controls.refresh()
+                    await session.sync_profile_tools()
+                    await session.save()
+                    await session.commands()
         elif operation == "run":
             profile, _, task = remainder.partition(" ")
             await output(await control("agents/run", {"name": profile, "task": task}))

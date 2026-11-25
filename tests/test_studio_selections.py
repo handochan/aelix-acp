@@ -291,59 +291,69 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         too_large = CASES["relay-error-large-item"]["result"]
         self.assertEqual(await self.call(case), too_large)
         self.snapshots["tool"]["items"] = []
-        self.active = [f"{index}-" + "한" * 7500 for index in range(12)]
+        self.session.active_tools = [f"{index}-" + "한" * 7500 for index in range(12)]
         self.assertEqual(await self.call("selections-list-tool-first"), too_large)
 
     async def test_tool_page_cannot_mix_rows_with_a_concurrent_tool_override(self):
-        catalog_read = asyncio.Event()
-        held_reads, held_writes = [], []
-        inventory = self.controls["resources/list"]
-
-        def read_inventory(request):
-            if not held_reads:
-                held_reads.append(request)
-                catalog_read.set()
-                return None
-            return inventory(request)
+        held_writes = []
+        listing_started = asyncio.Event()
 
         def change_tools(request):
             held_writes.append(request)
             self.active = request["params"]["names"]
+            for row in self.snapshots["tool"]["items"]:
+                row["live"] = row["key"] in self.active
             self.requested.set()
 
-        self.controls.update({"resources/list": read_inventory, "tools/set_active": change_tools})
+        async def list_during_write():
+            listing_started.set()
+            return await self.call("selections-list-tool-first")
+
+        self.controls["tools/set_active"] = change_tools
         self.session.save = AsyncMock()
-        listing = asyncio.create_task(self.call("selections-list-tool-first"))
-        await asyncio.wait_for(catalog_read.wait(), 5)
+        first = await self.call("selections-list-tool-first")
+        cursor = first["nextCursor"]
         write = asyncio.create_task(self.call("tools-set-empty"))
-        entered = asyncio.create_task(self.requested.wait())
-        done, _ = await asyncio.wait((write, entered), timeout=5, return_when=asyncio.FIRST_COMPLETED)
-        self.assertTrue(done)
-        self.reply(held_reads[0], inventory(held_reads[0]))
-        result = await listing
-        if held_writes:
-            self.reply(held_writes[0], {"activeTools": []})
-        await write
-        entered.cancel()
-        await asyncio.gather(entered, return_exceptions=True)
-        self.assertTrue(result["items"][0]["live"])
-        self.assertEqual(result["activeTools"], ["read"])
-        self.assertIsNone(result["toolOverride"])
-
-    async def test_contended_selection_reads_return_the_d16_refresh_outcome(self):
-        stale = CASES["relay-error-stale-cursor"]["result"]
-        async with self.session.mutation_lock:
-            self.assertEqual(await self.call("selections-list-tool-first"), stale)
-        self.assertFalse(self.calls)
-
-        self.controls["selections/set"] = lambda _: self.requested.set()
-        write = asyncio.create_task(self.call("selections-set-mcp"))
         await asyncio.wait_for(self.requested.wait(), 5)
+        listing = asyncio.create_task(list_during_write())
+        await asyncio.wait_for(listing_started.wait(), 5)
         try:
-            self.assertEqual(await self.call("selections-list-mcp"), stale)
+            self.assertFalse(listing.done())
         finally:
-            self.finish_set(self.selection_frame)
+            self.reply(held_writes[0], {"activeTools": []})
+            self.assertTrue((await write)["accepted"])
+        result = await listing
+        self.assertFalse(result["items"][0]["live"])
+        self.assertEqual(result["activeTools"], [])
+        self.assertEqual(result["toolOverride"], [])
+        self.assertEqual(await self.call("selections-list-tool-next", payload={"kind": "tool", "cursor": cursor}),
+                         CASES["relay-error-stale-cursor"]["result"])
+
+    async def test_first_page_wait_for_resource_mutation_is_bounded(self):
+        async with self.session.studio_resources.selection_lock:
+            with patch.object(session_relay, "SELECTION_READ_WAIT", 0):
+                self.assertEqual(await self.call("selections-list-tool-first"),
+                                 CASES["relay-error-unreadable"]["result"])
+        self.assertFalse(self.calls)
+        self.assertIn("items", await self.call("selections-list-tool-first"))
+
+    async def test_close_retires_tool_write_waiting_for_snapshot_lock(self):
+        started = asyncio.Event()
+
+        async def write_tools():
+            started.set()
+            return await self.call("tools-set-empty")
+
+        self.session.save = AsyncMock()
+        async with self.session.studio_resources.selection_lock:
+            write = asyncio.create_task(write_tools())
+            await asyncio.wait_for(started.wait(), 5)
+            self.assertTrue(self.session.mutation_lock.locked())
+            with self.assertRaises(ProtocolError):
+                await self.server.dispatch("session/close", {"sessionId": self.session.id})
+        with self.assertRaises(ProtocolError):
             await write
+        self.assertFalse(self.calls)
 
     @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)
     async def test_confirm_approve_refuse_cancel_and_timeout(self, _):

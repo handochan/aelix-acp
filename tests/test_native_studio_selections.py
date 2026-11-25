@@ -31,6 +31,23 @@ def setup(api):
     api.register_tool(AgentTool(name={name!r}, description="Path-named test tool",
                                 parameters={{"type": "object", "properties": {{}}}}, execute=execute))
 """
+PROMPT_TOOL_SWITCH = """
+import asyncio
+from aelix_agent_core.harness.hooks import InputHandled
+
+def setup(api):
+    async def intercept(event, ctx):
+        api.set_active_tools(["write"])
+        reader, writer = await asyncio.open_connection("127.0.0.1", {port})
+        try:
+            await reader.readline()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        return InputHandled()
+
+    api.on("input", intercept)
+"""
 
 
 @unittest.skipUnless(EXECUTABLE, "Set AELIX_ACP_TEST_AELIX to the pinned native executable")
@@ -47,11 +64,11 @@ class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.global_settings.write_text('{"defaultTools":["-read"]}\n', encoding="utf-8")
         self.binding = "selection-first"
 
-    async def start(self, *, verified=False, expiry=False, trusted=False, extensions=()):
+    async def start(self, *, verified=False, expiry=False, trusted=False, extensions=(), prefix=()):
         kwargs = {"entry": ("-c", VERIFIED_APPROVAL.format(seconds=2 if expiry else 45))} if verified else {}
         self.client = await AcpClient.start(
             self.root, EXECUTABLE, capabilities=initialize_offer()["clientCapabilities"],
-            prefix=("--approve",) if trusted else (), extensions=extensions, **kwargs)
+            prefix=(("--approve",) if trusted else ()) + prefix, extensions=extensions, **kwargs)
         self.addAsyncCleanup(self.client.close)
         created = await self.client.request("session/new", self.open_params(), timeout=120)
         self.session_id = created["sessionId"]
@@ -284,3 +301,38 @@ class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(row["key"].startswith("selection:"))
         self.assertNotIn(fictional, json.dumps(listing))
         self.assertEqual(row["label"], "Selection item")
+
+    async def test_tool_snapshot_completes_while_native_prompt_changes_active_tools(self):
+        connections = asyncio.Queue()
+        listener = await asyncio.start_server(lambda reader, writer: connections.put_nowait(writer), "127.0.0.1", 0)
+        self.addAsyncCleanup(listener.wait_closed)
+        self.addCleanup(listener.close)
+        # The input hook handles the prompt locally. The configured model is never called.
+        port = listener.sockets[0].getsockname()[1]
+        (self.agent / "models.json").write_text(json.dumps({"providers": {"fixture": {
+            "baseUrl": f"http://127.0.0.1:{port}/v1", "api": "openai-completions", "apiKey": "fixture",
+            "models": [{"id": "one", "name": "Fixture", "input": ["text"], "contextWindow": 32768, "maxTokens": 2048}],
+        }}}), encoding="utf-8")
+        self.global_settings.write_text('{"defaultProvider":"fixture","defaultModel":"one"}\n', encoding="utf-8")
+        extension = self.root / "tool_switch.py"
+        extension.write_text(PROMPT_TOOL_SWITCH.format(port=port), encoding="utf-8")
+        await self.start(extensions=(extension,), prefix=("--exclude-tools", "read"))
+        before = await self.listing("tool")
+        self.assertGreater(len(before["activeTools"]), 1)
+        prompt = asyncio.create_task(self.client.request("session/prompt", {
+            "sessionId": self.session_id, "prompt": [{"type": "text", "text": "Hold the turn"}],
+        }))
+        writer = await asyncio.wait_for(connections.get(), 10)
+        try:
+            snapshot = await self.listing("tool")
+            self.assertFalse(prompt.done())
+            self.assertEqual(snapshot.get("activeTools"), ["write"], snapshot)
+            self.assertEqual([item["key"] for item in snapshot["items"] if item["live"]], ["write"])
+            self.assertFalse(next(item for item in snapshot["items"] if item["key"] == "read")["loaded"])
+            self.assertIsNone(snapshot["toolOverride"])
+        finally:
+            writer.write(b"done\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            await prompt

@@ -386,11 +386,16 @@ apply, at SQLite commit admission, and before publishing the binding.
 kind and method. List rows retain the native saved value, source of the
 decision, applied and in-force values, live observation, and pending state.
 A tool list also returns the saved session `toolOverride` and the worker's
-`activeTools`. The native row and inventory reads share the session mutation
-lock. If a prompt or write holds that lock, a tool list returns
-`cursor-stale` so Studio can refresh without waiting for the prompt.
-`cursor-stale` also covers selection reads during a project write and
-conflicting native live values. The shared pager sorts selection keys by UTF-8 bytes and binds
+`activeTools`. ACP takes the active tools and loaded rows from one native
+snapshot. The pinned native snapshot marks excluded tools with the
+`excluded` lock tag and supplies the live state for every tool row. A prompt
+can change that live state through an extension hook while the snapshot
+remains consistent. Fresh selection reads share a separate lock with ACP
+tool, profile, reload, and selection writes so the override and native state
+are read after those writes finish. A read waits at most five seconds to
+acquire that lock, then returns the existing `unreadable` outcome if it
+cannot get a snapshot. `cursor-stale` applies to invalid continuations.
+The shared pager sorts selection keys by UTF-8 bytes and binds
 each snapshot to its session binding, method, and kind. Repeat `kind` on
 continuations. A cursor expires 60 seconds after the snapshot is taken.
 Replays before expiry return the same page. The reply budget includes the JSON
@@ -451,6 +456,8 @@ keys. It derives changed values from the keyed snapshots because the pin
 reports display labels that can be shared by multiple rows. A missing
 requested row returns `selection-missing`. Its `written` paths report any
 observed partial save so the client can refresh before taking another action.
+This settled partial result leaves the worker available. An unknown write
+outcome uses `-33100` and fences the worker.
 When native refuses a missing row before saving, `written` is empty even
 if an external edit had already replaced the file.
 Atomic batch validation requires a native transaction change.

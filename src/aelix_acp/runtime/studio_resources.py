@@ -20,6 +20,7 @@ MAX_CATALOG_SOURCE_BYTES = 32 * 1024 * 1024
 UNAVAILABLE = object()
 TOO_LARGE = object()
 TOOL_LOCK = re.compile(r"Cannot turn on (.+): \1 is (?:locked off for this run: |removed for this run by ).+\Z")
+SELECTION_MUTATIONS = frozenset({"agents/use", "tools/set_active", "resources/reload", "mcp/configure", "settings/set"})
 
 
 def refusal(reason, **details):
@@ -38,6 +39,7 @@ def internal_error():
 class StudioResources:
     def __init__(self, session):
         self.session = session
+        self.selection_lock = asyncio.Lock()
         self.unbound_identifiers = ResourceIdentifiers()
         self.recorded = None
         self.previews = OrderedDict()
@@ -47,6 +49,7 @@ class StudioResources:
         self.profile_operation = None
         self.tool_operation = None
         self.selection_operation = None
+        self.waiting_operation = None
         self.restore_operation = None
 
     def binding(self):
@@ -107,7 +110,8 @@ class StudioResources:
             raise ProtocolError("Native tool selection was refused.", error.code, data) from None
 
     def retire_approval(self):
-        operation = self.profile_operation or self.tool_operation or self.selection_operation or self.restore_operation
+        operation = (self.profile_operation or self.tool_operation or self.selection_operation
+                     or self.waiting_operation or self.restore_operation)
         if operation is not None:
             operation.retire()
 
@@ -115,6 +119,7 @@ class StudioResources:
         binding = self.binding()
         if binding is not None and binding != replacement:
             self.retired_binding = binding
+            self.invalidate_pages()
             self.retire_approval()
 
     def mark_uncertain(self):
@@ -147,20 +152,8 @@ class StudioResources:
     async def selections_catalog(self, kind):
         if not self.supports_selection(kind, selections.LIST):
             return refusal("unsupported")
-        if self.selection_operation is not None:
-            return refusal("cursor-stale")
-        if kind == "tool":
-            # The pin reports native rows and loaded/active tools in two RPCs.
-            # Keep tool/profile writes and override publication outside both reads.
-            if self.session.mutation_lock.locked():
-                # D16 reads can refresh. A lock owner may be an entire prompt,
-                # so the list returns without joining that wait.
-                return refusal("cursor-stale")
-            async with self.session.mutation_lock:
-                return await self._selections_catalog(kind)
-        return await self._selections_catalog(kind)
-
-    async def _selections_catalog(self, kind):
+        if self.session.changing or self.session.rpc_closed:
+            return refusal("unreadable")
         try:
             data = await self.rpc(selections.LIST, kind=kind)
             rows = self.selection_rows(kind, data)
@@ -168,23 +161,10 @@ class StudioResources:
             target = selections.project_target(self.session, kind, scopes)
             public_scopes = {scope: selections.exposed_scope(kind, scope, scopes[scope], target is not None)
                              for scope in ("global", "project")}
-            tools, active = set(), None
-            if kind == "tool":
-                resources = await self.rpc("resources/list")
-                active = resources["activeTools"]
-                if not isinstance(active, list) or not all(isinstance(name, str) for name in active):
-                    raise ValueError("Invalid active tools response")
-                tools = {tool["name"] for tool in resources["tools"]}
-                # Native can also change tools independently of ACP. Reject
-                # an observed disagreement between the two samples.
-                active_names = set(active)
-                if any(type(row["live"]) is bool and row["live"] != (row["key"] in active_names)
-                       for row in rows.values() if row["role"] == "item"):
-                    return refusal("cursor-stale")
             pending = data["policyPending"]
             if type(pending) is not bool:
                 raise ValueError("Invalid selection policy status")
-            items = [selections.public_row(kind, key, rows[key], tools)
+            items = [selections.public_row(kind, key, rows[key])
                      for key in sorted(rows, key=lambda key: key.encode("utf-8"))]
         except (BackendError, KeyError, TypeError, ValueError):
             return refusal("unreadable")
@@ -193,7 +173,7 @@ class StudioResources:
                 "policyPending": pending, "diagnostics": [
                     {"code": "native-problem", "key": None, "source": None} for _ in data["problems"]],
                 "toolOverride": identifiers.names("tool", self.session.active_tools) if kind == "tool" else None,
-                "activeTools": identifiers.names("tool", active)}
+                "activeTools": [row["key"] for row in items if row["live"]] if kind == "tool" else None}
 
     async def set_selections(self, value, fits, operation):
         kind, changes = value["kind"], value["changes"]

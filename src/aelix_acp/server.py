@@ -28,6 +28,7 @@ from .runtime.store import (open_store, load_preferences, history, legacy_permis
                             write_store)
 from .runtime.controls import MODE_IDS
 from .runtime.resource_identifiers import public_text_fields
+from .runtime.studio_resources import SELECTION_MUTATIONS
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
 from .stdio import StdinReader, offer_stderr, write_diagnostic
@@ -792,7 +793,12 @@ class Server:
                 return await self.close_session(session)
             if session.mutation_lock.locked():
                 raise ProtocolError("Session is busy", -32000)
-            async with session.mutation_lock:
+            selection_lock = (session.studio_resources.selection_lock if action in SELECTION_MUTATIONS
+                              else contextlib.nullcontext())
+            already_cancelled = session.cancelled
+            async with session.mutation_lock, selection_lock:
+                if action in SELECTION_MUTATIONS and session.cancelled and not already_cancelled:
+                    raise ProtocolError("Resource change cancelled.", -32004)
                 if not session.studio_resources.uncertain:
                     await session.recover_after_compaction()
                 if action == "sessions/branch":

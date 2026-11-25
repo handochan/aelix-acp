@@ -29,6 +29,7 @@ MAX_RECEIPTS = 256
 MAX_RELAY_FRAME = 256 * 1024
 IMAGE_REQUEST_SECONDS = 120
 LIST_CURSOR_TTL = 60
+SELECTION_READ_WAIT = 5
 MAX_LIST_SNAPSHOTS = 8
 MAX_LIST_SNAPSHOT_BYTES = 2 * 1024 * 1024
 MAX_RESOURCE_ID_BYTES = 4096
@@ -383,10 +384,11 @@ class SessionRelay:
     async def selections_list(self, payload, *, response_id):
         payload = dict(require_object(payload))
         kind = self.selection_kind(payload.pop("kind", None))
+        resources = self.session.studio_resources
         return await self.list_page(payload, (studio_selections.LIST, kind), "items",
-                                    lambda: self.session.studio_resources.selections_catalog(kind))
+                                    lambda: resources.selections_catalog(kind), lock=resources.selection_lock)
 
-    async def list_page(self, payload, selector, row_field, read_snapshot):
+    async def list_page(self, payload, selector, row_field, read_snapshot, *, lock=None):
         payload = require_object(payload)
         now = self.clock()
         for identifier, (_, deadline) in tuple(self.list_snapshots.items()):
@@ -403,10 +405,23 @@ class SessionRelay:
             limit = payload.get("limit", 40)
             if type(limit) is not int or not 1 <= limit <= 100:
                 raise ProtocolError("Invalid page limit")
-            generation = self.list_generation
-            snapshot = await read_snapshot()
+            if lock is not None:
+                try:
+                    async with asyncio.timeout(SELECTION_READ_WAIT):
+                        await lock.acquire()
+                except TimeoutError:
+                    return refusal("unreadable")
+            try:
+                generation = self.list_generation
+                if lock is not None and (self.session.input_relay is not self
+                                         or self.session.studio_resources.retired_binding == self.binding_id):
+                    return refusal("unreadable")
+                snapshot = await read_snapshot()
+            finally:
+                if lock is not None:
+                    lock.release()
             if generation != self.list_generation:
-                return refusal("cursor-stale")
+                return refusal("unreadable")
             if snapshot.get("accepted") is False:
                 return snapshot
             page = ListPage(uuid.uuid4().hex, snapshot, selector, limit, 0)
@@ -530,20 +545,29 @@ class SessionRelay:
                     return refusal("busy")
                 session.reset_cancellation()
                 operation.generation = session.cancel_generation
-                if method == "profiles/use":
-                    expected = {"accepted": True, "activeAgent": value["name"] if value else None,
-                                "activeRef": value, "toolOverride": None}
-                    if not fits_resource_reply(expected):
+                resources.waiting_operation = operation
+                try:
+                    await resources.selection_lock.acquire()
+                finally:
+                    resources.waiting_operation = None
+                try:
+                    operation.require_current()
+                    if method == "profiles/use":
+                        expected = {"accepted": True, "activeAgent": value["name"] if value else None,
+                                    "activeRef": value, "toolOverride": None}
+                        if not fits_resource_reply(expected):
+                            return refusal("profile-refused")
+                        result = await resources.select(value, operation)
+                        if fits_resource_reply(result):
+                            return result
+                        if operation.uncertain_effect:
+                            raise ProtocolError("Outcome unknown.", OUTCOME_UNKNOWN)
                         return refusal("profile-refused")
-                    result = await resources.select(value, operation)
-                    if fits_resource_reply(result):
-                        return result
-                    if operation.uncertain_effect:
-                        raise ProtocolError("Outcome unknown.", OUTCOME_UNKNOWN)
-                    return refusal("profile-refused")
-                if method == studio_selections.SET:
-                    return await resources.set_selections(value, fits_resource_reply, operation)
-                return await resources.set_tools(value, fits_resource_reply, operation)
+                    if method == studio_selections.SET:
+                        return await resources.set_selections(value, fits_resource_reply, operation)
+                    return await resources.set_tools(value, fits_resource_reply, operation)
+                finally:
+                    resources.selection_lock.release()
 
     async def _write_images(self, command, turn, message, refs, receipt, issued, fence):
         session = self.session
