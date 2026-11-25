@@ -96,6 +96,8 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         if method not in session.controls.capabilities.get("methods", []):
             raise ProtocolError(f"/{name} needs Aelix runtime control v1 ({method}); update the Aelix runtime", -32004)
         timeout = getattr(session.server.args, "command_timeout", 600) or None
+        if method == "resources/reload":
+            return await session.reload_resources(params or {}, timeout=timeout, refresh_first=True)
         return await session.rpc("aelix_control", method=method, params=params or {}, _timeout=timeout)
 
     if name == "help":
@@ -150,13 +152,12 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
             await output(await session.server.client_action(session, "open_session", {"sessionId": args}))
     elif name == "reload":
         await output(await control("resources/reload"))
-        await session.controls.refresh()
-        await session.restore_tools()
         await session.commands()
     elif name in {"tools", "skills", "hooks", "mcp"}:
         if name == "tools" and args:
             result = await control("tools/set_active", {"names": shlex.split(args)})
             session.active_tools = result["activeTools"]
+            session.studio_resources.invalidate_pages()
             await output(result)
         else:
             resources = await control("resources/list")

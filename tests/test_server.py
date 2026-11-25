@@ -8,7 +8,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import ProtocolError, Server, Session
@@ -35,14 +35,18 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.server.db.close()
         self.tmp.cleanup()
 
-    async def test_load_frame_count_is_sealed_after_earlier_output(self):
+    async def test_guarded_load_frame_count_is_sealed_after_earlier_output(self):
         for cancel in (False, True):
             with self.subTest(cancel=cancel):
                 entered, release = asyncio.Event(), asyncio.Event()
                 captured = []
+                guarded_replies = []
 
-                async def write(raw, *, after_queue=None):
+                async def write(raw, *, before_queue=None, after_queue=None):
                     frame = json.loads(raw)
+                    if before_queue is not None:
+                        before_queue()
+                        guarded_replies.append(frame["id"])
                     captured.append(frame)
                     if after_queue is not None:
                         after_queue()
@@ -51,25 +55,38 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
                 self.server.output = SimpleNamespace(write=write)
                 self.session.load_display_frames = {"version": 1, "totalFrames": 0}
+                self.server.sessions[self.session.id] = self.session
+                resources = self.session.studio_resources
+                resources.starting_binding = "fixture"
+                restore = Mock()
+                resources.restore_operation = restore
                 self.server.send = Server.send.__get__(self.server)
                 update = {"sessionUpdate": "agent_message_chunk",
                           "content": {"type": "text", "text": "Recovery"}}
                 notify = asyncio.create_task(
                     self.session.notify("session/update", {"sessionId": self.session.id, "update": update}))
                 await asyncio.wait_for(entered.wait(), 5)
-                response = {"jsonrpc": "2.0", "id": 1, "result": {"_meta": {
-                    "aelix/transcript": self.session.load_display_frames}}}
-                reply = asyncio.create_task(self.server.send(response))
-                if cancel:
-                    notify.cancel()
-                    with self.assertRaises(asyncio.CancelledError):
-                        await notify
-                else:
-                    release.set()
-                    await asyncio.wait_for(notify, 5)
-                await asyncio.wait_for(reply, 5)
+                result = {"_meta": {"aelix/transcript": self.session.load_display_frames}}
+                request = {"jsonrpc": "2.0", "id": 1, "method": "session/load",
+                           "params": {"sessionId": self.session.id}}
+                with patch.object(self.server, "dispatch", return_value=result):
+                    reply = asyncio.create_task(self.server.handle(request))
+                    if cancel:
+                        notify.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await notify
+                    else:
+                        release.set()
+                        await asyncio.wait_for(notify, 5)
+                    await asyncio.wait_for(reply, 5)
+                restore.require_restore_current.assert_called_once_with()
+                self.assertEqual(guarded_replies, [1])
+                self.assertIsNone(resources.restore_operation)
+                self.assertIsNone(resources.starting_binding)
+                self.assertIsNone(self.session.load_display_frames)
                 self.assertEqual(captured[0]["params"]["update"], update)
                 self.assertEqual(captured[1]["result"]["_meta"]["aelix/transcript"]["totalFrames"], 1)
+                self.assertEqual(captured[2]["params"]["update"]["sessionUpdate"], "current_mode_update")
 
     async def test_close_session_rejects_held_mutation_lock(self):
         async with self.session.mutation_lock:
@@ -691,6 +708,22 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([command for command in written if command in ("prompt", "abort")], ["prompt", "abort"])
         self.assertEqual((caught.exception.code, str(caught.exception)), (TURN_FAILED_AFTER_DISPATCH, "Aelix turn timed out"))
         self.assertEqual(caught.exception.data, {"kind": "turn_failed_after_dispatch", "retryable": False})
+
+    async def test_client_reply_does_not_swallow_enclosing_deadline(self):
+        loop = asyncio.get_running_loop()
+        deadline = asyncio.timeout(None)
+
+        async def send(frame):
+            reply = self.server.pending[frame["id"]]
+            loop.call_soon(reply.set_result, {"outcome": {"outcome": "selected", "optionId": "allow-once"}})
+            deadline.reschedule(loop.time())
+
+        self.server.send = send
+        with self.assertRaises(TimeoutError):
+            async with deadline:
+                await self.server.client_request("session/request_permission", {}, withdraw=True, timeout=2)
+        self.assertTrue(deadline.expired())
+        self.assertFalse(self.server.pending)
 
     async def test_native_assistant_error_classifies_without_copying_provider_details(self):
         self.session.socket_dir = self.tmp.name

@@ -331,6 +331,76 @@ gets up to 45 s to end before it is killed, so `{}` can take that long (see
 [Delegated children](#delegated-children) and the close latency measured in
 [product validation](product-validation.md)).
 
+## Studio session profiles and tools
+
+This section is part of Studio #7 Unit A.
+
+Offer `clientCapabilities._meta["aelix/sessionRelay"] = {version:1, notifications:false}`
+and use the binding echoed by `session/new` or `session/load`. The host sends
+`{sessionId,bindingId,payload}` on each advertised `_aelix/session/` method.
+The session methods in [Studio #7 D16 v1](https://github.com/handochan/aelix-studio/issues/7#issuecomment-7164048476)
+are available through the same conversation extension route as running input.
+
+| Method suffix | Payload | Result |
+|---|---|---|
+| `profiles/list` | `{}`, `{limit}`, or `{cursor}` | Winning profiles sorted by UTF-8 name, active name and saved ref, diagnostics and next cursor |
+| `profiles/show` | `{name}` | Current winner's ref, relative source, prompt preview, and model, tool, skill and policy fields |
+| `profiles/use` | `{profile,requestId}` | On success, active name and ref with `toolOverride:null`. A null profile clears the selection. |
+| `tools/set-active` | `{names,requestId}` | On success, persisted `toolOverride` and native `activeTools`. An empty array explicitly enables zero tools. |
+| `requests/lookup` | `{requestId}` | Receipt in the original binding, with `pending`, `completed`, `unknown`, or `unavailable` status |
+
+A `ProfileRef` contains `name`, `scope` and `revision`. Its SHA-256 includes the
+scope, resolved file URI and original Markdown bytes. Lists use a default page
+size of 40 and accept limits from 1 to 100. A binding retains up to eight
+snapshots with a 2 MiB total budget and a 60-second expiration. A full budget
+refuses new snapshots and preserves existing cursors until expiry or state
+invalidation. Start again when a cursor is stale. The 256 KiB reply limit reserves space for JSON-RPC
+IDs up to 4 KiB so a continuation can be replayed with another ID.
+Prompt previews are cleaned and limited to 512 Unicode scalars.
+`approvalMode` describes the profile's delegation policy.
+
+An idle write uses a UUIDv7 and shares the binding's 256 receipts with running
+input. Identical requests share the result for up to 600 seconds. Reusing an
+ID for different content returns `-32602`. A completed write is accepted once
+native application and SQLite persistence succeed. `-33100` means the effect
+could not be confirmed. Look up the original receipt and read current state.
+Reopen the session before mutating again when the worker and saved preferences
+may have diverged.
+
+Studio's relay saves `agentRef` and a bounded, redacted `agentPreview`.
+On load, a matching ref restores with the saved model, permission mode and
+verified tool override. Direct management, `/agents use`, and name-only
+restoration keep the legacy name-based behavior. For drift, ACP asks
+once through `session/request_permission`, including the original and
+candidate source, revision and changed fields in the card. A stale explicit
+pick returns `profile-changed` before the card. Decline, cancellation, 45-second
+timeout, and a candidate that changes again during apply require restoring
+the original profile and reopening the same conversation. A load refusal
+uses `-32004` and `kind:"profile_reselection_required"`. Project trust and
+native launch requirements still apply.
+
+When native advertises `profileRefGuard:1`, ACP requires a `profile.ref`
+bound to the parsed preview on `agents/show` and sends
+`agents/use({name,expectedProfile})`. Native uses the same immutable parse
+for comparison and application. Each listing uses one native discovery pass.
+On the interim pin, discovery metadata is provisional and an explicit pick
+requires a checked `profiles/show` for its ref. ACP sends the name alone after
+a pre-check and compares the active name and freshly resolved ref after application. A detected mismatch requires recovery with the original saved
+preferences. The native call can already have changed runtime or history
+state. A file change from A to B and back to A can pass both checks while B is
+applied. [Native guard request](https://github.com/handochan/aelix-ai/issues/925)
+
+ACP binds drift approval to the pending or live binding, worker, operation,
+and cancellation generation. Drift approval remains disabled pending the
+authenticated, binding-bound confirmation signal in Host #76. Until it
+lands, ACP returns recovery before applying a changed recorded profile.
+Host #76 must tie the candidate and manual confirmation to the live or
+opening binding generation and withdraw pending cards on retirement, Stop,
+or ACP withdrawal. The adapter rechecks operation lifetime after native
+apply, at SQLite commit admission, and before publishing the binding.
+[Host #76](https://github.com/handochan/aelix-studio-host/issues/76)
+
+
 ## Management
 
 For app defaults and conversation-specific extension selection, Studio uses the
@@ -361,7 +431,7 @@ defines both the launcher snapshot and the versioned ACP management actions.
 | `extensions/list` | `{}` | Installed distribution/version/entry reference |
 | `extensions/action` | `{action,target?}` | list/verify/discover/install/remove/update/enable/disable/reload |
 | `agents/list` / `agents/show` | `{}` / `{name}` | Native profiles and diagnostics |
-| `agents/use` | `{name}` | Persistent selection; `--none` clears |
+| `agents/use` | `{name}` | Native name-based selection. `--none` clears. |
 | `agents/run` | `{name,task,allowProject?}` | Native delegation, enabled explicitly |
 | `agents/enable` | `{enabled:bool}` | Consent + restart |
 | `workspace/trust` | `{trusted:bool}` | Consent + restart |
