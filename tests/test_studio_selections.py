@@ -3,6 +3,7 @@ import asyncio
 from copy import deepcopy
 import json
 from pathlib import Path
+from threading import Event
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -123,7 +124,7 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
             else:
                 self.reply(self.selection_frame, error="Not saved: creating settings.json was not confirmed")
             return
-        method = request["method"]
+        method = request.get("method", request["type"])
         if method == "selections/set":
             self.mutations.append(request["params"])
             self.selection_frame = request
@@ -616,6 +617,72 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     self.assertEqual(result, CASES["relay-error-scope-readonly"]["result"])
         self.assertFalse(self.mutations)
+
+    async def test_stop_is_admitted_while_acp_target_probe_is_blocked(self):
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        release, returned = Event(), Event()
+        stamp = studio_selections.target_stamp
+        self.session.cancel_native = AsyncMock()
+
+        def blocked_stamp(path, *, project=False):
+            if project:
+                loop.call_soon_threadsafe(entered.set)
+                release.wait(2)
+                returned.set()
+            return stamp(path, project=project)
+
+        with patch.object(studio_selections, "target_stamp", side_effect=blocked_stamp):
+            listing = asyncio.create_task(self.call("selections-list-tool-first"))
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                self.assertEqual(await self.server.dispatch("session/cancel", {"sessionId": self.session.id}), {})
+                self.session.cancel_native.assert_awaited_once()
+                self.assertFalse(returned.is_set())
+            finally:
+                release.set()
+                await listing
+
+    async def test_fresh_snapshot_is_not_sent_while_native_stop_is_pending(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def pause_stop():
+            entered.set()
+            await release.wait()
+
+        self.session.cancel_native = pause_stop
+        await self.server.admit_cancel(None, {"sessionId": self.session.id})
+        stop = self.server.cancel_tasks[self.session.id].task
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            self.assertEqual(await self.call("selections-list-tool-first"), CASES["relay-error-unreadable"]["result"])
+            self.assertFalse(self.calls)
+        finally:
+            release.set()
+            await stop
+        self.assertIn("items", await self.call("selections-list-tool-first"))
+
+    async def test_native_stop_reaches_worker_without_waiting_for_catalogue_reply(self):
+        requests = []
+
+        def hold_selection(request):
+            requests.append(request)
+            self.requested.set()
+
+        self.session.controls.capabilities["methods"].append("commands/cancel")
+        self.controls.update({"selections/list": hold_selection, "commands/cancel": lambda _: {},
+                              "abort": lambda _: {}})
+        listing = asyncio.create_task(self.call("selections-list-tool-first"))
+        await asyncio.wait_for(self.requested.wait(), 5)
+        try:
+            await asyncio.wait_for(self.server.dispatch("session/cancel", {"sessionId": self.session.id}), 5)
+            self.assertFalse(listing.done())
+            self.assertEqual([call.get("method", call["type"]) for call in self.calls],
+                             ["selections/list", "commands/cancel", "abort"])
+        finally:
+            self.reply(requests[0], self.snapshots["tool"])
+            await listing
 
     async def test_project_directory_replaced_after_dispatch_is_outcome_unknown(self):
         project = self.root / ".aelix"

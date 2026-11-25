@@ -46,11 +46,6 @@ class SelectionWrite(profile_reselection.Operation):
             return True
         return False
 
-    def before_write(self):
-        self.require_current()
-        self.target.require_version(self.target.before)
-        super().before_write()
-
     def missing_key_hint(self, message):
         prefix = f"Unknown {self.kind} row: "
         keys = []

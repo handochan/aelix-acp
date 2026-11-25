@@ -203,6 +203,7 @@ class Session:
         self.rpc_closed = False
         self.cancelled = False
         self.cancel_generation = 0
+        self.direct_cancels = 0
         self.turn_active = False
         self.input_relay = None
         self.private_host = getattr(server, "host_bytes", None) is not None
@@ -1428,13 +1429,15 @@ class Session:
                     async with asyncio.timeout(profile_reselection.APPROVAL_SECONDS):
                         cause = await profile_reselection.request_approval(
                             operation, params, timeout=profile_reselection.APPROVAL_SECONDS)
+                if cause is None:
+                    await asyncio.to_thread(operation.target.require_version, operation.target.before)
+                # The native dialog or binding may have ended during the
+                # filesystem check. Validate them again before writing consent.
                 operation.require_current()
                 if not operation.awaiting_native():
                     cause = "unanswered"
                 if cause is None and not operation.may_confirm_creation():
                     cause = "cancelled"
-                if cause is None:
-                    operation.target.require_version(operation.target.before)
             except (profile_reselection.Stopped, asyncio.CancelledError):
                 cause = "cancelled"
             except studio_selections.UnsafeTarget:
@@ -1990,6 +1993,12 @@ class Session:
         with contextlib.suppress(ProtocolError, TimeoutError):
             await self.rpc("abort", _timeout=5)
 
+    def stop_pending(self):
+        pending = getattr(self.server, "cancel_tasks", {}).get(self.id)
+        return (self.direct_cancels > 0 or (self.cancelled and self.turn_active)
+                or (pending is not None and pending.session is self and pending.generation == self.cancel_generation
+                    and not pending.task.done()))
+
     def begin_cancel(self):
         """Apply Stop to the admitted turn and its dialogs before any I/O."""
         # Every open child question ends, during a manual /compact too (fix round 1, P-LOW-3).
@@ -2011,7 +2020,11 @@ class Session:
 
     async def cancel(self, *, again=False):
         if self.begin_cancel():
-            await self.cancel_native(again=again)
+            self.direct_cancels += 1
+            try:
+                await self.cancel_native(again=again)
+            finally:
+                self.direct_cancels -= 1
 
     async def cancel_native(self, *, again=False):
         generation = self.cancel_generation

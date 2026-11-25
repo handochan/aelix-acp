@@ -400,6 +400,13 @@ each snapshot to its session binding, method, and kind. Repeat `kind` on
 continuations. A cursor expires 60 seconds after the snapshot is taken.
 Replays before expiry return the same page. The reply budget includes the JSON
 envelope. A row or common header that cannot fit returns `result-too-large`.
+ACP runs selection target discovery and file identity checks off its event
+loop while retaining the write locks for write checks. It refuses a fresh
+native selection snapshot while Stop is pending. Stop sends its own control
+frames independently of any outstanding snapshot reply. An already-started
+tool or skill settings read can still block the pinned native event loop,
+which delays native handling of the Stop frames.
+[Native off-loop settings I/O](https://github.com/handochan/aelix-ai/issues/929)
 Identifiers pass through unchanged when they are nonblank, at most 8,192
 Unicode characters, and contain no slash, backslash, leading drive prefix,
 non-displayable Unicode character, or text flagged by the existing sensitive

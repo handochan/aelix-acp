@@ -529,7 +529,8 @@ class SessionRelay:
     async def apply_resource(self, method, value, operation):
         session = self.session
         resources = session.studio_resources
-        if (session.mutation_lock.locked() or session.changing or session.turn_active or session.rpc_closed
+        if (session.mutation_lock.locked() or session.changing or session.turn_active or session.stop_pending()
+                or session.rpc_closed
                 or session.proc is None or session.proc.returncode is not None
                 or session.compaction_recovery_needed):
             return refusal("busy")

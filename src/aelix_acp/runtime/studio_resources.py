@@ -146,6 +146,8 @@ class StudioResources:
         return type(version) is int and version == 1 and self.supports("agents/show", "agents/use")
 
     async def rpc(self, method, *, operation=None, **params):
+        if method == selections.LIST and self.session.stop_pending():
+            raise reselection.Stopped()
         kwargs = {"_before_native_write": operation.before_write} if operation is not None else {}
         return await self.session.rpc("aelix_control", method=method, params=params, **kwargs)
 
@@ -165,7 +167,7 @@ class StudioResources:
             data = await self.rpc(selections.LIST, kind=kind)
             rows = self.selection_rows(kind, data)
             scopes = data["scopes"]
-            target = selections.project_target(self.session, kind, scopes)
+            target = await asyncio.to_thread(selections.project_target, self.session, kind, scopes)
             public_scopes = {scope: selections.exposed_scope(kind, scope, scopes[scope], target is not None)
                              for scope in ("global", "project")}
             pending = data["policyPending"]
@@ -173,7 +175,7 @@ class StudioResources:
                 raise ValueError("Invalid selection policy status")
             items = [selections.public_row(kind, key, rows[key])
                      for key in sorted(rows, key=lambda key: key.encode("utf-8"))]
-        except (BackendError, KeyError, TypeError, ValueError):
+        except (BackendError, reselection.Stopped, KeyError, TypeError, ValueError):
             return refusal("unreadable")
         identifiers = self.identifiers
         return {"kind": kind, "effect": selections.EFFECTS[kind], "scopes": public_scopes, "items": items,
@@ -201,7 +203,7 @@ class StudioResources:
             data = await self.rpc(selections.LIST, kind=kind)
             rows = self.selection_rows(kind, data)
             scopes = data["scopes"]
-            target = selections.project_target(self.session, kind, scopes)
+            target = await asyncio.to_thread(selections.project_target, self.session, kind, scopes)
             project = selections.exposed_scope(kind, "project", scopes["project"], target is not None)
             for edit in changes:
                 key = edit["key"]
@@ -223,6 +225,10 @@ class StudioResources:
         operation.native_keys = {edit["key"]: rows[edit["key"]]["key"] for edit in changes}
         native_changes = [{"key": operation.native_keys[edit["key"]], "on": edit["on"]} for edit in changes]
         try:
+            # Keep the last filesystem check under the mutation and selection
+            # locks. The synchronous dispatch hook still fences Stop/close
+            # after this thread returns and immediately before the pipe write.
+            await asyncio.to_thread(target.require_version, target.before)
             native = await self.session.rpc(
                 "aelix_control", method=selections.SET,
                 params={"scope": "project", "kind": kind, "changes": native_changes},
@@ -242,7 +248,7 @@ class StudioResources:
                 operation.no_effect = True
                 result = await self.missing_selections(kind, changes, getattr(error, "studio_selection_key", None))
                 return result if fits(result) else refusal("result-too-large")
-            target.require_version(target.before)
+            await asyncio.to_thread(target.require_version, target.before)
             operation.no_effect = True
             if reason == "cancelled":
                 if not project["exists"] or operation.confirm_id is not None:
@@ -256,7 +262,8 @@ class StudioResources:
             return refusal(reason)
         operation.require_current()
         result = selections.project_readback(kind, native, target.path, self.identifiers)
-        version = target.verify_save(result["written"])
+        version = await asyncio.to_thread(target.verify_save, result["written"])
+        operation.require_current()
         if kind == "tool" and self.session.active_tools is not None:
             if result["apply"]["deferred"]:
                 # A native deferred apply can still turn tools back on after
@@ -267,7 +274,8 @@ class StudioResources:
                 operation.require_current()
         after = self.selection_rows(kind, await self.rpc(selections.LIST, kind=kind))
         operation.require_current()
-        target.require_version(version)
+        await asyncio.to_thread(target.require_version, version)
+        operation.require_current()
         changed, mismatches = selections.verified_diff(rows, after, changes, native["mismatches"])
         if any(mismatch["reason"] == "missing" for mismatch in mismatches):
             result = refusal("selection-missing", scope="project", written=result["written"], mismatches=mismatches)
