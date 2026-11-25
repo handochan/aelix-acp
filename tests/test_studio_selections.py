@@ -2,7 +2,9 @@
 import asyncio
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
+import sys
 from threading import Event
 import tempfile
 from types import SimpleNamespace
@@ -23,6 +25,88 @@ LIST_CASES = {
 }
 SET_CASES = ("selections-set-tool", "selections-set-skill", "selections-set-mcp",
              "selections-deferred", "selections-saved-not-applied", "selections-mismatch")
+
+BLOCKED_TARGET_PROBE = """
+import asyncio
+from pathlib import Path
+import socket
+import sys
+from types import SimpleNamespace
+
+from aelix_acp.runtime import studio_selections
+from aelix_acp.server import Server, Session
+
+async def run():
+    server = Server(SimpleNamespace(state_dir="state", profile="coding"))
+    session = Session(server, "s", str(Path.cwd()))
+    server.sessions[session.id] = session
+    session.controls.capabilities = {"methods": ["selections/list"], "selectionKinds": ["tool"]}
+    dispatch = server.dispatch
+
+    async def request(method, params, **kwargs):
+        if method == "fixture/probe":
+            return await session.studio_resources.selections_catalog("tool")
+        return await dispatch(method, params, **kwargs)
+
+    async def rpc(*args, **kwargs):
+        return {"kind": "tool", "effect": "next_request", "items": [], "policyPending": False,
+                "notices": [], "problems": [], "unreadable": [],
+                "scopes": {scope: {"path": None, "writable": False, "exists": False, "reason": None}
+                           for scope in ("project", "global")}}
+
+    def blocked(*args):
+        with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10) as connection:
+            connection.settimeout(None)
+            connection.sendall(b"b")
+            connection.recv(1)
+
+    session.rpc = rpc
+    server.dispatch = request
+    studio_selections.project_target = blocked
+    await server.run()
+    print("ACP cleanup finished", flush=True)
+
+asyncio.run(run())
+"""
+
+
+class SelectionShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_eof_exits_while_target_probe_is_still_blocked(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        accepted = asyncio.Queue()
+        listener = await asyncio.start_server(lambda reader, writer: accepted.put_nowait((reader, writer)),
+                                              "127.0.0.1", 0)
+        self.addAsyncCleanup(listener.wait_closed)
+        self.addCleanup(listener.close)
+        port = listener.sockets[0].getsockname()[1]
+        source = Path(__file__).resolve().parents[1] / "src"
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", BLOCKED_TARGET_PROBE, str(port), cwd=root,
+            env=dict(os.environ, PYTHONPATH=str(source)), stdin=-1, stdout=-1, stderr=-1,
+        )
+        try:
+            process.stdin.write(encode_frame({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                              "params": {"protocolVersion": 1}}))
+            self.assertIn("result", json.loads(await asyncio.wait_for(process.stdout.readline(), 10)))
+            process.stdin.write(encode_frame({"jsonrpc": "2.0", "id": 2, "method": "fixture/probe"}))
+            await process.stdin.drain()
+            reader, writer = await asyncio.wait_for(accepted.get(), 10)
+            try:
+                self.assertEqual(await asyncio.wait_for(reader.readexactly(1), 5), b"b")
+                process.stdin.close()
+                self.assertEqual((await asyncio.wait_for(process.stdout.readline(), 5)).strip(), b"ACP cleanup finished")
+                self.assertEqual(await asyncio.wait_for(process.wait(), 3), 0)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        finally:
+            if process.returncode is None:
+                process.stdin.close()
+                try:
+                    await asyncio.wait_for(process.wait(), 5)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
 
 
 class SelectionsTests(unittest.IsolatedAsyncioTestCase):

@@ -1435,7 +1435,7 @@ class Session:
                         cause = await profile_reselection.request_approval(
                             operation, params, timeout=profile_reselection.APPROVAL_SECONDS)
                 if cause is None:
-                    await asyncio.to_thread(operation.target.require_version, operation.target.before)
+                    await self.server.selection_target_io.run(operation.target.require_version, operation.target.before)
                 # The native dialog or binding may have ended during the
                 # filesystem check. Validate them again before writing consent.
                 operation.require_current()

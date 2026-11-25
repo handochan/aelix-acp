@@ -1,9 +1,12 @@
 """D16 projection of native project selections."""
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 import os
 from pathlib import Path
 import stat
+from threading import Thread
 
 from .profile_refs import file_stamp
 from . import profile_reselection
@@ -16,6 +19,44 @@ CREATE_TITLE = "This creates .aelix/settings.json: the folder falls under projec
 CREATE_HINT = "next launch may ask; -p may need --approve"
 LOCK_REASONS = {"cli": "launch-locked", "profile": "profile-locked",
                 "shadowed": "shadowed", "unavailable": "unavailable"}
+
+
+class SelectionTargetIO:
+    """Bounded off-loop work for read-only target probes, independent of executor shutdown."""
+
+    def __init__(self):
+        self.slots = asyncio.BoundedSemaphore(4)
+
+    async def run(self, probe, *args):
+        await self.slots.acquire()
+        loop = asyncio.get_running_loop()
+        result = loop.create_future()
+
+        def complete(value, error):
+            self.slots.release()
+            if not result.done():
+                if error is None:
+                    result.set_result(value)
+                else:
+                    result.set_exception(error)
+
+        def work():
+            value, error = None, None
+            try:
+                value = probe(*args)
+            except BaseException as exc:
+                error = exc
+            # EOF can cancel the request and close the loop while the
+            # filesystem still owns this call. No probe performs a write.
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(complete, value, error)
+
+        try:
+            Thread(target=work, name="aelix-selection-target", daemon=True).start()
+        except BaseException:
+            self.slots.release()
+            raise
+        return await result
 
 
 class SelectionWrite(profile_reselection.Operation):

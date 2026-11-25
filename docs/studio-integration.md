@@ -411,8 +411,13 @@ each snapshot to its session binding, method, and kind. Repeat `kind` on
 continuations. A cursor expires 60 seconds after the snapshot is taken.
 Replays before expiry return the same page. The reply budget includes the JSON
 envelope. A row or common header that cannot fit returns `result-too-large`.
-ACP runs selection target discovery and file identity checks off its event
-loop while retaining the write locks for write checks. It refuses a fresh
+ACP runs selection target discovery and file identity checks on up to four
+daemon probe threads per adapter while retaining the write locks for write
+checks. A running probe holds its slot until it returns, even if its request
+is cancelled. On EOF, ACP completes normal worker, transport, and store
+cleanup and can exit with a blocked read-only probe still outstanding.
+Daemon probes avoid the default executor's shutdown join on Windows and
+POSIX. The OS releases their read handles on exit. ACP refuses a fresh
 native selection snapshot while Stop is pending. Stop sends its own control
 frames independently of any outstanding snapshot reply. An already-started
 tool or skill settings read can still block the pinned native event loop,

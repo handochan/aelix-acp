@@ -219,7 +219,7 @@ class StudioResources:
             data = await self.rpc(selections.LIST, kind=kind)
             rows = self.selection_rows(kind, data)
             scopes = data["scopes"]
-            target = await asyncio.to_thread(selections.project_target, self.session, kind, scopes)
+            target = await self.session.server.selection_target_io.run(selections.project_target, self.session, kind, scopes)
             public_scopes = {scope: selections.exposed_scope(kind, scope, scopes[scope], target is not None)
                              for scope in ("global", "project")}
             pending = data["policyPending"]
@@ -251,11 +251,12 @@ class StudioResources:
             self.invalidate_pages()
 
     async def _set_selections(self, kind, changes, fits, operation):
+        target_io = self.session.server.selection_target_io
         try:
             data = await self.rpc(selections.LIST, kind=kind)
             rows = self.selection_rows(kind, data)
             scopes = data["scopes"]
-            target = await asyncio.to_thread(selections.project_target, self.session, kind, scopes)
+            target = await target_io.run(selections.project_target, self.session, kind, scopes)
             project = selections.exposed_scope(kind, "project", scopes["project"], target is not None)
             for edit in changes:
                 key = edit["key"]

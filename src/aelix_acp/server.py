@@ -29,6 +29,7 @@ from .runtime.store import (open_store, load_preferences, history, legacy_permis
 from .runtime.controls import MODE_IDS
 from .runtime.resource_identifiers import public_text_fields
 from .runtime.studio_resources import SELECTION_MUTATIONS
+from .runtime.studio_selections import SelectionTargetIO
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
 from .stdio import StdinReader, offer_stderr, write_diagnostic
@@ -73,6 +74,7 @@ class Server:
     def __init__(self, args):
         self.args = args
         self.db = open_store(args.state_dir)
+        self.selection_target_io = SelectionTargetIO()
         self.initialized = False
         self.relay_enabled = False
         self.host_bytes = None
