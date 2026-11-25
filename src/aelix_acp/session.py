@@ -1720,7 +1720,7 @@ class Session:
                                           self.adapter_event_binding, first_input, last_input,
                                           diagnostic="history_write_failed")
                     except ProtocolError as error:
-                        print(error.data["kind"], file=sys.stderr)
+                        write_diagnostic(error.data["kind"])
                 return {"stopReason": "end_turn"}
             if prepared is not None:
                 text = prepared
