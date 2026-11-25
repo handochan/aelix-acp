@@ -49,13 +49,18 @@ class Operation:
         if self.permission is not None:
             self.permission.cancel()
 
-    def require_current(self, *, allow_cancelled=False):
+    def require_admission(self, *, allow_cancelled=False):
         s = self.session
         if (self.retired or (s.cancelled and not allow_cancelled) or s.cancel_generation != self.generation
-                or self.worker is None or self.worker.returncode is not None
-                or s.proc is not self.worker or s.rpc_closed or s.ending
                 or s.server.closing or s.server.input_closed or self.resources.binding() != self.binding
                 or (self.binding is not None and self.binding == self.resources.retired_binding)):
+            raise Stopped()
+
+    def require_current(self, *, allow_cancelled=False):
+        self.require_admission(allow_cancelled=allow_cancelled)
+        s = self.session
+        if (self.worker is None or self.worker.returncode is not None
+                or s.proc is not self.worker or s.rpc_closed or s.ending):
             raise Stopped()
 
     def before_write(self):

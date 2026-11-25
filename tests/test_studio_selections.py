@@ -381,6 +381,46 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(write_result, ProtocolError)
         self.assertFalse(self.calls)
 
+    async def test_selection_recovery_preserves_stop_and_close_retirement(self):
+        params = {"sessionId": self.session.id}
+        self.session.cancel_native = AsyncMock()
+        for retire in ("session/cancel", "session/close"):
+            with self.subTest(retire=retire):
+                entered, release = asyncio.Event(), asyncio.Event()
+                self.session.proc = None
+                self.session.rpc_closed = True
+                self.session.compaction_recovery_needed = True
+
+                async def recover(*, preserve_cancellation=False):
+                    self.assertTrue(preserve_cancellation)
+                    self.session.studio_resources.retire_approval(keep_recovery=True)
+                    entered.set()
+                    await release.wait()
+                    self.session.proc = SimpleNamespace(returncode=None)
+                    self.session.rpc_closed = False
+                    self.session.compaction_recovery_needed = False
+
+                self.session.recover_after_compaction = recover
+                pending = (self.call("tools-set-empty") if retire == "session/cancel"
+                           else self.server.dispatch("_aelix/manage", {
+                               **params, "action": "tools/set_active", "arguments": {"names": []},
+                           }))
+                write = asyncio.create_task(pending)
+                try:
+                    await asyncio.wait_for(entered.wait(), 5)
+                    self.assertFalse(write.done())
+                    if retire == "session/close":
+                        with self.assertRaises(ProtocolError):
+                            await self.server.dispatch(retire, params)
+                    else:
+                        await self.server.dispatch(retire, params)
+                finally:
+                    release.set()
+                    result, = await asyncio.gather(write, return_exceptions=True)
+                self.assertIsInstance(result, ProtocolError)
+                self.assertEqual(result.code, -32004)
+                self.assertFalse(self.calls)
+
     async def test_close_retires_queued_legacy_tool_change_before_dispatch(self):
         started = asyncio.Event()
         params = {"sessionId": self.session.id}

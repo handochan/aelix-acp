@@ -52,6 +52,7 @@ class StudioResources:
         self.selection_operation = None
         self.waiting_operation = None
         self.legacy_operation = None
+        self.recovering_operation = None
         self.restore_operation = None
 
     def binding(self):
@@ -119,11 +120,13 @@ class StudioResources:
             data = {"kind": "tool_locked", "key": identifiers.key("tool", key)} if key in names else error.data
             raise ProtocolError("Native tool selection was refused.", error.code, data) from None
 
-    def retire_approval(self):
+    def retire_approval(self, *, keep_recovery=False):
         operation = (self.profile_operation or self.tool_operation or self.selection_operation
                      or self.waiting_operation or self.legacy_operation or self.restore_operation)
         if operation is not None:
             operation.retire()
+        if not keep_recovery and self.recovering_operation is not None:
+            self.recovering_operation.retire()
 
     @asynccontextmanager
     async def selection_write(self, operation):
@@ -137,10 +140,39 @@ class StudioResources:
         try:
             # A historical Stop does not prevent a new idle write. A Stop
             # admitted during this wait retires the operation explicitly.
-            operation.require_current(allow_cancelled=True)
+            session = self.session
+            if session.server.sessions.get(session.id) is not session:
+                raise reselection.Stopped()
+            if session.compaction_recovery_needed:
+                operation.require_admission(allow_cancelled=True)
+            else:
+                operation.require_current(allow_cancelled=True)
             yield
         finally:
             self.selection_lock.release()
+
+    async def recover_selection_write(self, operation):
+        session = self.session
+        if not session.compaction_recovery_needed:
+            return False
+        operation.require_admission(allow_cancelled=True)
+        # The request is now admitted. Clear only historical cancellation
+        # and keep this generation through the replacement worker's startup.
+        session.reset_cancellation()
+        operation.generation = session.cancel_generation
+        previews = self.previews.copy()
+        self.recovering_operation = operation
+        try:
+            await session.recover_after_compaction(preserve_cancellation=True)
+        finally:
+            self.recovering_operation = None
+        operation.require_admission()
+        operation.worker = session.proc
+        operation.require_current()
+        # A checked preview remains scoped to this binding. Explicit use
+        # still resolves its revision again on the replacement worker.
+        self.previews.update(previews)
+        return True
 
     def retire_replaced_approval(self, replacement):
         binding = self.binding()
@@ -248,7 +280,7 @@ class StudioResources:
             # Keep the last filesystem check under the mutation and selection
             # locks. The synchronous dispatch hook still fences Stop/close
             # after this thread returns and immediately before the pipe write.
-            await asyncio.to_thread(target.require_version, target.before)
+            await target_io.run(target.require_version, target.before)
             native = await self.session.rpc(
                 "aelix_control", method=selections.SET,
                 params={"scope": "project", "kind": kind, "changes": native_changes},
@@ -268,7 +300,7 @@ class StudioResources:
                 operation.no_effect = True
                 result = await self.missing_selections(kind, changes, getattr(error, "studio_selection_key", None))
                 return result if fits(result) else refusal("result-too-large")
-            await asyncio.to_thread(target.require_version, target.before)
+            await target_io.run(target.require_version, target.before)
             operation.no_effect = True
             if reason == "cancelled":
                 if not project["exists"] or operation.confirm_id is not None:
@@ -282,7 +314,7 @@ class StudioResources:
             return refusal(reason)
         operation.require_current()
         result = selections.project_readback(kind, native, target.path, self.identifiers)
-        version = await asyncio.to_thread(target.verify_save, result["written"])
+        version = await target_io.run(target.verify_save, result["written"])
         operation.require_current()
         if kind == "tool" and self.session.active_tools is not None:
             if result["apply"]["deferred"]:
@@ -294,7 +326,7 @@ class StudioResources:
                 operation.require_current()
         after = self.selection_rows(kind, await self.rpc(selections.LIST, kind=kind))
         operation.require_current()
-        await asyncio.to_thread(target.require_version, version)
+        await target_io.run(target.require_version, version)
         operation.require_current()
         changed, mismatches = selections.verified_diff(rows, after, changes, native["mismatches"])
         if any(mismatch["reason"] == "missing" for mismatch in mismatches):

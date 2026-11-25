@@ -546,8 +546,9 @@ class SessionRelay:
                 async with session.mutation_lock:
                     if resources.uncertain:
                         return refusal("busy")
-                    session.reset_cancellation()
-                    operation.generation = session.cancel_generation
+                    if not await resources.recover_selection_write(operation):
+                        session.reset_cancellation()
+                        operation.generation = session.cancel_generation
                     operation.require_current()
                     if method == "profiles/use":
                         expected = {"accepted": True, "activeAgent": value["name"] if value else None,
@@ -566,9 +567,9 @@ class SessionRelay:
 
     def resource_write_busy(self):
         session = self.session
+        worker_unavailable = session.rpc_closed or session.proc is None or session.proc.returncode is not None
         return (session.mutation_lock.locked() or session.changing or session.turn_active or session.stop_pending()
-                or session.rpc_closed or session.proc is None or session.proc.returncode is not None
-                or session.compaction_recovery_needed)
+                or (worker_unavailable and not session.compaction_recovery_needed))
 
     async def _write_images(self, command, turn, message, refs, receipt, issued, fence):
         session = self.session

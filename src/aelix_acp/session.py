@@ -1725,11 +1725,11 @@ class Session:
                 -32003 if cancelled else -32004, details,
             ) from failure
 
-    async def recover_after_compaction(self, *, for_prompt=False):
+    async def recover_after_compaction(self, *, preserve_cancellation=False):
         if not self.compaction_recovery_needed:
             return
         try:
-            await self.restart(preserve_history=True, preserve_cancellation=for_prompt)
+            await self.restart(preserve_history=True, preserve_cancellation=preserve_cancellation)
         finally:
             self.server.sessions[self.id] = self
         self.compaction_recovery_needed = False
@@ -1747,7 +1747,7 @@ class Session:
         # addresses this generation throughout recovery and receipt admission.
         self.reset_cancellation()
         if self.compaction_recovery_needed:
-            await self.recover_after_compaction(for_prompt=True)
+            await self.recover_after_compaction(preserve_cancellation=True)
         prior = await write_store(self.server.args.state_dir, begin_turn, self.id, key, fingerprint,
                                   diagnostic="turn_receipt_write_failed")
         if prior is not None:
@@ -2014,7 +2014,8 @@ class Session:
             # Keep waiting for the actual manual compaction outcome.
             return False
         self.cancelled = True
-        for operation in (self.studio_resources.waiting_operation, self.studio_resources.legacy_operation):
+        for operation in (self.studio_resources.waiting_operation, self.studio_resources.legacy_operation,
+                          self.studio_resources.recovering_operation):
             if operation is not None:
                 operation.retire()
         self.invalidate_image_acceptance()
@@ -2060,7 +2061,9 @@ class Session:
 
     async def _close(self):
         self.raise_fence()
-        self.studio_resources.retire_approval()
+        # Closing the old worker is part of an admitted recovery. Explicit
+        # client Close retires the recovery at server admission instead.
+        self.studio_resources.retire_approval(keep_recovery=True)
         self.studio_resources.invalidate_pages()
         self.ending = True
         try:

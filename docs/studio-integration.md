@@ -401,6 +401,11 @@ After acquiring the lock, a writer rechecks its lifetime and tries session
 admission without waiting for a prompt or slash command.
 Legacy management applies the Stop and Close fence again before its first
 native mutation, including after any inventory preflight.
+The first resource write after a compaction timeout can recover the saved
+session under its activity lease. Stop and Close still retire that request
+during restart. ACP checks the binding and replacement worker before
+mutation. A checked profile preview remains usable in the same binding and
+its revision is resolved again on the replacement worker.
 The shared pager sorts selection keys by UTF-8 bytes and binds
 each snapshot to its session binding, method, and kind. Repeat `kind` on
 continuations. A cursor expires 60 seconds after the snapshot is taken.

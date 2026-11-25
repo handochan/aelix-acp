@@ -12,6 +12,7 @@ import textwrap
 import unittest
 
 from support import AcpClient, process_alive
+from test_session_relay import request_id as relay_request_id
 from aelix_acp.runtime import host_bytes, session_relay
 from aelix_acp.runtime.leases import acquire as acquire_lease
 from aelix_acp.runtime.store import ASSISTANT_ORIGIN_META, append_event
@@ -883,6 +884,62 @@ def setup(api):
         self.assertIn("Nothing to compact", self.client.text())
         progress = self.context_updates("tool_call_update")[-1]
         self.assertEqual(progress["_meta"]["aelix/compaction"], {"reason": "manual", "state": "failed"})
+
+    async def test_first_resource_write_recovers_worker_after_compaction_deadline(self):
+        project = self.root / ".aelix"
+        project.mkdir()
+        (project / "settings.json").write_text("{}\n", encoding="utf-8")
+        profiles = self.root / "agent/agents"
+        profiles.mkdir()
+        (profiles / "recovery.md").write_text(
+            "---\nname: recovery\ndescription: Recovery fixture\n---\nKeep the same session.\n",
+            encoding="utf-8",
+        )
+        await self.client.close()
+        self.client = await AcpClient.start(
+            self.root, EXECUTABLE, prefix=("--approve",), adapter_args=("--command-timeout", "1"),
+            capabilities=PROTECTED_HOST,
+        )
+        binding = "compaction-recovery"
+        await self.client.request("session/load", {
+            "cwd": str(self.root), "sessionId": self.session, "mcpServers": [],
+            "_meta": {session_relay.META_KEY: {"bindingId": binding}},
+        })
+
+        async def relay(suffix, payload):
+            return await self.client.request(session_relay.METHOD_PREFIX + suffix, {
+                "sessionId": self.session, "bindingId": binding, "payload": payload,
+            })
+
+        for index, method in enumerate(("legacy", "tools/set-active", "selections/set", "profiles/use"), start=1):
+            with self.subTest(method=method):
+                await self.prompt("Keep this prior context")
+                await self.prompt("Keep more prior context")
+                ref = None
+                if method == "profiles/use":
+                    ref = (await relay("profiles/show", {"name": "recovery"}))["profile"]["ref"]
+                self.model_gate = asyncio.Event()
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "compaction outcome is unknown"):
+                        await self.prompt("/compact", f"recovery-compaction-{index}")
+                finally:
+                    self.model_gate.set()
+                    self.model_gate = None
+                request_count = len(self.model_requests)
+                if method == "legacy":
+                    self.assertEqual((await self.manage("tools/set_active", {"names": []}))["activeTools"], [])
+                else:
+                    payload = {
+                        "tools/set-active": {"names": ["read"]},
+                        "selections/set": {"scope": "project", "kind": "tool",
+                                           "changes": [{"key": "read", "on": False}]},
+                        "profiles/use": {"profile": ref},
+                    }[method]
+                    result = await relay(method, {**payload, "requestId": relay_request_id(index)})
+                    self.assertTrue(result["accepted"], result)
+                    if method == "profiles/use":
+                        self.assertEqual(result["activeRef"], ref)
+                self.assertEqual(len(self.model_requests), request_count)
 
     async def test_compaction_deadline_reports_unknown_and_reopens_the_same_session_without_replay(self):
         import sqlite3
