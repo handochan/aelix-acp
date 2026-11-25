@@ -194,16 +194,16 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.session = (await self.client.request("session/new", self.open_params("b-21")))["sessionId"]
         self.original = self.write_record()
 
-    async def start_client(self, *, manual=True, inherited_flag=False, gates=False, adapter_args=()):
+    async def start_client(self, *, manual=True, inherited_flag=False):
         # Exercise future authenticated-host behavior only inside the fixture
         # process. The adapter itself has no configuration that grants it.
         fixture_hook = "r.host_verified_manual_approval=lambda operation: True;" if manual else ""
         entry = "from aelix_acp.runtime import profile_reselection as r;r.APPROVAL_SECONDS=1.5;" + fixture_hook
-        entry += PUBLICATION_GATES if gates else "from aelix_acp.server import main;main()"
+        entry += PUBLICATION_GATES
         client = await AcpClient.start(
             self.root, sys.executable, prefix=[str(self.script)], capabilities=initialize_offer()["clientCapabilities"],
             extra_env={MANUAL_APPROVAL_ENV: "1"} if inherited_flag else None,
-            entry=("-c", entry), adapter_args=adapter_args,
+            entry=("-c", entry), adapter_args=("--max-sessions", "1"),
         )
         self.addAsyncCleanup(client.close)
         return client
@@ -217,7 +217,7 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         return {**vector["ref"], "revision": "sha256:" + hashlib.sha256(prefix + raw).hexdigest()}
 
     def preferences(self, update=None):
-        with sqlite3.connect(self.root / "state/sessions.sqlite3") as db:
+        with closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db, db:
             current = json.loads(db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session,)).fetchone()[0])
             if update is not None:
                 current.update(update)
@@ -565,8 +565,6 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
 
 
     async def open_with_gate(self, name):
-        await self.client.close()
-        self.client = await self.start_client(gates=True, inherited_flag=True)
         self.write_profile(self.project, 1)
         pause = self.root / ("pause-" + name)
         pause.touch()
@@ -605,11 +603,6 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.preferences()["agentRef"]["scope"], "project")
         self.assertFalse(self.calls("prompt"))
 
-    async def start_with_gates(self, *, adapter_args=()):
-        await self.client.close()
-        self.client = await self.start_client(gates=True, adapter_args=adapter_args)
-        await self.load()
-
     async def retire_before_release(self, pending, pause, blocked, *, busy_message):
         try:
             await self.wait_until(lambda: blocked.exists())
@@ -636,7 +629,7 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.preferences(), saved)
 
     async def assert_failed_compaction_restart_recoverable(self, *, close_first):
-        await self.start_with_gates()
+        await self.load()
         await self.fail_compaction_restart()
         if close_first:
             self.assertEqual(await self.client.request("session/close", {"sessionId": self.session}), {})
@@ -658,7 +651,7 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_failed_compaction_restart_recoverable(close_first=True)
 
     async def test_delete_releases_the_retained_compaction_session_slot(self):
-        await self.start_with_gates(adapter_args=("--max-sessions", "1"))
+        await self.load()
         await self.fail_compaction_restart()
         self.assertEqual(await self.client.request("session/delete", {"sessionId": self.session}), {})
         self.assertEqual((await self.client.request("session/list", {}))["sessions"], [])
@@ -666,7 +659,7 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(opened["sessionId"], self.session)
 
     async def test_delete_rollback_releases_closed_session_lease_for_load_and_retry(self):
-        await self.start_with_gates()
+        await self.load()
         await self.fail_compaction_restart()
         saved = self.preferences()
         with closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
@@ -694,7 +687,7 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.request("session/list", {}))["sessions"], [])
 
     async def test_close_retires_tool_write_during_inventory_preflight(self):
-        await self.start_with_gates()
+        await self.load()
         saved = self.preferences()
         prior_writes = self.calls("tools/set_active")
         post = CASES["tools-set-active"]["post"]
@@ -716,7 +709,7 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.preferences(), saved)
 
     async def assert_retired_tool_write_is_unknown(self, pause_name, blocked_name):
-        await self.start_with_gates()
+        await self.load()
         saved = self.preferences()
         self.assertEqual(saved["activeTools"], [])
         post = CASES["tools-set-active"]["post"]

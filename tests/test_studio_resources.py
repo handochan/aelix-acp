@@ -112,6 +112,22 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(profile_ref(ref["name"], ref["scope"], vector["sourceUri"],
                                          vector["rawUtf8"].encode()), ref)
 
+    def test_file_identity_uses_comparable_handle_timestamps(self):
+        path = self.root / "quiet.md"
+        raw = CASES["profile-ref"]["vectors"][0]["rawUtf8"].encode()
+        path.write_bytes(raw)
+        actual_stat = path.stat()
+        # Windows path stat can report creation time while fstat reports change time.
+        path_stat = SimpleNamespace(
+            st_mode=actual_stat.st_mode, st_dev=actual_stat.st_dev, st_ino=actual_stat.st_ino,
+            st_ctime_ns=actual_stat.st_ctime_ns - 1, st_mtime_ns=actual_stat.st_mtime_ns,
+            st_size=actual_stat.st_size,
+        )
+        expected = profile_ref("quiet", "user", path.resolve(strict=True).as_uri(), raw)
+        with patch.object(type(path), "stat", return_value=path_stat):
+            ref, source, _ = file_identity({"name": "quiet", "scope": "user", "filePath": str(path)})
+        self.assertEqual((ref, source), (expected, "user:agents/quiet.md"))
+
     async def test_show_guarded_use_and_clear(self):
         await self.assert_result("profiles-show")
         self.assertEqual(await self.call("profiles-use", wire=True), CASES["relay-envelope"]["acpResponse"])

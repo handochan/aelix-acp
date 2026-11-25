@@ -24,7 +24,8 @@ jobs:
       - run: aelix-acp --version
   native:
     name: Native candidate and ACP (${{ matrix.target }})
-    timeout-minutes: ${{ matrix.target == 'darwin-x64' && 35 || 20 }}
+    # Intel's native suite has taken 32 minutes before the image/Stop and packaging steps.
+    timeout-minutes: ${{ matrix.target == 'darwin-x64' && 40 || 20 }}
     strategy:
       fail-fast: false
       matrix:

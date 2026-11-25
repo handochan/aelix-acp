@@ -210,8 +210,13 @@ def file_identity(native, *, max_bytes=None):
         ref = profile_ref(name, scope, resolved.as_uri(), file_chunks(stream, max_bytes))
         after = os.fstat(stream.fileno())
     stamp = file_stamp(after)
-    if file_stamp(before) != stamp or path.resolve(strict=True) != resolved or file_stamp(resolved.stat()) != stamp:
+    if file_stamp(before) != stamp or path.resolve(strict=True) != resolved:
         raise ValueError("Profile changed during inspection")
+    # Windows can report creation time through stat() and change time through
+    # fstat(). Compare two handle snapshots, including the current path target.
+    with os.fdopen(os.open(resolved, flags), "rb") as current:
+        if file_stamp(os.fstat(current.fileno())) != stamp:
+            raise ValueError("Profile changed during inspection")
     return ref, source, stamp
 
 

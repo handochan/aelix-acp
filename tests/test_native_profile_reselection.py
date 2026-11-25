@@ -1,4 +1,5 @@
 """D16 interim compatibility, catalog and restore checks against the pinned native executable."""
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -59,7 +60,7 @@ class NativeProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         })
 
     def preferences(self, update=None):
-        with sqlite3.connect(self.root / "state/sessions.sqlite3") as database:
+        with closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as database, database:
             stored = json.loads(database.execute("SELECT value FROM preferences WHERE session_id=?",
                                                  (self.session,)).fetchone()[0])
             if update:
