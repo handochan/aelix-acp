@@ -155,7 +155,6 @@ async def approve(operation, before, after):
         if before["promptTruncated"] and after["promptTruncated"]:
             lines.append("The omitted portion of the prompt may have changed.")
     lines.append("Use this version of the profile?")
-    server = session.server
     params = {
         "sessionId": session.id,
         "toolCall": {"toolCallId": "profile-change-" + uuid.uuid4().hex,
@@ -169,8 +168,14 @@ async def approve(operation, before, after):
     }
     if len(encode_frame(params)) > APPROVAL_BYTES:
         return "unanswered"
+    return await request_approval(operation, params, timeout=APPROVAL_SECONDS)
+
+
+async def request_approval(operation, params, *, timeout):
+    session = operation.session
+    server = session.server
     task = asyncio.create_task(server.client_request(
-        "session/request_permission", params, withdraw=True, timeout=APPROVAL_SECONDS,
+        "session/request_permission", params, withdraw=True, timeout=timeout,
         max_response_bytes=4096, before_send=operation.require_current,
     ))
     operation.permission = task

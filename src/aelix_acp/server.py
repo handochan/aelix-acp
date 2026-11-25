@@ -656,7 +656,7 @@ class Server:
                 session.client_mcp = params.get("mcpServers", [])
                 if method == "session/load":
                     self.pending_stop_sessions[session_id] = session
-                    session.studio_resources.starting_binding = binding_id
+                session.studio_resources.starting_binding = binding_id
                 if previous:
                     self.sessions.pop(session_id, None)
                     await previous.close()

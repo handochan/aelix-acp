@@ -350,16 +350,16 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
         first = CASES["profiles-list-page-1"]["result"]
         snapshot = {**first, "profiles": first["profiles"] + CASES["profiles-list-page-2"]["result"]["profiles"]}
         self.resources.catalog = AsyncMock(return_value=snapshot)
-        with patch.object(session_relay, "MAX_PROFILE_SNAPSHOTS", 1):
+        with patch.object(session_relay, "MAX_LIST_SNAPSHOTS", 1):
             current = (await self.call("profiles-list-page-1"))["nextCursor"]
             await self.assert_result("relay-error-large-item", payload={"limit": 1})
             result = await self.relay.profiles_list({"cursor": current}, response_id=7)
             self.assertEqual(result, await self.relay.profiles_list({"cursor": current}, response_id="*" * 4094))
             self.assertTrue(session_relay.fits_resource(result, "*" * 4094))
-        self.relay.invalidate_profile_pages()
-        with patch.object(session_relay, "MAX_PROFILE_SNAPSHOT_BYTES", 1):
+        self.relay.invalidate_list_pages()
+        with patch.object(session_relay, "MAX_LIST_SNAPSHOT_BYTES", 1):
             await self.assert_result("relay-error-large-item", payload={"limit": 1})
-        self.assertFalse(self.relay.profile_snapshots)
+        self.assertFalse(self.relay.list_snapshots)
 
     async def test_preview_redacts_pasted_credentials_paths_and_unverifiable_authority(self):
         native = {

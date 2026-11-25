@@ -309,9 +309,9 @@ gets up to 45 s to end before it is killed, so `{}` can take that long (see
 [Delegated children](#delegated-children) and the close latency measured in
 [product validation](product-validation.md)).
 
-## Studio session profiles and tools
+## Studio session profiles, tools, and project selections
 
-This section is part of Studio #7 Unit A.
+This section covers Studio #7 units A and B.
 
 Offer `clientCapabilities._meta["aelix/sessionRelay"] = {version:1, notifications:false}`
 and use the binding echoed by `session/new` or `session/load`. The host sends
@@ -325,6 +325,8 @@ are available through the same conversation extension route as running input.
 | `profiles/show` | `{name}` | Current winner's ref, relative source, prompt preview, and model, tool, skill and policy fields |
 | `profiles/use` | `{profile,requestId}` | On success, active name and ref with `toolOverride:null`. A null profile clears the selection. |
 | `tools/set-active` | `{names,requestId}` | On success, persisted `toolOverride` and native `activeTools`. An empty array explicitly enables zero tools. |
+| `selections/list` | `{kind,limit?}` or `{kind,cursor}` | Project and global scope status, selection rows, policy pending, and next cursor |
+| `selections/set` | `{scope:"project",kind,changes,requestId}` | Saved project changes, relative filenames, mismatches, and native apply status |
 | `requests/lookup` | `{requestId}` | Receipt in the original binding, with `pending`, `completed`, `unknown`, or `unavailable` status |
 
 A `ProfileRef` contains `name`, `scope` and `revision`. Its SHA-256 includes the
@@ -339,8 +341,8 @@ Prompt previews are cleaned and limited to 512 Unicode scalars.
 
 An idle write uses a UUIDv7 and shares the binding's 256 receipts with running
 input. Identical requests share the result for up to 600 seconds. Reusing an
-ID for different content returns `-32602`. A completed write is accepted once
-native application and SQLite persistence succeed. `-33100` means the effect
+ID for different content returns `-32602`. Profile and tool override writes
+are accepted once native application and SQLite persistence succeed. `-33100` means the effect
 could not be confirmed. Look up the original receipt and read current state.
 Reopen the session before mutating again when the worker and saved preferences
 may have diverged.
@@ -378,6 +380,70 @@ or ACP withdrawal. The adapter rechecks operation lifetime after native
 apply, at SQLite commit admission, and before publishing the binding.
 [Host #76](https://github.com/handochan/aelix-studio-host/issues/76)
 
+### Project selections
+
+`kind` is `tool`, `skill`, or `mcp`. Native must advertise the requested
+kind and method. List rows retain the native saved value, source of the
+decision, applied and in-force values, live observation, and pending state.
+A tool list also returns the saved session `toolOverride` and the worker's
+`activeTools`. The shared pager sorts selection keys by UTF-8 bytes and binds
+each snapshot to its session binding, method, and kind. Repeat `kind` on
+continuations. A cursor expires 60 seconds after the snapshot is taken.
+Replays before expiry return the same page. The reply budget includes the JSON
+envelope. A row or common header that cannot fit returns `result-too-large`.
+
+Set accepts 1–1024 distinct, ordered `{key,on}` entries with boolean
+`on`. ACP checks each key and lock against a fresh native list and sends
+project scope exclusively. Global listings report `writable:false` with
+`reason:"management-helper"`. Global writes return `-33102` before a native
+call. Confirmation, paths, cwd, and commands are outside the payload schema.
+ACP checks the native target against the expected project filename and refuses
+existing path aliases. Native rechecks trust under its write lock. The MCP
+writer also checks the path identity from its own snapshot. An external
+retarget between ACP's check and the native snapshot is outside that check.
+
+First-time creation of `.aelix/settings.json` uses one standard
+`session/request_permission` card tied to the native confirm ID, operation,
+worker, binding, and cancellation generation. The two options are allow once
+and reject once. A refusal, Stop, binding retirement, or 45-second expiry
+leaves the file uncreated. Automatic permission modes cannot authorize
+creation. The approval covers file creation and project trust still applies.
+
+For tools and skills, native saves `defaultTools` or `skills` in
+`.aelix/settings.json`. The effect is `next_request`. A confirmed save can
+return `accepted:true` with `apply.applied:false`, including a deferred apply.
+Refresh the list to confirm applied state and surface mismatches alongside the
+saved result. An explicit tool override, including `[]`, is restored and
+verified under the same mutation lock before replying to an immediate tool
+apply. If native defers a tool apply while an override exists, reopen the
+session before prompting so startup can apply that override to the saved
+defaults. The override is still stored in the session preferences.
+
+MCP edits `mcpServers.<name>.enabled` in the project `.aelix/mcp.json` when
+that file is in effect. The project file replaces the global MCP file as a
+whole. The native writer requires an existing file. MCP saves return
+`effect:"restart"` and `apply:null`. Close and load the same session on a
+new worker, then list again to check the applied and live values.
+
+### Restoring inheritance proposal
+
+The pinned native `selections/set` accepts boolean edits. Its tool and skill
+editors can sometimes drop a selector while setting a boolean. Equal
+effective values are skipped, so a boolean write cannot guarantee removal of a
+scope's override. An omitted MCP `enabled` defaults to true within the
+effective file.
+
+For D16 v1.1, advertise supported kinds with `selectionUnsetKinds` and
+extend a change entry with the disjoint form `{key,unset:true}`. Start with
+tool and skill. Native would remove that row's explicit selector under the
+existing scope lock, then re-evaluate it from the lower-priority scope or
+defaults. It would refuse an unset when a shared pattern or replacing list
+still decides the row or removing it would change unrelated rows. An absent
+override is an idempotent no-op, including when the file does not exist.
+ACP would forward project unsets through the same receipt and apply path. The
+global helper would use its existing expected-revision check and lock. Studio
+would offer “Restore inherited value” for advertised kinds and confirm the
+source on a fresh list. MCP needs a separate per-server inheritance contract.
 
 ## Management
 

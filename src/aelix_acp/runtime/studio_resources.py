@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 
 from . import profile_reselection as reselection
+from . import studio_selections as selections
 from .profile_refs import (DisplayTooLarge, catalog_description, file_identity, preview, public_preview, source_label,
                            text_list, valid_name, valid_ref)
 from ..wire.errors import BackendError, ProtocolError
@@ -43,6 +44,7 @@ class StudioResources:
         self.retired_binding = None
         self.profile_operation = None
         self.tool_operation = None
+        self.selection_operation = None
         self.restore_operation = None
 
     def binding(self):
@@ -50,7 +52,7 @@ class StudioResources:
         return self.starting_binding or (relay.binding_id if relay is not None else None)
 
     def retire_approval(self):
-        operation = self.profile_operation or self.tool_operation or self.restore_operation
+        operation = self.profile_operation or self.tool_operation or self.selection_operation or self.restore_operation
         if operation is not None:
             operation.retire()
 
@@ -68,6 +70,10 @@ class StudioResources:
         supported = self.session.controls.capabilities.get("methods", [])
         return all(method in supported for method in methods)
 
+    def supports_selection(self, kind, *methods):
+        kinds = self.session.controls.capabilities.get("selectionKinds")
+        return isinstance(kinds, list) and kind in kinds and self.supports(*methods)
+
     def guarded(self):
         version = self.session.controls.capabilities.get("profileRefGuard")
         return type(version) is int and version == 1 and self.supports("agents/show", "agents/use")
@@ -78,7 +84,111 @@ class StudioResources:
 
     def invalidate_pages(self):
         if relay := self.session.input_relay:
-            relay.invalidate_profile_pages()
+            relay.invalidate_list_pages()
+
+    async def selections_catalog(self, kind):
+        if not self.supports_selection(kind, selections.LIST):
+            return refusal("unsupported")
+        if self.selection_operation is not None:
+            return refusal("busy")
+        try:
+            data = await self.rpc(selections.LIST, kind=kind)
+            rows = selections.check_snapshot(kind, data)
+            scopes = data["scopes"]
+            target = selections.project_target(self.session, kind, scopes)
+            public_scopes = {scope: selections.exposed_scope(kind, scope, scopes[scope], target is not None)
+                             for scope in ("global", "project")}
+            tools, active = set(), None
+            if kind == "tool":
+                resources = await self.rpc("resources/list")
+                active = resources["activeTools"]
+                if not text_list(active):
+                    raise ValueError("Invalid active tools response")
+                tools = {tool["name"] for tool in resources["tools"]}
+            pending = data["policyPending"]
+            if type(pending) is not bool:
+                raise ValueError("Invalid selection policy status")
+            items = [selections.public_row(kind, rows[key], tools)
+                     for key in sorted(rows, key=lambda key: key.encode("utf-8"))]
+        except (BackendError, KeyError, TypeError, ValueError):
+            return refusal("unreadable")
+        return {"kind": kind, "effect": selections.EFFECTS[kind], "scopes": public_scopes, "items": items,
+                "policyPending": pending, "diagnostics": [
+                    {"code": "native-problem", "key": None, "source": None} for _ in data["problems"]],
+                "toolOverride": self.session.active_tools if kind == "tool" else None, "activeTools": active}
+
+    async def set_selections(self, value, fits, operation):
+        kind, changes = value["kind"], value["changes"]
+        if not self.supports_selection(kind, selections.LIST, selections.SET):
+            return refusal("unsupported")
+        self.selection_operation = operation
+        self.invalidate_pages()
+        try:
+            return await self._set_selections(value, kind, changes, fits, operation)
+        finally:
+            if operation.permission is not None:
+                operation.permission.cancel()
+            self.selection_operation = None
+            self.invalidate_pages()
+
+    async def _set_selections(self, value, kind, changes, fits, operation):
+        try:
+            data = await self.rpc(selections.LIST, kind=kind)
+            rows = selections.check_snapshot(kind, data)
+            scopes = data["scopes"]
+            target = selections.project_target(self.session, kind, scopes)
+            project = selections.exposed_scope(kind, "project", scopes["project"], target is not None)
+            for edit in changes:
+                key = edit["key"]
+                row = rows.get(key)
+                if row is None:
+                    return refusal("selection-missing", scope="project", written=[],
+                                   mismatches=[{"key": key, "reason": "missing"}])
+                if row["lock"] is not None or row["role"] != "item" or row["refusal"] is not None:
+                    return refusal("selection-locked", scope="project", written=[],
+                                   mismatches=[{"key": key, "reason": "locked"}])
+        except (BackendError, KeyError, TypeError, ValueError):
+            return refusal("unreadable")
+        operation.require_current()
+        if not project["writable"]:
+            return refusal("scope-readonly", scope="project", written=[])
+        if not project["exists"] and (self.session.controls.permission_mode != "default"
+                                      or not self.supports("ui/enable")):
+            return refusal("consent-required", cause="unanswered", scope="project", written=[])
+        operation.target, operation.scopes = target, scopes
+        try:
+            native = await self.session.rpc(
+                "aelix_control", method=selections.SET, params={"scope": "project", **value},
+                _before_native_write=operation.before_write, _selection_write=operation, _timeout=90,
+            )
+        except BackendError as error:
+            reason = getattr(error, "studio_selection_refusal", None)
+            if reason is None or (reason == "cancelled" and operation.confirmation_sent):
+                raise
+            operation.no_effect = True
+            if reason == "cancelled":
+                if not project["exists"] or operation.confirm_id is not None:
+                    return refusal("consent-required", cause="cancelled", scope="project", written=[])
+                return refusal("cancelled")
+            if reason == "consent-required":
+                return refusal(reason, cause=operation.consent_cause or "unanswered",
+                               scope="project", written=[])
+            if reason == "scope-readonly":
+                return refusal(reason, scope="project", written=[])
+            return refusal(reason)
+        operation.require_current()
+        result = selections.project_readback(kind, native, rows, target, changes)
+        if kind == "tool" and self.session.active_tools is not None:
+            if result["apply"]["deferred"]:
+                # A native deferred apply can still turn tools back on after
+                # a repair RPC. Reopen with the saved override before prompting.
+                self.mark_uncertain()
+            else:
+                await self.session.restore_tools(operation=operation)
+                operation.require_current()
+        if not fits(result):
+            raise internal_error()
+        return result
 
     def reset(self, preferences):
         self.recorded = reselection.recorded_profile(preferences)
