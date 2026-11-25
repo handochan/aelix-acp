@@ -441,7 +441,7 @@ def setup(api):
         with self.assertRaises(RuntimeError) as refused:
             await self.prompt("Respond")
         error = json.loads(str(refused.exception))
-        self.assertEqual(error["code"], -32602)
+        self.assertEqual(error["code"], -32004)
         self.assertEqual(error["data"], {"kind": "model_selection_required", "configId": "model",
                                          "availableModels": 2, "retryable": False})
         self.assertEqual(self.model_requests, [])

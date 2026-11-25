@@ -23,7 +23,7 @@ Aelix lacks these operations. Advertise client actions only after implementing t
    with `currentValue: ""` and `models.currentModelId: ""`; `""` is never a
    selectable value. `thinking_level` appears once a model is current, in the
    `config_option_update` that follows the selection. Model input (and
-   `/compact`) is refused before it reaches native with `-32602` and
+   `/compact`) is refused before it reaches native with `-32004` and
    `{kind:"model_selection_required", configId:"model", availableModels, retryable:false}`.
    With `availableModels: 0` there is no `model` option: configure a provider
    first. Slash commands still run, including `/model provider/id`. Native RPC
@@ -51,7 +51,8 @@ Reuse only for identical content. Completed duplicates return the stop result
 without repeating output; reload history if output was lost. `-32006` means
 unresolved effects: show history and require a deliberate new user action.
 Never silently retry with a fresh key. `-32008` is changed content under one
-key, `-32007` RPC timeout, `-32004` missing capability/client action,
+key, `-32007` RPC timeout, `-32004` missing capability/client action or an
+unmet session precondition (`model_selection_required`),
 `-32000` busy/limit, `-32003` denied management approval, `-32602`
 invalid parameters and `-32603` backend failure before native work started.
 Use `error.data`, not parsing human error messages, when details are provided.

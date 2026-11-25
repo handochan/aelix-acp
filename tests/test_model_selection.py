@@ -109,7 +109,7 @@ class NoCurrentModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("models", selectors)
         with self.assertRaises(ProtocolError) as refused:
             await self.prompt("Hello")
-        self.assertEqual(refused.exception.code, -32602)
+        self.assertEqual(refused.exception.code, -32004)
         self.assertEqual(refused.exception.data, {**REFUSAL, "availableModels": 0})
         self.assertIn("configure a provider", str(refused.exception))
 
@@ -149,7 +149,7 @@ class NoCurrentModelTests(unittest.IsolatedAsyncioTestCase):
         self.calls.clear()
         with self.assertRaises(ProtocolError) as refused:
             await self.prompt("Hello")
-        self.assertEqual(refused.exception.code, -32602)
+        self.assertEqual(refused.exception.code, -32004)
         self.assertEqual(refused.exception.data, REFUSAL)
         commands = [command for command, _kwargs in self.calls]
         self.assertNotIn("prompt", commands)

@@ -62,13 +62,15 @@ def fork_head_changed() -> ProtocolError:
 def model_selection_required(available: int) -> ProtocolError:
     """Model input while native has no current model, refused before native receives it.
 
-    `-32602` like other client-correctable refusals. The client sets the
-    advertised `model` option, or first configures a provider when none is
-    available (`availableModels: 0`, no `model` option).
+    `-32004` with structured `data`: the session cannot take model input until
+    the client meets a precondition (AionCore keeps `-32004` data as an
+    operation refusal, while `-32602` reaches it as bare invalid parameters).
+    The client sets the advertised `model` option, or first configures a
+    provider when none is available (`availableModels: 0`, no `model` option).
     """
     message = ("No model is selected; choose one with the model option, then send the prompt again" if available
                else "No model is available; configure a provider for Aelix, then choose a model")
-    return ProtocolError(message, -32602, {"kind": "model_selection_required", "configId": "model",
+    return ProtocolError(message, -32004, {"kind": "model_selection_required", "configId": "model",
                                            "availableModels": available, "retryable": False})
 
 
