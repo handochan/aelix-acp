@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import hmac
 import os
 from pathlib import Path
 import stat
@@ -16,6 +17,7 @@ CREATE_TITLE = "This creates .aelix/settings.json: the folder falls under projec
 CREATE_HINT = "next launch may ask; -p may need --approve"
 LOCK_REASONS = {"cli": "launch-locked", "profile": "profile-locked",
                 "shadowed": "shadowed", "unavailable": "unavailable"}
+OPAQUE_PREFIX = "selection:"
 
 
 class SelectionWrite(Operation):
@@ -198,7 +200,24 @@ def exposed_scope(kind, scope, status, safe_target):
     return {"exists": exists, "writable": writable, "reason": reason}
 
 
-def check_snapshot(kind, data):
+def path_bearing(value):
+    return "/" in value or "\\" in value or (len(value) > 1 and value[0].isascii()
+                                             and value[0].isalpha() and value[1] == ":")
+
+
+def public_key(secret, kind, key):
+    # Escape the token namespace too, so a literal native key cannot shadow a token.
+    if path_bearing(key) or key.startswith(OPAQUE_PREFIX):
+        digest = hmac.digest(secret, (kind + "\0" + key).encode("utf-8"), "sha256")
+        return OPAQUE_PREFIX + digest.hex()
+    return key
+
+
+def display_label(label):
+    return "Selection item" if path_bearing(label) else label
+
+
+def check_snapshot(kind, data, secret):
     if data["kind"] != kind or data["effect"] != EFFECTS[kind]:
         raise ValueError("Invalid selection snapshot")
     for field in ("items", "unreadable", "problems", "notices"):
@@ -208,16 +227,19 @@ def check_snapshot(kind, data):
         raise ValueError("Unreadable selection snapshot")
     rows = {}
     for row in data["items"]:
-        key = row["key"]
-        if not isinstance(key, str) or key in rows or not isinstance(row["label"], str):
+        if not isinstance(row["key"], str) or not isinstance(row["label"], str):
+            raise ValueError("Invalid selection row")
+        key = public_key(secret, kind, row["key"])
+        if key in rows:
             raise ValueError("Invalid selection row")
         rows[key] = row
     return rows
 
 
-def public_row(kind, row, tools):
-    result = {field: row[field] for field in ("key", "label", "role", "saved", "decidedBy",
+def public_row(kind, key, row, tools):
+    result = {field: row[field] for field in ("role", "saved", "decidedBy",
                                               "applied", "inForce", "live", "pending")}
+    result.update(key=key, label=display_label(row["label"]))
     if (result["role"] not in ("item", "placeholder", "info")
             or result["decidedBy"] not in ("global", "project", None)
             or any(type(result[field]) is not bool for field in ("saved", "applied", "inForce", "pending"))
@@ -230,7 +252,7 @@ def public_row(kind, row, tools):
             raise ValueError("Invalid selection lock")
         result["lock"] = {"kind": lock["kind"], "value": lock["value"],
                           "reason": LOCK_REASONS.get(lock["kind"], "locked")}
-    result["loaded"] = (result["role"] == "item" and result["key"] in tools
+    result["loaded"] = (result["role"] == "item" and row["key"] in tools
                         if kind == "tool" else result["applied"])
     result["problem"] = "native-problem" if row["problem"] is not None else None
     return result
@@ -274,6 +296,8 @@ def project_readback(kind, native, rows, target, changes):
             raise ValueError("Invalid selection apply response")
         if apply["warning"] is not None:
             apply["warning"] = "apply-warning" if apply["applied"] else "apply-failed"
+        for field in ("turnedOn", "turnedOff"):
+            apply[field] = [display_label(label) for label in apply[field]]
     return {
         "accepted": True, "scope": "project", "kind": kind, "effect": EFFECTS[kind],
         "written": [file_label(kind)] if native["written"] else [],

@@ -391,6 +391,8 @@ each snapshot to its session binding, method, and kind. Repeat `kind` on
 continuations. A cursor expires 60 seconds after the snapshot is taken.
 Replays before expiry return the same page. The reply budget includes the JSON
 envelope. A row or common header that cannot fit returns `result-too-large`.
+Path-bearing native row identifiers are projected as opaque keys scoped to the
+binding. Use the listed key in edits and read a new list after rebinding.
 
 Set accepts 1–1024 distinct, ordered `{key,on}` entries with boolean
 `on`. ACP checks each key and lock against a fresh native list and sends

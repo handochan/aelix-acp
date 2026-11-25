@@ -86,6 +86,9 @@ class StudioResources:
         if relay := self.session.input_relay:
             relay.invalidate_list_pages()
 
+    def selection_rows(self, kind, data):
+        return selections.check_snapshot(kind, data, self.session.input_relay.selection_key_secret)
+
     async def selections_catalog(self, kind):
         if not self.supports_selection(kind, selections.LIST):
             return refusal("unsupported")
@@ -93,7 +96,7 @@ class StudioResources:
             return refusal("busy")
         try:
             data = await self.rpc(selections.LIST, kind=kind)
-            rows = selections.check_snapshot(kind, data)
+            rows = self.selection_rows(kind, data)
             scopes = data["scopes"]
             target = selections.project_target(self.session, kind, scopes)
             public_scopes = {scope: selections.exposed_scope(kind, scope, scopes[scope], target is not None)
@@ -108,7 +111,7 @@ class StudioResources:
             pending = data["policyPending"]
             if type(pending) is not bool:
                 raise ValueError("Invalid selection policy status")
-            items = [selections.public_row(kind, rows[key], tools)
+            items = [selections.public_row(kind, key, rows[key], tools)
                      for key in sorted(rows, key=lambda key: key.encode("utf-8"))]
         except (BackendError, KeyError, TypeError, ValueError):
             return refusal("unreadable")
@@ -134,7 +137,7 @@ class StudioResources:
     async def _set_selections(self, value, kind, changes, fits, operation):
         try:
             data = await self.rpc(selections.LIST, kind=kind)
-            rows = selections.check_snapshot(kind, data)
+            rows = self.selection_rows(kind, data)
             scopes = data["scopes"]
             target = selections.project_target(self.session, kind, scopes)
             project = selections.exposed_scope(kind, "project", scopes["project"], target is not None)
@@ -156,9 +159,11 @@ class StudioResources:
                                       or not self.supports("ui/enable")):
             return refusal("consent-required", cause="unanswered", scope="project", written=[])
         operation.target = target
+        native_changes = [{"key": rows[edit["key"]]["key"], "on": edit["on"]} for edit in changes]
         try:
             native = await self.session.rpc(
-                "aelix_control", method=selections.SET, params={"scope": "project", **value},
+                "aelix_control", method=selections.SET,
+                params={"scope": "project", "kind": kind, "changes": native_changes},
                 _before_native_write=operation.before_write, _selection_write=operation, _timeout=90,
             )
         except selections.UnsafeTarget:

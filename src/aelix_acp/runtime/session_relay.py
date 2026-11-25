@@ -7,6 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass
 import hashlib
 import json
+import secrets
 import time
 import uuid
 
@@ -157,6 +158,7 @@ class SessionRelay:
     def __init__(self, session, binding_id, *, clock=time.monotonic):
         self.session = session
         self.binding_id = binding_id
+        self.selection_key_secret = secrets.token_bytes(32)
         self.clock = clock
         self.turn_id = None
         self.acquiring_images = False
@@ -468,7 +470,7 @@ class SessionRelay:
         for change in changes:
             require_fields(change, {"key", "on"})
             key = require_string(change["key"], "key")
-            if len(key) > 8192 or key in keys or type(change["on"]) is not bool:
+            if len(key) > 8192 or key in keys or studio_selections.path_bearing(key) or type(change["on"]) is not bool:
                 raise ProtocolError("Expected unique selection keys and boolean values")
             keys.add(key)
         return await self.resource_write(studio_selections.SET, {"kind": kind, "changes": changes},

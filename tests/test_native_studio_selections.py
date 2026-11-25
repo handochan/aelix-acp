@@ -135,6 +135,31 @@ class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((after["saved"], after["applied"], after["live"], after["pending"]),
                          (False, False, None, False))
 
+    def duplicate_skills(self):
+        for scope, root in (("user", self.agent), ("project", self.project)):
+            skill = root / "skills/review/SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(f"---\nname: review\ndescription: {scope} review\n---\nReview changes.\n",
+                             encoding="utf-8")
+        (self.project / "settings.json").write_text("{}\n", encoding="utf-8")
+
+    async def test_shadowed_native_skill_has_opaque_key_and_translates_for_write_validation(self):
+        self.duplicate_skills()
+        await self.start(trusted=True)
+        listing = await self.listing("skill")
+        self.assertNotIn(str(self.root), json.dumps(listing, ensure_ascii=False))
+        duplicates = [row for row in listing["items"] if row["label"] == "review"]
+        self.assertEqual(len(duplicates), 2)
+        shadowed = next(row for row in duplicates if row["lock"] and row["lock"]["kind"] == "shadowed")
+        key = shadowed["key"]
+        self.assertNotIn("/", key)
+        self.assertNotIn("\\", key)
+        self.assertNotEqual(key, "review")
+        self.assertIn(shadowed, (await self.listing("skill"))["items"])
+        result = await self.set_selection("skill", key, False, 8)
+        self.assertEqual(result, {"accepted": False, "reason": "selection-locked", "scope": "project",
+                                  "mismatches": [{"key": key, "reason": "locked"}], "written": []})
+
     async def test_mcp_project_file_takes_effect_on_worker_restart(self):
         script = self.root / "docs_server.py"
         script.write_text(
