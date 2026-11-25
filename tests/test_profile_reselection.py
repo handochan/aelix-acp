@@ -78,6 +78,11 @@ for line in sys.stdin:
         result = {"cancelled": False}
     elif name == "tools/set_active":
         tools = ["read"] if Path("wrong-restore-tools").exists() else params["names"]
+        if Path("pause-tool-ack").exists():
+            Path("tool-ack-blocked").touch()
+            deadline = time.monotonic() + 8
+            while Path("pause-tool-ack").exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
         result = {"activeTools": tools}
     elif name == "agents/show":
         if Path("pause-show").exists():
@@ -149,8 +154,19 @@ async def send(server, message, **kwargs):
                 await asyncio.sleep(0.005)
     return await original_send(server, message, **kwargs)
 
+original_dispatch = Server.dispatch
+async def dispatch(server, method, params, **kwargs):
+    if method == "fixture/require-compaction-recovery":
+        server.session(params).compaction_recovery_needed = True
+        return {}
+    if method == "fixture/receipt":
+        relay = server.session(params).input_relay
+        return await relay.lookup({"requestId": params["requestId"]})
+    return await original_dispatch(server, method, params, **kwargs)
+
 store._write_store = write_store
 Server.send = send
+Server.dispatch = dispatch
 main()
 """
 
@@ -582,3 +598,83 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(str(error.exception))["data"]["reason"], "outcome-unknown")
         self.assertEqual(self.preferences()["agentRef"]["scope"], "project")
         self.assertFalse(self.calls("prompt"))
+
+    async def start_with_gates(self):
+        await self.client.close()
+        self.client = await self.start_client(gates=True)
+        await self.load()
+
+    async def retire_before_release(self, pending, pause, blocked, *, busy_message):
+        try:
+            await self.wait_until(lambda: blocked.exists())
+            with self.assertRaisesRegex(RuntimeError, busy_message):
+                await self.client.request("session/load", {
+                    **self.open_params("b-replacement"), "sessionId": self.session,
+                })
+        finally:
+            pause.unlink(missing_ok=True)
+        return await pending
+
+    async def assert_failed_compaction_restart_recoverable(self, *, close_first):
+        await self.start_with_gates()
+        saved = self.preferences()
+        await self.client.request("fixture/require-compaction-recovery", {"sessionId": self.session})
+        pause = self.root / "pause-commit"
+        pause.touch()
+        pending = asyncio.create_task(self.client.request("session/prompt", {
+            "sessionId": self.session, "prompt": [{"type": "text", "text": "/tools"}],
+        }))
+        with self.assertRaises(RuntimeError) as failure:
+            await self.retire_before_release(pending, pause, self.root / "commit-blocked",
+                                             busy_message="already starting")
+        self.assertEqual(json.loads(str(failure.exception))["data"]["reason"], "outcome-unknown")
+        self.assertEqual(self.preferences(), saved)
+        if close_first:
+            self.assertEqual(await self.client.request("session/close", {"sessionId": self.session}), {})
+            with self.assertRaisesRegex(RuntimeError, "Unknown session"):
+                await self.client.request("session/prompt", {
+                    "sessionId": self.session, "prompt": [{"type": "text", "text": "/tools"}],
+                })
+        opened = await self.client.request("session/load", {
+            **self.open_params("b-fresh"), "sessionId": self.session,
+        })
+        self.assertEqual(opened["_meta"][META], {"bindingId": "b-fresh"})
+        self.assertEqual(await self.client.request("session/close", {"sessionId": self.session}), {})
+        self.assertFalse(self.calls("prompt"))
+
+    async def test_failed_compaction_restart_allows_fresh_load(self):
+        await self.assert_failed_compaction_restart_recoverable(close_first=False)
+
+    async def test_failed_compaction_restart_allows_close_then_load(self):
+        await self.assert_failed_compaction_restart_recoverable(close_first=True)
+
+    async def assert_retired_tool_write_is_unknown(self, pause_name, blocked_name):
+        await self.start_with_gates()
+        saved = self.preferences()
+        self.assertEqual(saved["activeTools"], [])
+        post = CASES["tools-set-active"]["post"]
+        pause = self.root / pause_name
+        pause.touch()
+        pending = asyncio.create_task(self.client.request(post["method"], {
+            "sessionId": self.session, "bindingId": "b-22", "payload": post["payload"],
+        }))
+        with self.assertRaises(RuntimeError) as error:
+            await self.retire_before_release(pending, pause, self.root / blocked_name,
+                                             busy_message="Session is busy")
+        self.assertEqual(json.loads(str(error.exception))["code"], -33100)
+        self.assertEqual(self.calls("tools/set_active")[-1], {"names": ["read"]})
+        self.assertEqual(self.preferences(), saved)
+        self.assertEqual(await self.client.request("fixture/receipt", {
+            "sessionId": self.session, "requestId": post["payload"]["requestId"],
+        }), CASES["lookup-unknown"]["result"])
+        with self.assertRaisesRegex(RuntimeError, "Reopen the session"):
+            await self.client.request("session/prompt", {
+                "sessionId": self.session, "prompt": [{"type": "text", "text": "/tools"}],
+            })
+        self.assertFalse(self.calls("prompt"))
+
+    async def test_tools_retired_after_native_apply_before_acknowledgement(self):
+        await self.assert_retired_tool_write_is_unknown("pause-tool-ack", "tool-ack-blocked")
+
+    async def test_tools_retired_before_sqlite_commit_admission(self):
+        await self.assert_retired_tool_write_is_unknown("pause-commit", "commit-blocked")

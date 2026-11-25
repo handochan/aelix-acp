@@ -672,7 +672,7 @@ class Session:
     async def save(self, inherited_history=None, *, live=False, managed_commit=False):
         before_commit = None
         if live:
-            operation = self.studio_resources.profile_operation
+            operation = self.studio_resources.profile_operation or self.studio_resources.tool_operation
             restore_operation = self.studio_resources.restore_operation
             if restore_operation is not None:
                 restore_operation.require_restore_current()
@@ -1524,7 +1524,6 @@ class Session:
                 await self.publish_context_usage()
                 await self.publish_recovery_warnings()
                 await self.save(live=True, managed_commit=managed_change is not None)
-                self.studio_resources.restore_operation = None
                 self.server.sessions[self.id] = self
             return snapshot
         except BaseException:
@@ -1536,6 +1535,9 @@ class Session:
             await self.close()
             raise
         finally:
+            # Compaction recovery retains the session handle even if the
+            # replacement worker closed. Its publication attempt has ended.
+            self.studio_resources.restore_operation = None
             self.extension_commit_started = False
             self.server.pending_stop_sessions.pop(self.id, None)
             self.server.starting_ids.discard(self.id)

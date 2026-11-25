@@ -42,6 +42,7 @@ class StudioResources:
         self.starting_binding = None
         self.retired_binding = None
         self.profile_operation = None
+        self.tool_operation = None
         self.restore_operation = None
 
     def binding(self):
@@ -49,7 +50,7 @@ class StudioResources:
         return self.starting_binding or (relay.binding_id if relay is not None else None)
 
     def retire_approval(self):
-        operation = self.profile_operation or self.restore_operation
+        operation = self.profile_operation or self.tool_operation or self.restore_operation
         if operation is not None:
             operation.retire()
 
@@ -408,6 +409,7 @@ class StudioResources:
                 return refusal("tool-unavailable", key=name)
         if not fits({"accepted": True, "toolOverride": names, "activeTools": names}):
             return refusal("result-too-large")
+        self.tool_operation = operation
         try:
             result = await self.rpc("tools/set_active", names=names, operation=operation)
             active = result.get("activeTools")
@@ -424,8 +426,10 @@ class StudioResources:
                 raise internal_error()
             if not self.tools_match(result, names):
                 raise internal_error()
+            operation.require_current()
             self.session.active_tools = active
             await self.session.save(live=True)
+            operation.require_current()
         except BackendError as error:
             key = getattr(error, "studio_tool_lock", None) or tool_lock_key(str(error))
             if key in names:
@@ -433,6 +437,7 @@ class StudioResources:
                 return refusal("tool-locked", key=key)
             raise
         finally:
+            self.tool_operation = None
             if operation.dispatched:
                 self.invalidate_pages()
         return {"accepted": True, "toolOverride": active, "activeTools": active}

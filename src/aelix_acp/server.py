@@ -500,6 +500,10 @@ class Server:
             raise ProtocolError("Session is busy", -32000)
         async with session.mutation_lock:
             await session.close()
+            # A failed compaction recovery can retain an already-closed
+            # session for retry. An explicit close releases that handle too.
+            if self.sessions.get(session.id) is session:
+                self.sessions.pop(session.id)
         return {}
 
     async def dispatch(self, method, params, *, response_id=None):
