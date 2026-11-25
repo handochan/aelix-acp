@@ -229,6 +229,7 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
 
         async def locked(*args, **kwargs):
             if kwargs["method"] == "tools/set_active":
+                kwargs["_before_native_write"]()
                 raise BackendError("Cannot turn on write: write is locked off for this run: fixture", "aelix_control")
             return await self.native(*args, **kwargs)
 

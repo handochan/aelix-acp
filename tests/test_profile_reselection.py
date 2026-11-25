@@ -72,6 +72,11 @@ for line in sys.stdin:
         mode = params["mode"]
         result = {"mode": mode}
     elif name == "resources/list":
+        if Path("pause-inventory").exists():
+            Path("inventory-blocked").touch()
+            deadline = time.monotonic() + 8
+            while Path("pause-inventory").exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
         result = {"tools": [{"name": "read"}], "activeTools": tools}
     elif name == "resources/reload":
         tools = ["read"]
@@ -188,7 +193,7 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.session = (await self.client.request("session/new", self.open_params("b-21")))["sessionId"]
         self.original = self.write_record()
 
-    async def start_client(self, *, manual=True, inherited_flag=False, gates=False):
+    async def start_client(self, *, manual=True, inherited_flag=False, gates=False, adapter_args=()):
         # Exercise future authenticated-host behavior only inside the fixture
         # process. The adapter itself has no configuration that grants it.
         fixture_hook = "r.host_verified_manual_approval=lambda operation: True;" if manual else ""
@@ -197,7 +202,7 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         client = await AcpClient.start(
             self.root, sys.executable, prefix=[str(self.script)], capabilities=initialize_offer()["clientCapabilities"],
             extra_env={MANUAL_APPROVAL_ENV: "1"} if inherited_flag else None,
-            entry=("-c", entry),
+            entry=("-c", entry), adapter_args=adapter_args,
         )
         self.addAsyncCleanup(client.close)
         return client
@@ -599,9 +604,9 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.preferences()["agentRef"]["scope"], "project")
         self.assertFalse(self.calls("prompt"))
 
-    async def start_with_gates(self):
+    async def start_with_gates(self, *, adapter_args=()):
         await self.client.close()
-        self.client = await self.start_client(gates=True)
+        self.client = await self.start_client(gates=True, adapter_args=adapter_args)
         await self.load()
 
     async def retire_before_release(self, pending, pause, blocked, *, busy_message):
@@ -615,8 +620,7 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
             pause.unlink(missing_ok=True)
         return await pending
 
-    async def assert_failed_compaction_restart_recoverable(self, *, close_first):
-        await self.start_with_gates()
+    async def fail_compaction_restart(self):
         saved = self.preferences()
         await self.client.request("fixture/require-compaction-recovery", {"sessionId": self.session})
         pause = self.root / "pause-commit"
@@ -629,6 +633,10 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
                                              busy_message="already starting")
         self.assertEqual(json.loads(str(failure.exception))["data"]["reason"], "outcome-unknown")
         self.assertEqual(self.preferences(), saved)
+
+    async def assert_failed_compaction_restart_recoverable(self, *, close_first):
+        await self.start_with_gates()
+        await self.fail_compaction_restart()
         if close_first:
             self.assertEqual(await self.client.request("session/close", {"sessionId": self.session}), {})
             with self.assertRaisesRegex(RuntimeError, "Unknown session"):
@@ -647,6 +655,36 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_compaction_restart_allows_close_then_load(self):
         await self.assert_failed_compaction_restart_recoverable(close_first=True)
+
+    async def test_delete_releases_the_retained_compaction_session_slot(self):
+        await self.start_with_gates(adapter_args=("--max-sessions", "1"))
+        await self.fail_compaction_restart()
+        self.assertEqual(await self.client.request("session/delete", {"sessionId": self.session}), {})
+        self.assertEqual((await self.client.request("session/list", {}))["sessions"], [])
+        opened = await self.client.request("session/new", self.open_params("b-new"))
+        self.assertNotEqual(opened["sessionId"], self.session)
+
+    async def test_close_retires_tool_write_during_inventory_preflight(self):
+        await self.start_with_gates()
+        saved = self.preferences()
+        prior_writes = self.calls("tools/set_active")
+        post = CASES["tools-set-active"]["post"]
+        pause = self.root / "pause-inventory"
+        pause.touch()
+        pending = asyncio.create_task(self.client.request(post["method"], {
+            "sessionId": self.session, "bindingId": "b-22", "payload": post["payload"],
+        }))
+        try:
+            await self.wait_until(lambda: (self.root / "inventory-blocked").exists())
+            with self.assertRaisesRegex(RuntimeError, "Session is busy"):
+                await self.client.request("session/close", {"sessionId": self.session})
+        finally:
+            pause.unlink(missing_ok=True)
+        with self.assertRaises(RuntimeError) as failure:
+            await pending
+        self.assertEqual(json.loads(str(failure.exception))["code"], -32004)
+        self.assertEqual(self.calls("tools/set_active"), prior_writes)
+        self.assertEqual(self.preferences(), saved)
 
     async def assert_retired_tool_write_is_unknown(self, pause_name, blocked_name):
         await self.start_with_gates()

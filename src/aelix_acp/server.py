@@ -708,6 +708,8 @@ class Server:
                         db.execute("DELETE FROM turns WHERE session_id=?", (session_id,))
 
                     await write_store(self.args.state_dir, delete_records)
+                    if live is not None and self.sessions.get(session_id) is live:
+                        self.sessions.pop(session_id)
             except BaseException:
                 if live and self.sessions.get(session_id) is live:
                     live.lease, lease = lease, None

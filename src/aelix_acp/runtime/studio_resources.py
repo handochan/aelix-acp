@@ -402,15 +402,16 @@ class StudioResources:
     async def set_tools(self, names, fits, operation):
         if not self.supports("resources/list", "tools/set_active"):
             return refusal("unsupported")
-        resources = await self.rpc("resources/list")
-        available = {tool["name"] for tool in resources["tools"]}
-        for name in names:
-            if name not in available:
-                return refusal("tool-unavailable", key=name)
-        if not fits({"accepted": True, "toolOverride": names, "activeTools": names}):
-            return refusal("result-too-large")
         self.tool_operation = operation
         try:
+            resources = await self.rpc("resources/list")
+            operation.require_current()
+            available = {tool["name"] for tool in resources["tools"]}
+            for name in names:
+                if name not in available:
+                    return refusal("tool-unavailable", key=name)
+            if not fits({"accepted": True, "toolOverride": names, "activeTools": names}):
+                return refusal("result-too-large")
             result = await self.rpc("tools/set_active", names=names, operation=operation)
             active = result.get("activeTools")
             if "accepted" in result and type(result["accepted"]) is not bool:
@@ -431,6 +432,8 @@ class StudioResources:
             await self.session.save(live=True)
             operation.require_current()
         except BackendError as error:
+            if not operation.dispatched:
+                raise
             key = getattr(error, "studio_tool_lock", None) or tool_lock_key(str(error))
             if key in names:
                 operation.no_effect = True
