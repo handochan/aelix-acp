@@ -18,6 +18,21 @@ Aelix lacks these operations. Advertise client actions only after implementing t
    use string `true`/`false`. Replace the catalog after model changes.
    `permission_mode` is `default` (Ask) or `yolo`. A `current_mode_update`
    follows every new/load response with the restored mode.
+   Native can run with no current model (no `defaultProvider`/`defaultModel`
+   and no `--model`). `model` is then still offered with the available models,
+   with `currentValue: ""` and `models.currentModelId: ""`; `""` is never a
+   selectable value. Read the selection from `currentValue`: AionCore's derived
+   model catalog shows an empty current value as its first (or desired) model,
+   while its reconcile compares the raw `""`. `thinking_level` appears once a
+   model is current, in the `config_option_update` that follows the selection.
+   Model input (and `/compact`) is refused before it reaches native with
+   `-32004` and
+   `{kind:"model_selection_required", configId:"model", availableModels, retryable:false}`,
+   after a catalog that changed meanwhile is published.
+   With `availableModels: 0` there is no `model` option: configure a provider
+   first. Slash commands still run, including `/model provider/id`. Native RPC
+   `set_model` does not store a default model, so each new session starts
+   unselected; load, worker restart and fork restore the session's own choice.
 5. Render available commands, text/thought chunks, tool calls, updates, status,
    raw input/output and file locations. Answer `session/request_permission`
    with a listed option ID. Dismissal denies/cancels.
@@ -37,10 +52,15 @@ Generate a stable turn ID before first send:
 ```
 
 Reuse only for identical content. Completed duplicates return the stop result
-without repeating output; reload history if output was lost. `-32006` means
-unresolved effects: show history and require a deliberate new user action.
+without repeating output; reload history if output was lost. A refusal before
+native work (`-32602`, `-32004`, `-32601`) is recorded too and replayed for the
+same key and content, even after its cause is fixed: after choosing a model for
+a `model_selection_required` refusal, send the prompt with a new request ID.
+`-32006` means unresolved effects: show history and require a deliberate new
+user action.
 Never silently retry with a fresh key. `-32008` is changed content under one
-key, `-32007` RPC timeout, `-32004` missing capability/client action,
+key, `-32007` RPC timeout, `-32004` missing capability/client action or an
+unmet session precondition (`model_selection_required`),
 `-32000` busy/limit, `-32003` denied management approval, `-32602`
 invalid parameters and `-32603` backend failure before native work started.
 Use `error.data`, not parsing human error messages, when details are provided.

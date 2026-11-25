@@ -254,6 +254,8 @@ class Session:
             preferences = load_preferences(self.server.db, self.id)
         self.fork_projection = preferences.get("forkProjection") is True
         self.fork_head = preferences.get("forkHead")
+        config = preferences.get("config", {})
+        self.saved_config = config if isinstance(config, dict) else {}  # start() refuses a malformed one.
         self.active_tools = preferences.get("activeTools")
         if self.active_tools is not None and (not isinstance(self.active_tools, list) or any(not isinstance(name, str) for name in self.active_tools)):
             raise ProtocolError("Invalid saved tool selection")
@@ -441,8 +443,8 @@ class Session:
         # them. The empty branch still relies on its cached pre-turn choices.
         native_has_history = resume_file and self.state.get("messageCount", self.state.get("message_count")) != 0
         restored_selectors = {
-            option["id"]: option["currentValue"] for option in self.controls.options()
-            if option["id"] in NATIVE_SESSION_SELECTORS
+            config_id: value for config_id, value in self.controls.selections().items()
+            if config_id in NATIVE_SESSION_SELECTORS
         } if native_has_history else {}
         # A saved profile or tool selection restricts authority. Refuse rather
         # than resume with the runtime's broader defaults; check before client
@@ -492,7 +494,9 @@ class Session:
                 if not option or config[config_id] not in [entry["value"] for entry in option["options"]]:
                     self.recovery_warnings.append({"kind": "config_unavailable", "configId": config_id,
                         "previousValue": config[config_id], "message": f"Saved {config_id} is unavailable; using the native runtime's current selection."})
-                elif not (native_has_history and config_id in NATIVE_SESSION_SELECTORS):
+                elif config_id not in restored_selectors:
+                    # A selection native's history restored wins. With none (no
+                    # history, or native resumed without a model) the saved one applies.
                     await self.controls.set(config_id, config[config_id], publish=False)
         metadata = getattr(self.server, "client_capabilities", {}).get("_meta", {})
         if metadata.get("aelix/clientActions") is True and "ui/enable" in methods:
@@ -651,8 +655,14 @@ class Session:
             self.fork_projection = True
         row = (self.id, self.cwd, self.server.args.profile, self.state.get("sessionFile"),
                self.state.get("sessionName") or f"Aelix {self.server.args.profile}", int(time.time()))
+        config = self.controls.selections()
+        if not self.controls.model_selected():
+            # Native has no model, e.g. the saved one is unavailable right now. Keep
+            # the saved model and reasoning choice so a later start can restore them.
+            config.update({config_id: value for config_id, value in self.saved_config.items()
+                           if config_id in NATIVE_SESSION_SELECTORS and config_id not in config})
         preferences = {"permission_mode": self.controls.permission_mode, "extensions": self.extra_extensions,
-            "config": {option["id"]: option["currentValue"] for option in self.controls.options()},
+            "config": config,
             **({"extensionOverrides": self.extension_overrides} if self.extension_overrides else {}),
             "lastContextMeasurement": self.context.last_measurement,
             "agent": self.controls.capabilities.get("activeAgent"),
@@ -663,6 +673,7 @@ class Session:
             "backendMessageCount": self.state.get("messageCount", self.state.get("message_count", 0))}
         await write_store(self.server.args.state_dir, save_session, row, preferences, inherited_history,
                           before_commit=before_commit)
+        self.saved_config = config
         if live:
             self.require_live_worker(worker, committed=True)
 
@@ -1688,6 +1699,10 @@ class Session:
                 not text_only or "[[AION_FILES]]" in map(str.strip, instructions.splitlines())):
             raise ProtocolError("/compact accepts text instructions only")
         command = text.partition(" ")[0].removeprefix("/") if text_only and text.startswith("/") else ""
+        if instructions is not None or not (text_only and text.startswith("/")):
+            # Model input (and /compact) without a model is refused before the
+            # input is recorded; slash commands run, as /model can select one.
+            await self.controls.require_model()
         adapter_input = instructions is not None or ALIASES.get(command, command) in BUILTINS
         tracked_input = transcript.supported(self.controls.capabilities) and (adapter_input or bool(command))
         first_input = self.adapter_event_sequence + 1
@@ -1726,6 +1741,7 @@ class Session:
                 text = prepared
         if self.cancelled:
             return {"stopReason": "cancelled"}
+        await self.controls.require_model()  # A template or skill expansion is model input too.
         return await self.drive_turn(
             lambda: self.rpc("prompt", message=text, **({"images": images} if images else {})),
             input_relay=self.input_relay,

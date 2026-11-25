@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import contextlib
 
-from ..wire.errors import ProtocolError
+from ..wire.errors import ProtocolError, model_selection_required
 
 # Ask/Yolo is the accepted product scope. Native also has plan, auto-accept-edits
 # and auto, but their headless RPC behavior has not been accepted for Studio.
@@ -13,6 +13,14 @@ PERMISSION_MODES = (
 )
 MODE_IDS = frozenset(mode for mode, _name, _description in PERMISSION_MODES)
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+# Native runs on an empty placeholder when nothing chose a model (no
+# defaultProvider/defaultModel and no --model). ACP still requires a select's
+# currentValue: "" means nothing is selected. It is never a provider/id key, so
+# it is never selectable. Studio's renderer treats it as unset. AionCore keeps it
+# as the observed value (reconcile still applies a stored choice) and its resume
+# paths drop an empty model id, but its derived model catalog maps "" to the
+# first or desired model (non_empty_or_first, preserve_desired_model_in_catalog).
+UNSELECTED = ""
 
 
 def model_key(model: dict) -> str:
@@ -70,13 +78,16 @@ class SessionControls:
                         for value, name, description in PERMISSION_MODES],
         }]
         current = state.get("model") or {}
-        if current.get("id"):
+        current_value, choices = self.model_choices()
+        if choices:
             options.append({
                 "id": "model", "name": "Model", "category": "model", "type": "select",
-                "currentValue": model_key(current),
+                "currentValue": current_value,
                 "options": [{"value": model_key(m), "name": m.get("name") or m["id"],
-                             "description": m.get("provider", "")} for m in self.models or [current]],
+                             "description": m.get("provider", "")} for m in choices],
             })
+        # Reasoning levels belong to a model; none are offered before one is current.
+        if self.model_selected():
             levels = thinking_levels(current, self.capabilities)
             actual_level = state.get("thinkingLevel", state.get("thinking_level", "off"))
             if actual_level not in levels:
@@ -99,7 +110,6 @@ class SessionControls:
         return options
 
     def selectors(self) -> dict:
-        state = self.session.state
         result = {"configOptions": self.options(), "modes": {
             "currentModeId": self.permission_mode,
             "availableModes": [{"id": value, "name": name, "description": description}
@@ -107,12 +117,45 @@ class SessionControls:
         }, "_meta": {"aelix/permission": {
             "nativeMode": self.native_mode, "approvalPolicy": "ask" if self.permission_mode == "default" else "yolo",
             "appliesAt": "immediate", "nativePostureObservation": "permissions/get"}}}
-        current = state.get("model") or {}
-        if current.get("id"):
-            result["models"] = {"currentModelId": model_key(current), "availableModels": [
+        current_value, choices = self.model_choices()
+        if choices:
+            result["models"] = {"currentModelId": current_value, "availableModels": [
                 {"modelId": model_key(m), "name": m.get("name") or m["id"], "description": m.get("provider", "")}
-                for m in self.models or [current]]}
+                for m in choices]}
         return result
+
+    def model_selected(self) -> bool:
+        return bool((self.session.state.get("model") or {}).get("id"))
+
+    def model_choices(self) -> tuple[str, list[dict]]:
+        """The model selector's current value and entries, also with no current model."""
+        current = self.session.state.get("model") or {}
+        if not self.model_selected():
+            return UNSELECTED, self.models
+        return model_key(current), self.models or [current]
+
+    def selections(self) -> dict:
+        """Option values to save and restore. An unselected model is not a selection."""
+        return {option["id"]: option["currentValue"] for option in self.options()
+                if not (option["id"] == "model" and option["currentValue"] == UNSELECTED)}
+
+    async def require_model(self) -> None:
+        """Refuse model input while native reports that it has no current model.
+
+        Native refuses such a prompt itself ("No model selected", aelix-ai
+        runnable_models.turn_refusal) with CLI advice a client cannot follow;
+        this names the option to set instead. A state without a model field is
+        no evidence, and the state is read again before refusing. A catalog that
+        changed meanwhile (a model, or models to choose from) is published first.
+        """
+        if "model" not in self.session.state or self.model_selected():
+            return
+        published = self.options()
+        await self.refresh()
+        if self.options() != published:
+            await self.session.update({"sessionUpdate": "config_option_update", "configOptions": self.options()})
+        if not self.model_selected():
+            raise model_selection_required(len(self.models))
 
     async def set(self, config_id: str, value: str, *, publish=True) -> dict:
         option = next((option for option in self.options() if option["id"] == config_id), None)
