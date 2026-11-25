@@ -214,6 +214,7 @@ class Session:
         self.tool_arrived = asyncio.Event()
         self.subagents = SubagentTracker()
         self.recovery_warnings = []
+        self.load_display_frames = None
         self.permissions = set()
         self.permission_connections = set()
         self.ui_tasks = set()
@@ -1268,7 +1269,11 @@ class Session:
         """
         message = {"jsonrpc": "2.0", "method": method, "params": params}
         if not self.ending:
-            await self.server.send(message)
+            if (self.load_display_frames is not None and method == "session/update"
+                    and params["update"].get("sessionUpdate") in transcript.DISPLAY_UPDATES):
+                await self.server.send(message, display_count=self.load_display_frames)
+            else:
+                await self.server.send(message)
         elif not getattr(self.server, "closing", False) and self.server.sessions.get(self.id) is self:
             with contextlib.suppress(ConnectionError, OSError):
                 await self.server.send(message)

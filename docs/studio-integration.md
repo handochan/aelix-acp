@@ -167,9 +167,24 @@ snapshot marker in the successful load result:
 ```json
 {"_meta": {"aelix/transcript": {
   "version": 1, "nativeSessionId": "native-123", "leafId": "c8434a01",
-  "totalMessages": 4, "recovered": false
+  "totalMessages": 4, "totalFrames": 4, "recovered": false
 }}}
 ```
+
+The optional nonnegative integer `totalFrames` counts the display
+`session/update` notifications emitted during the completed load, including native
+parts, synthetic tool cards, adapter display updates and recovery warnings.
+It excludes lifecycle updates such as the command catalog and context usage. When present,
+the client must check that it received that many replay frames. Older
+adapters can omit it, so clients still verify the native entry count and
+contiguous parts. A present marker with a frame count mismatch gives the host
+no snapshot to apply.
+
+A replayed prompt-failure entry counts as one display frame. Protected replay
+keeps the stored adapter coordinates when it replaces the diagnostic text
+with `Request failed.` Legacy failure entries without adapter coordinates
+are available through legacy replay. Structured provider causes belong to
+`session/prompt` error replies and are outside the load projection.
 
 The durable key is `(nativeSessionId, entryId)`. Sequence is the one-based
 native message ordinal on the selected path. Siblings can share an ordinal,
@@ -238,7 +253,11 @@ snapshot when their late progress reached the same live raw-ID card.
 Tool progress retains `_meta["aelix/subagents"]` and the negotiated nested
 tool metadata. With `aelix/nestedToolCalls`, ACP also replays recorded
 standalone synthetic parent cards and their nested tool updates, including
-when the native snapshot is empty.
+when the native snapshot is empty. Those replay frames have adapter
+coordinates derived from their stored event positions. They retain their
+identities across repeated loads and adapter restarts. If a child reuses a
+tool ID after the previous call ends, replay gives each occurrence its own
+card ID and routes tool updates to the corresponding card.
 
 ### First load of an existing Studio conversation
 
@@ -247,11 +266,14 @@ the old display history as an archive, then rebuilds the active native-backed
 portion from the complete projection, keyed by native IDs. Merge or replace
 by those keys on subsequent loads. Preserve application-owned messages,
 ACP-only updates and tool metadata with a verified card association. Adapter
-display events carry `source: "adapter"` when ACP can identify them. They
-have their own stable `eventId` and retain their recorded order. Their
-`sequence` is local to the adapter `bindingId`, in a separate namespace
-from native message sequence. Ambiguous
-legacy content remains in the archive. The host can retain its prior clean
+display events carry `source: "adapter"` and retain their recorded order.
+Treat their opaque `eventId` as a display-event key. Their `sequence` is scoped
+to the adapter `bindingId` and can have gaps. Adapter events count toward
+`totalFrames`. They have no native `entryId` and do not count toward
+`totalMessages`. Keep native keys and ordinals in their own namespace. Fold
+tool card creates and updates by `toolCallId`, and use the adapter coordinates
+to identify the individual frames across replays. Ambiguous legacy content
+remains in the archive. The host can retain its prior clean
 view when a load reports recovery. Keep composer echoes provisional and
 avoid inserting them again as native user messages. Older assistant chunking,
 formatted user echoes, images, tool output formatting, and old branch or

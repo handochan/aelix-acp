@@ -23,9 +23,9 @@ from .image_policy import VERIFIED_IMAGE_POLICIES
 from . import __version__
 from .wire.errors import (ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH,
                           fork_head_changed, require_object, require_string)
-from .runtime.store import (open_store, load_preferences, history, legacy_permission_mode,
-                            save_preferences, cache_recovered_history, display_recorded_update, with_assistant_origin,
-                            write_store)
+from .runtime.store import (open_store, load_preferences, history_records, legacy_permission_mode,
+                            save_preferences, cache_recovered_history, display_recorded_update,
+                            with_assistant_origin, write_store)
 from .runtime.controls import MODE_IDS
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
@@ -100,10 +100,10 @@ class Server:
         self.run_task = None
         self.managed_extensions = getattr(args, "managed_extensions", None)
 
-    async def send(self, message, *, before_send=None):
-        await self._send_frame(message, before_send=before_send)
+    async def send(self, message, *, before_send=None, display_count=None):
+        await self._send_frame(message, before_send=before_send, display_count=display_count)
 
-    async def _send_frame(self, payload, *, before_send=None):
+    async def _send_frame(self, payload, *, before_send=None, display_count=None):
         async with self.output_lock:
             if self.output_error is not None:
                 raise self.output_error
@@ -112,7 +112,14 @@ class Server:
             raw = payload if isinstance(payload, bytes) else encode_frame(payload)
             if self.output is None:
                 self.output = StdoutWriter(on_failure=self.output_failed)
-            if before_send is None:
+            if display_count is not None:
+                # This display frame remains queued if its waiter is
+                # cancelled. Count it before releasing the encoding lock.
+                def count_queued_frame():
+                    display_count["totalFrames"] += 1
+
+                await self.output.write(raw, after_queue=count_queued_frame)
+            elif before_send is None:
                 await self.output.write(raw)
             else:
                 await self.output.write(raw, before_queue=before_send)
@@ -390,22 +397,23 @@ class Server:
 
     async def replay_history(self, session):
         await session.live_history.flush()
-        recorded = (display_recorded_update(update, protected=session.private_host)
-                    for update in history(self.db, session.id))
+        recorded = ((store, sequence, display_recorded_update(update, protected=session.private_host))
+                    for store, sequence, update in history_records(self.db, session.id))
         nesting = session.declares(NESTED_TOOL_CALLS)
         if session.transcript_enabled():
             snapshot = await transcript.read(
                 session.rpc, lambda message: self.native_message_updates(session, message, canonical=True))
             session.require_live_worker()
-            async for update in transcript.reconcile(snapshot, recorded, nesting=nesting):
+            async for update in transcript.reconcile(snapshot, recorded, session_id=session.id, nesting=nesting):
                 if session.private_host:
                     update = {key: value for key, value in update.items() if key != "rawOutput"}
                 await session.notify("session/update", {"sessionId": session.id, "update": update})
                 await asyncio.sleep(0)
             return snapshot.marker
-        recorded = (transcript.display_update(update) for update in recorded if transcript.result_link(update) is None)
-        if (first := next(recorded, None)) is not None:
-            for update in chain((first,), recorded):
+        display = (transcript.display_update(update) for _, _, update in recorded
+                   if transcript.result_link(update) is None)
+        if (first := next(display, None)) is not None:
+            for update in chain((first,), display):
                 if not nesting and nested_only(update):
                     continue
                 if session.private_host:
@@ -657,6 +665,8 @@ class Server:
                 if method == "session/load":
                     self.pending_stop_sessions[session_id] = session
                     session.studio_resources.starting_binding = binding_id
+                    if transcript.offered(getattr(self, "client_capabilities", {})):
+                        session.load_display_frames = {"totalFrames": 0}
                 if previous:
                     self.sessions.pop(session_id, None)
                     await previous.close()
@@ -684,7 +694,10 @@ class Server:
                 self.starting_ids.discard(session_id)
             result = {**session.selectors(), **({"sessionId": session_id} if method.endswith("new") else {})}
             if snapshot is not None:
-                result["_meta"][transcript.META] = snapshot
+                session.load_display_frames.update(snapshot)
+                result["_meta"][transcript.META] = session.load_display_frames
+            else:
+                session.load_display_frames = None
             return session_relay.bind_session(session, result, binding_id)
         if method == "session/close":
             return await self.close_session(self.session(params))
@@ -886,6 +899,9 @@ class Server:
                 if resources is not None:
                     resources.starting_binding = None
                 if session:
+                    marker = (result.get("_meta") or {}).get(transcript.META)
+                    if marker is not None and marker is session.load_display_frames:
+                        session.load_display_frames = None
                     # Follows the open response, so the host observes the restored policy.
                     await session.update({"sessionUpdate": "current_mode_update",
                                           "currentModeId": session.controls.permission_mode})
