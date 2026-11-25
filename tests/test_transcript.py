@@ -5,6 +5,7 @@ import json
 import unittest
 
 from aelix_acp.runtime import transcript
+from aelix_acp.runtime.children import CHILD_META
 from aelix_acp.wire.errors import ProtocolError
 
 
@@ -27,6 +28,10 @@ def project(message):
 
 def part(offset, total, data):
     return {"offset": offset, "totalBytes": total, "base64": base64.b64encode(data).decode()}
+
+
+def records(updates):
+    return (("events", sequence, update) for sequence, update in enumerate(updates, 1))
 
 
 class TranscriptPageTests(unittest.IsolatedAsyncioTestCase):
@@ -53,7 +58,7 @@ class TranscriptPageTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(snapshot.marker, {"version": 1, "nativeSessionId": "native", "leafId": "tail",
                                            "totalMessages": 3, "recovered": False})
-        updates = [update async for update in transcript.reconcile(snapshot, (), nesting=False)]
+        updates = [update async for update in transcript.reconcile(snapshot, (), session_id="acp", nesting=False)]
         self.assertEqual([update["content"]["text"] for update in updates],
                          ["first", message, "[Native message unavailable.]"])
         self.assertEqual([update["_meta"][transcript.META]["entryId"] for update in updates],
@@ -82,6 +87,23 @@ class TranscriptPageTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TranscriptToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_nested_replay_links_updates_to_the_correct_recreated_parent(self):
+        parent = "aelix-child:child"
+        child = "child:tool"
+        parent_start = {"sessionUpdate": "tool_call", "toolCallId": parent, "_meta": {CHILD_META: {}}}
+        child_start = {"sessionUpdate": "tool_call", "toolCallId": child, "_meta": {"parentToolCallId": parent}}
+        child_end = {**child_start, "sessionUpdate": "tool_call_update", "status": "completed"}
+        snapshot = transcript.Snapshot({"nativeSessionId": "native"}, [])
+        replay = [update async for update in transcript.reconcile(
+            snapshot, records([parent_start, child_start, child_end] * 2), session_id="acp", nesting=True)]
+        first_parent, first_child, first_end, second_parent, second_child, second_end = replay
+        self.assertNotEqual(first_parent["toolCallId"], second_parent["toolCallId"])
+        self.assertNotEqual(first_child["toolCallId"], second_child["toolCallId"])
+        self.assertEqual(first_end["toolCallId"], first_child["toolCallId"])
+        self.assertEqual(second_end["toolCallId"], second_child["toolCallId"])
+        for frame in (second_child, second_end):
+            self.assertEqual(frame["_meta"]["parentToolCallId"], second_parent["toolCallId"])
+
     async def test_duplicate_raw_tool_ids_do_not_merge_distinct_results(self):
         call = {"sessionUpdate": "tool_call", "toolCallId": "same", "status": "in_progress"}
         result = {"sessionUpdate": "tool_call_update", "toolCallId": "same", "status": "completed"}
@@ -106,7 +128,7 @@ class TranscriptToolTests(unittest.IsolatedAsyncioTestCase):
                 transcript.recorded_result("same", origin, {"nativeSessionId": "native", "entryId": str(end_seq)}),
             ])
         recorded.append({**result, "_meta": {"aelix/subagents": {"children": [{"id": "ambiguous-late-child"}]}}})
-        updates = [update async for update in transcript.reconcile(snapshot, recorded, nesting=True)]
+        updates = [update async for update in transcript.reconcile(snapshot, records(recorded), session_id="acp", nesting=True)]
         tool_ids = [update["toolCallId"] for update in updates]
         self.assertEqual(tool_ids[0], tool_ids[1])
         self.assertEqual(tool_ids[2], tool_ids[3])
@@ -115,6 +137,28 @@ class TranscriptToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([update["_meta"]["aelix/subagents"] for update in updates],
                          [progress[0], progress[0], progress[1], progress[1]])
         self.assertTrue(all(set(update["_meta"]) == {transcript.META, "aelix/subagents"} for update in updates))
+
+    async def test_nested_replay_distinguishes_a_native_and_synthetic_parent_with_the_same_id(self):
+        parent = "aelix-child:standalone"
+        native = {"sessionUpdate": "tool_call", "toolCallId": parent, "title": "agent"}
+        synthetic = {"sessionUpdate": "tool_call", "toolCallId": parent,
+                     "_meta": {CHILD_META: {"id": "standalone"}}}
+        started = {**native, "_meta": {transcript.TOOL_ORIGIN_META: {"nativeSessionId": "native", "entryId": "entry"}}}
+
+        def nested(child):
+            return {"sessionUpdate": "tool_call", "toolCallId": f"{child}:tool",
+                    "_meta": {"parentToolCallId": parent, CHILD_META: {"id": child}}}
+
+        snapshot = transcript.Snapshot({"nativeSessionId": "native"}, [
+            transcript.Row(transcript.position(row(1, "entry")), "assistant", [native])])
+        ambiguous = {**nested("legacy"), "_meta": {"parentToolCallId": parent}}
+        recorded = records([started, synthetic, nested("standalone"), nested("delegated"), ambiguous])
+        replay = [update async for update in transcript.reconcile(snapshot, recorded, session_id="acp", nesting=True)]
+        native_card, synthetic_card, standalone, delegated = replay
+        self.assertEqual(native_card["toolCallId"], parent)
+        self.assertNotEqual(synthetic_card["toolCallId"], parent)
+        self.assertEqual(standalone["_meta"]["parentToolCallId"], synthetic_card["toolCallId"])
+        self.assertEqual(delegated["_meta"]["parentToolCallId"], native_card["toolCallId"])
 
     async def test_rewritten_duplicate_calls_follow_receipt_occurrences(self):
         call = {"sessionUpdate": "tool_call", "toolCallId": "same", "status": "in_progress"}
@@ -128,7 +172,7 @@ class TranscriptToolTests(unittest.IsolatedAsyncioTestCase):
             "same", {"nativeSessionId": "native", "entryId": "origin", "occurrence": occurrence},
             {"nativeSessionId": "native", "entryId": f"result-{index}"})
             for index, occurrence in enumerate((1, 0), 1)]
-        updates = [update async for update in transcript.reconcile(snapshot, recorded, nesting=False)]
+        updates = [update async for update in transcript.reconcile(snapshot, records(recorded), session_id="acp", nesting=False)]
         first, second, first_result, second_result = [update["toolCallId"] for update in updates]
         self.assertNotEqual(first, second)
         self.assertEqual((first_result, second_result), (second, first))
@@ -143,7 +187,7 @@ class TranscriptToolTests(unittest.IsolatedAsyncioTestCase):
         for original, linked in (("visible", True), ("other", False)):
             recorded = [transcript.recorded_result(original, None, {"nativeSessionId": "native", "entryId": "result"})]
             with self.subTest(original=original):
-                updates = [update async for update in transcript.reconcile(snapshot, recorded, nesting=False)]
+                updates = [update async for update in transcript.reconcile(snapshot, records(recorded), session_id="acp", nesting=False)]
                 self.assertEqual(len(updates), 2 if linked else 3)
                 self.assertEqual(updates[-1]["status"], "completed")
                 self.assertEqual(updates[-1]["toolCallId"] == "visible", linked)
@@ -161,6 +205,6 @@ class TranscriptToolTests(unittest.IsolatedAsyncioTestCase):
             unproven = {**call, "sessionUpdate": "tool_call_update", "_meta": {transcript.TOOL_ORIGIN_META: None}}
             recorded = [start, unproven, progress] if reused else [start, progress]
             with self.subTest(origin=origin, reused=reused):
-                replay = [update async for update in transcript.reconcile(snapshot, recorded, nesting=True)]
+                replay = [update async for update in transcript.reconcile(snapshot, records(recorded), session_id="acp", nesting=True)]
                 self.assertEqual(len(replay), 1)
                 self.assertEqual("aelix/subagents" in replay[0]["_meta"], preserve)

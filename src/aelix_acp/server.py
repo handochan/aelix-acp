@@ -23,7 +23,7 @@ from .image_policy import VERIFIED_IMAGE_POLICIES
 from . import __version__
 from .wire.errors import (ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH,
                           fork_head_changed, require_object, require_string)
-from .runtime.store import (open_store, load_preferences, history, legacy_permission_mode,
+from .runtime.store import (open_store, load_preferences, history, history_records, legacy_permission_mode,
                             save_preferences, cache_recovered_history, write_store)
 from .runtime.controls import MODE_IDS
 from .runtime import managed_extensions
@@ -393,19 +393,20 @@ class Server:
 
     async def replay_history(self, session):
         await session.live_history.flush()
-        recorded = history(self.db, session.id)
         nesting = session.declares(NESTED_TOOL_CALLS)
         if session.transcript_enabled():
             snapshot = await transcript.read(
                 session.rpc, lambda message: self.native_message_updates(session, message, canonical=True))
             session.require_live_worker()
-            async for update in transcript.reconcile(snapshot, recorded, nesting=nesting):
+            recorded = history_records(self.db, session.id)
+            async for update in transcript.reconcile(snapshot, recorded, session_id=session.id, nesting=nesting):
                 if session.private_host:
                     update = {key: value for key, value in update.items() if key != "rawOutput"}
                 await session.notify("session/update", {"sessionId": session.id, "update": update})
                 await asyncio.sleep(0)
             return snapshot.marker
-        recorded = (transcript.display_update(update) for update in recorded if transcript.result_link(update) is None)
+        recorded = (transcript.display_update(update) for update in history(self.db, session.id)
+                    if transcript.result_link(update) is None)
         if (first := next(recorded, None)) is not None:
             for update in chain((first,), recorded):
                 if not nesting and nested_only(update):

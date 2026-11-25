@@ -121,6 +121,12 @@ class NativeChildrenTests(unittest.IsolatedAsyncioTestCase):
         self.child_requests.append(request)
         messages = request["messages"]
         task = next((text_of(m) for m in messages if m.get("role") == "user"), "")
+        if "CHILD_REPEAT_WRITE" in task:
+            results = sum(message.get("role") == "tool" for message in messages)
+            if results < 2:
+                delta, stop = self.call("write", {"path": f"child-{results}.txt", "content": "child"})
+                delta["tool_calls"][0]["id"] = "reused-child-call"
+                return delta, stop
         if messages[-1].get("role") == "tool":
             return {"role": "assistant", "content": "CHILD_DONE wrote"}, "stop"
         if "CHILD_WRITE" in task:
@@ -658,15 +664,26 @@ def setup(api):
 
     async def test_transcript_preserves_standalone_nested_tool_updates(self):
         await self.open_with_transcript()
-        result = await self.manage("agents/run", {"name": "worker", "task": "CHILD_WRITE child.txt"}, timeout=120)
+        result = await self.manage("agents/run", {"name": "worker", "task": "CHILD_REPEAT_WRITE"}, timeout=120)
         self.assertTrue(result["result"]["ok"], result)
         nested = [update for update in self.updates() if "parentToolCallId" in update.get("_meta", {})]
-        self.assertEqual([update["sessionUpdate"] for update in nested], ["tool_call", "tool_call_update"])
-        self.assertEqual(nested[-1]["status"], "completed")
+        self.assertEqual([update["sessionUpdate"] for update in nested], ["tool_call", "tool_call_update"] * 2)
+        self.assertEqual({update["toolCallId"] for update in nested}, {nested[0]["toolCallId"]})
+        self.assertEqual([update["status"] for update in nested[1::2]], ["completed", "completed"])
         parent = nested[0]["_meta"]["parentToolCallId"]
         self.assertTrue(parent.startswith("aelix-child:"))
         load = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
-        for _ in range(2):
+        meta = "aelix/transcript"
+        coordinates = []
+        for attempt in range(3):
+            if attempt == 2:
+                # Reopen from the same ACP database in a new process.
+                await self.client.close()
+                self.clients.remove(self.client)
+                self.client = await AcpClient.start(
+                    self.root, EXECUTABLE, adapter_args=["--enable-agents"],
+                    capabilities={"_meta": {**NESTING, meta: {"version": 1}}})
+                self.clients.append(self.client)
             self.client.updates.clear()
             opened = await self.client.request("session/load", load, timeout=120)
             marker = opened["_meta"]["aelix/transcript"]
@@ -676,8 +693,37 @@ def setup(api):
                 "session_info_update", "usage_update"}]
             self.assertGreater(len(replayed), 0)
             self.assertEqual(marker["totalFrames"], len(replayed))
+            tagged = [update["_meta"][meta] for update in replayed]
+            for coordinate in tagged:
+                self.assertEqual(coordinate["source"], "adapter")
+                self.assertTrue(coordinate["eventId"])
+                self.assertTrue(coordinate["bindingId"])
+                self.assertGreater(coordinate["sequence"], 0)
+                self.assertNotIn("nativeSessionId", coordinate)
+                self.assertNotIn("entryId", coordinate)
+            self.assertEqual(len({item["eventId"] for item in tagged}), len(replayed))
+            coordinates.append(tagged)
             self.assertEqual(self.card(parent)[-1]["status"], "completed")
-            self.assertEqual(self.card(nested[0]["toolCallId"]), nested)
+            replayed_children = [update for update in replayed if "parentToolCallId" in update["_meta"]]
+            self.assertEqual([update["sessionUpdate"] for update in replayed_children], ["tool_call", "tool_call_update"] * 2)
+            first, first_end, second, second_end = [update["toolCallId"] for update in replayed_children]
+            self.assertEqual(first, nested[0]["toolCallId"])
+            self.assertEqual((first_end, second_end), (first, second))
+            self.assertNotEqual(first, second)
+            original_fields = [{**update, "toolCallId": nested[i]["toolCallId"],
+                                "_meta": {key: value for key, value in update["_meta"].items() if key != meta}}
+                               for i, update in enumerate(replayed_children)]
+            self.assertEqual(original_fields, nested)
+        self.assertEqual(coordinates, [coordinates[0]] * 3)
+
+        await self.client.close()
+        self.clients.remove(self.client)
+        self.client = await AcpClient.start(
+            self.root, EXECUTABLE, adapter_args=["--enable-agents"], capabilities={"_meta": {meta: {"version": 1}}})
+        self.clients.append(self.client)
+        await self.client.request("session/load", load, timeout=120)
+        self.assertFalse(self.card(parent))
+        self.assertFalse(any("parentToolCallId" in update.get("_meta", {}) for update in self.updates()))
 
     # === #800 on ACP ===
 
