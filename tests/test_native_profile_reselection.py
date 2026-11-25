@@ -1,4 +1,4 @@
-"""D16 no-guard, catalog and restore checks against the pinned native executable."""
+"""D16 interim compatibility, catalog and restore checks against the pinned native executable."""
 import hashlib
 import json
 import os
@@ -71,7 +71,7 @@ class NativeProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
     def calls(self):
         return [json.loads(line) for line in (self.root / "native-calls.jsonl").read_text().splitlines()]
 
-    async def test_native_catalog_and_explicit_selection_without_guard_apply_zero(self):
+    async def test_native_catalog_legacy_manage_and_interim_explicit_selection(self):
         shown = await self.relay("profiles-show")
         self.assertEqual(shown, {"profile": {**QUIET, "ref": self.ref}})
         catalog = await self.relay("relay-error-large-item")
@@ -79,12 +79,17 @@ class NativeProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(catalog["activeRef"])
         capabilities = await self.client.request("_aelix/capabilities", {"sessionId": self.session})
         self.assertNotIn("profileRefGuard", capabilities["runtime"])
-        expected = CASES["native-guard"]["pinWithoutGuard"]
-        self.assertEqual(await self.relay("profiles-use", profile=self.ref), expected["relayResult"])
-        with self.assertRaisesRegex(RuntimeError, "unsupported"):
-            await self.client.request("_aelix/manage", {"sessionId": self.session, "action": "agents/use",
-                                                        "arguments": {"name": "quiet"}})
-        self.assertEqual(self.calls().count("agents/use"), expected["nativeUseCalls"])
+        await self.client.request("_aelix/manage", {"sessionId": self.session, "action": "agents/use",
+                                                    "arguments": {"name": "quiet"}})
+        self.assertEqual(self.preferences()["agent"], "quiet")
+        self.assertNotIn("agentRef", self.preferences())
+        await self.client.request("session/prompt", {"sessionId": self.session,
+                                                     "prompt": [{"type": "text", "text": "/agents use quiet"}]})
+        self.assertNotIn("agentRef", self.preferences())
+        expected = CASES["profiles-use"]["result"]
+        self.assertEqual(await self.relay("profiles-use", profile=self.ref), {**expected, "activeRef": self.ref})
+        self.assertEqual(self.preferences()["agentRef"], self.ref)
+        self.assertEqual(self.calls().count("agents/use"), 3)
         self.assertNotIn("prompt", self.calls())
 
     async def test_native_empty_tools_and_legacy_load_remain_supported(self):
@@ -106,17 +111,15 @@ class NativeProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls().count("agents/use"), 1)
         self.assertEqual(await self.relay("lookup-expired"), CASES["lookup-expired"]["result"])
 
-    async def test_native_recorded_restore_without_guard_applies_zero(self):
+    async def test_native_recorded_restore_uses_interim_name_apply(self):
         await self.client.request("session/close", {"sessionId": self.session})
-        stored = self.preferences({**CASES["load-drift-open"]["stored"], "agentRef": self.ref,
-                                   "agentPreview": {**QUIET, "ref": self.ref}})
-        with self.assertRaises(RuntimeError) as error:
-            await self.client.request("session/load", {**self.open_params(), "sessionId": self.session})
-        expected = CASES["load-guard-unavailable"]["response"]["error"]
-        self.assertEqual(json.loads(str(error.exception)), {**expected, "data": {
-            **expected["data"], "recovery": {**expected["data"]["recovery"], "original": self.ref},
-        }})
-        self.assertEqual(self.calls().count("agents/use"), CASES["load-guard-unavailable"]["assert"]["nativeUseCalls"])
+        self.preferences({**CASES["load-drift-open"]["stored"], "agentRef": self.ref,
+                          "agentPreview": {**QUIET, "ref": self.ref}})
+        self.binding = "b-22"
+        result = await self.client.request("session/load", {**self.open_params(), "sessionId": self.session})
+        self.assertEqual(result["_meta"][META], {"bindingId": "b-22"})
+        self.assertEqual(self.preferences()["agentRef"], self.ref)
+        self.assertEqual(self.preferences()["activeTools"], [])
+        self.assertEqual(self.calls().count("agents/use"), 1)
         self.assertNotIn("prompt", self.calls())
         self.assertFalse(self.client.requests)
-        self.assertEqual(self.preferences(), stored)

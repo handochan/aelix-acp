@@ -92,6 +92,7 @@ class Server:
         self.withdrawal_slots = asyncio.BoundedSemaphore(MAX_WITHDRAWABLE_REQUESTS)
         self.cleanup_tasks = set()
         self.closing = False  # The client is gone: sessions end without sending.
+        self.input_closed = False
         self.output_lock = asyncio.Lock()
         self.output = None
         self.output_error = None
@@ -514,6 +515,17 @@ class Server:
             return await self.intervene(params)
         if method in SESSION_MUTATIONS:
             session_id = require_string(params.get("sessionId"), "sessionId")
+            if method == "session/close":
+                live = self.pending_stop_sessions.get(session_id) or self.sessions.get(session_id)
+                if live is not None:
+                    live.studio_resources.retire_approval()
+            if method == "session/load" and self.relay_enabled:
+                live = self.pending_stop_sessions.get(session_id) or self.sessions.get(session_id)
+                replacement = session_relay.open_binding(params.get("_meta"))
+                cwd = params.get("cwd")
+                if (live is not None and replacement is not None and isinstance(cwd, str)
+                        and str(Path(cwd).expanduser().resolve()) == live.cwd):
+                    live.studio_resources.retire_replaced_approval(replacement)
             if method in ("session/load", "session/delete", "session/close") and session_id in self.starting_ids:
                 raise ProtocolError("Session is already starting", -32000)
             registered = session_id in self.sessions or self.db.execute(
@@ -521,7 +533,10 @@ class Server:
             if registered:
                 with acquire_lease(self.args.state_dir, session_id, purpose="activity"):
                     live = self.sessions.get(session_id)
-                    if (live is not None and live.studio_resources.uncertain
+                    readback = method == "_aelix/manage" and params.get("action") in (
+                        "resources/list", "agents/list", "agents/show", "mcp/status", "permissions/get",
+                    )
+                    if (live is not None and live.studio_resources.uncertain and not readback
                             and method not in {"session/load", "session/close", "session/delete"}):
                         raise ProtocolError("Reopen the session to recover its profile and tool state.", -32004)
                     return await self.dispatch_request(method, params)
@@ -537,8 +552,11 @@ class Server:
         binding_id = require_string(params["bindingId"], "bindingId")
         session = self.sessions.get(session_id)
         relay = session.input_relay if session is not None else None
-        if relay is None or relay.binding_id != binding_id or session_id in self.starting_ids:
+        if (relay is None or relay.binding_id != binding_id or session_id in self.starting_ids
+                or session.studio_resources.retired_binding == binding_id):
             raise ProtocolError("Session relay binding is unavailable.", session_relay.SCOPE_DENIED)
+        if "response_id" in kwargs:
+            session_relay.validate_response_id(kwargs["response_id"])
         return await handler(relay, params["payload"], **kwargs)
 
     async def intervene(self, params):
@@ -618,18 +636,18 @@ class Server:
             session = None
             snapshot = None
             try:
-                if previous:
-                    self.sessions.pop(session_id, None)
-                    await previous.close()
                 session = Session(self, session_id, cwd,
                                   initial_mode=getattr(self.args, "permission_mode", "default") if method == "session/new" else None)
                 session.index_snapshot = index_snapshot
                 session.client_mcp = params.get("mcpServers", [])
+                if method == "session/load":
+                    self.pending_stop_sessions[session_id] = session
+                    session.studio_resources.starting_binding = binding_id
+                if previous:
+                    self.sessions.pop(session_id, None)
+                    await previous.close()
                 async with session.publication_lock:
                     await session.start(session_file)
-                    if method == "session/load":
-                        # Stop can address the worker while replay and publication are pending.
-                        self.pending_stop_sessions[session_id] = session
                     await session.commands()
                     if method == "session/load":
                         snapshot = await self.replay_history(session)
@@ -640,13 +658,15 @@ class Server:
                     session.require_live_worker()
                     self.sessions[session_id] = session
             except BaseException:
-                self.sessions.pop(session_id, None)
+                if self.sessions.get(session_id) is session:
+                    self.sessions.pop(session_id, None)
                 if session:
                     await session.close()
                 raise
             finally:
                 self.pending_stop_sessions.pop(session_id, None)
                 self.starting_ids.discard(session_id)
+            session.studio_resources.starting_binding = None
             result = {**session.selectors(), **({"sessionId": session_id} if method.endswith("new") else {})}
             if snapshot is not None:
                 result["_meta"][transcript.META] = snapshot
@@ -752,7 +772,8 @@ class Server:
             if session.mutation_lock.locked():
                 raise ProtocolError("Session is busy", -32000)
             async with session.mutation_lock:
-                await session.recover_after_compaction()
+                if not session.studio_resources.uncertain:
+                    await session.recover_after_compaction()
                 if action == "sessions/branch":
                     return await self.branch_session(session, arguments)
                 if action == "workspace/trust":
@@ -784,11 +805,6 @@ class Server:
                     raise ProtocolError("Unsupported management action")
                 if action == "children/notices":
                     return await session.notice_turn()
-                if action == "agents/use":
-                    if set(arguments) != {"name"}:
-                        raise ProtocolError("Invalid profile selection arguments")
-                    session.reset_cancellation()
-                    return await session.studio_resources.select_name(arguments["name"])
                 if action == "mcp/configure":
                     result = await session.configure_mcp(arguments.get("servers"))
                 else:
@@ -802,8 +818,12 @@ class Server:
                     await session.restore_tools()
                     session.studio_resources.invalidate_pages()
                     await session.commands()
-                if action in {"auth/set_api_key", "auth/login", "auth/logout", "resources/reload", "settings/set"}:
+                if action == "agents/use":
+                    await session.commands()
+                if action in {"auth/set_api_key", "auth/login", "auth/logout", "resources/reload", "settings/set", "agents/use"}:
                     await session.controls.refresh()
+                    if action == "agents/use":
+                        await session.sync_profile_tools()
                     await session.save()
                     await session.update({"sessionUpdate": "config_option_update", "configOptions": session.controls.options()})
                 return result
@@ -824,8 +844,6 @@ class Server:
                 response = {"jsonrpc": "2.0", "id": request_id, "result": result}
                 if method == session_relay.LOOKUP_METHOD:
                     response = session_relay.bounded_lookup_response(response)
-                elif method in session_relay.RESOURCE_REQUESTS and not session_relay.fits_resource(result, request_id):
-                    response["result"] = {"accepted": False, "reason": "result-too-large"}
                 await self.send(response)
                 replied = True
                 if message["method"] in ("session/new", "session/load", "session/fork"):
@@ -879,6 +897,7 @@ class Server:
 
         def end_input():
             nonlocal input_deadline
+            self.input_closed = True
             if input_deadline is None and not self.closing:
                 input_deadline = loop.call_later(STDOUT_DRAIN_SECONDS, stop)
                 self.error_replies.end_input()

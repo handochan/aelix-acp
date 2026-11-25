@@ -184,10 +184,13 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         operation = operation or "list"
         if operation == "list":
             await output(await control("agents/list"))
-        elif operation == "show":
-            await output(await control("agents/show", {"name": remainder.strip()}))
-        elif operation == "use":
-            await output(await session.studio_resources.select_name(remainder.strip()))
+        elif operation in {"show", "use"}:
+            await output(await control("agents/" + operation, {"name": remainder.strip()}))
+            if operation == "use":
+                await session.controls.refresh()
+                await session.sync_profile_tools()
+                await session.save()
+                await session.commands()
         elif operation == "run":
             profile, _, task = remainder.partition(" ")
             await output(await control("agents/run", {"name": profile, "task": task}))

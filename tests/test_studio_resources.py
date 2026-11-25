@@ -7,10 +7,10 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 from aelix_acp.runtime import session_relay
-from aelix_acp.runtime.profile_refs import profile_ref
+from aelix_acp.runtime.profile_refs import POLICY_FIELDS, preview, profile_ref, public_preview
 from aelix_acp.server import Server, Session
 from aelix_acp.wire.errors import BackendError, ProtocolError
 
@@ -75,8 +75,12 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
         self.resources.inspect = AsyncMock(return_value=deepcopy(QUIET))
         self.session.active_tools = ["read"]
 
-    async def native(self, command, *, method, params):
+    async def native(self, command, *, method, params, _before_native_write=None, **kwargs):
         self.assertEqual(command, "aelix_control")
+        if _before_native_write is not None:
+            _before_native_write()
+        if method == "capabilities":
+            return self.session.controls.capabilities
         if method == "agents/use":
             self.session.controls.capabilities["activeAgent"] = None if params["name"] == "--none" else params["name"]
             return {"activeRef": params.get("expectedProfile"), "message": "Selected"}
@@ -112,7 +116,8 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_result("profiles-show")
         self.assertEqual(await self.call("profiles-use", wire=True), CASES["relay-envelope"]["acpResponse"])
         self.session.rpc.assert_awaited_once_with(
-            "aelix_control", method="agents/use", params=CASES["native-guard"]["nativeRequest"]["params"])
+            "aelix_control", method="agents/use", params=CASES["native-guard"]["nativeRequest"]["params"],
+            _before_native_write=ANY)
         self.assertEqual(self.resources.preferences(), {
             "agent": "quiet", "agentRef": REFS[0], "agentPreview": QUIET,
         })
@@ -121,16 +126,16 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_result("profiles-clear")
         self.assertEqual(self.resources.preferences(), {})
         self.assertIsNone(self.session.active_tools)
-        self.session.rpc.assert_awaited_with("aelix_control", method="agents/use", params={"name": "--none"})
+        self.session.rpc.assert_awaited_with("aelix_control", method="agents/use", params={"name": "--none"}, _before_native_write=ANY)
 
-    async def test_invalid_guard_advertisements_never_apply(self):
-        expected = CASES["native-guard"]["pinWithoutGuard"]["relayResult"]
+    async def test_invalid_guard_advertisements_use_only_the_name(self):
         for number, version in enumerate((None, False, True, 2, "1", 1.0)):
             self.session.controls.capabilities["profileRefGuard"] = version
             payload = dict(CASES["profiles-use"]["post"]["payload"], requestId=f"019aa123-0001-7000-8000-{number:012x}")
-            self.assertEqual(await self.call("profiles-use", payload=payload), expected)
-        self.session.rpc.assert_not_awaited()
-        self.session.save.assert_not_awaited()
+            await self.assert_result("profiles-use", payload=payload)
+        writes = [call.kwargs["params"] for call in self.session.rpc.await_args_list
+                  if call.kwargs["method"] == "agents/use"]
+        self.assertEqual(writes, [{"name": "quiet"}] * 6)
 
     async def test_pages_snapshot_replay_binding_ttl_and_size(self):
         first, second = (deepcopy(CASES[f"profiles-list-page-{page}"]["result"]) for page in (1, 2))
@@ -242,6 +247,7 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_native_refusal_cannot_become_tool_success(self):
         async def refused(*args, **kwargs):
             if kwargs["method"] == "tools/set_active":
+                kwargs["_before_native_write"]()
                 return {"accepted": False, "reason": "unrecognized", "activeTools": []}
             return await self.native(*args, **kwargs)
 
@@ -251,3 +257,95 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failure.exception.code, -33100)
         self.session.save.assert_not_awaited()
         await self.assert_result("lookup-unknown")
+
+
+    async def test_pre_dispatch_error_has_definite_receipt_and_safe_readback_after_unknown(self):
+        self.resources.recorded = QUIET
+
+        async def refused(*args, **kwargs):
+            if kwargs["method"] == "agents/use":
+                raise ProtocolError("worker closed before write", -32603)
+            if kwargs["method"] == "agents/list":
+                return {"profiles": []}
+            return await self.native(*args, **kwargs)
+
+        self.session.rpc.side_effect = refused
+        with self.assertRaises(ProtocolError) as error:
+            await self.call("profiles-use")
+        self.assertEqual(error.exception.code, -32603)
+        self.assertFalse(self.resources.uncertain)
+        self.session.rpc.side_effect = self.native
+        self.session.save.side_effect = OSError()
+        self.relay.receipts.clear()
+        with self.assertRaises(ProtocolError) as error:
+            await self.call("profiles-use")
+        self.assertEqual(error.exception.code, -33100)
+        self.session.rpc.side_effect = refused
+        self.session.controls.capabilities["activeAgent"] = "writer"
+        readback = await self.call("relay-error-large-item")
+        self.assertEqual((readback["activeAgent"], readback["activeRef"]), ("writer", None))
+        tools = await self.server.dispatch("_aelix/manage", {"sessionId": self.session.id, "action": "resources/list"})
+        self.assertEqual(tools["tools"], [{"name": "read"}, {"name": "write"}])
+
+    async def test_oversized_use_ack_and_changed_reply_respect_dispatch(self):
+        with patch.object(session_relay, "fits_resource_reply", return_value=False):
+            self.assertEqual(await self.call("profiles-use"), {"accepted": False, "reason": "profile-refused"})
+        self.session.rpc.assert_not_awaited()
+        self.relay.receipts.clear()
+        self.session.controls.capabilities.pop("profileRefGuard")
+        self.resources.inspect.side_effect = [QUIET, QUIET, PROJECT, PROJECT]
+        with patch.object(session_relay, "fits_resource_reply", side_effect=lambda value: value["accepted"]):
+            with self.assertRaises(ProtocolError) as error:
+                await self.call("profiles-use")
+        self.assertEqual(error.exception.code, -33100)
+        self.session.save.assert_not_awaited()
+        request_id = CASES["profiles-use"]["post"]["payload"]["requestId"]
+        self.assertEqual(await self.call("lookup-unknown", payload={"requestId": request_id}),
+                         CASES["lookup-unknown"]["result"])
+
+    async def test_catalog_uses_checked_show_description_and_identity(self):
+        self.resources.inspect.return_value = {**PROJECT, "description": "Write notes"}
+
+        async def catalog(*args, **kwargs):
+            if kwargs["method"] == "agents/list":
+                return {"profiles": [{"name": "quiet", "description": "Old discovery description"}]}
+            return await self.native(*args, **kwargs)
+
+        self.session.rpc.side_effect = catalog
+        result = await self.call("profiles-list-page-1")
+        self.assertEqual(result["profiles"], [{"ref": PROJECT["ref"], "description": "Write notes"}])
+        self.resources.inspect.assert_awaited_once_with("quiet", revision_bound=True)
+
+    async def test_cursor_retention_bounds_count_bytes_and_response_id_lengths(self):
+        first = CASES["profiles-list-page-1"]["result"]
+        snapshot = {**first, "profiles": first["profiles"] + CASES["profiles-list-page-2"]["result"]["profiles"]}
+        self.resources.catalog = AsyncMock(return_value=snapshot)
+        with patch.object(session_relay, "MAX_PROFILE_SNAPSHOTS", 1):
+            stale = (await self.call("profiles-list-page-1"))["nextCursor"]
+            current = (await self.call("profiles-list-page-1"))["nextCursor"]
+            await self.assert_result("relay-error-stale-cursor", payload={"cursor": stale})
+            result = await self.relay.profiles_list({"cursor": current}, response_id=7)
+            self.assertEqual(result, await self.relay.profiles_list({"cursor": current}, response_id="*" * 4094))
+            self.assertTrue(session_relay.fits_resource(result, "*" * 4094))
+        self.relay.invalidate_profile_pages()
+        with patch.object(session_relay, "MAX_PROFILE_SNAPSHOT_BYTES", 1):
+            await self.assert_result("relay-error-large-item", payload={"limit": 1})
+        self.assertFalse(self.relay.profile_snapshots)
+
+    async def test_preview_redacts_pasted_credentials_paths_and_unverifiable_authority(self):
+        native = {
+            "body": "Authorization: Bearer opaquevalue1234 and /private/fixture.txt",
+            "file_path": str(self.root / "quiet.md"),
+            "description": '"apiKey": "opaque-secret" opens file:///private/known.txt',
+            "system_prompt": QUIET["promptMode"], "provider": None, "model": None,
+            "skills": [], "tools": ["token", "password=opaque-policy"], "approval_mode": "inherit",
+            **{field: QUIET["policy"][name] for name, field in POLICY_FIELDS.items()},
+        }
+        candidate = preview(native, QUIET["ref"], QUIET["source"])
+        self.assertFalse(candidate["safeForConsent"])
+        wire = json.dumps(public_preview(candidate))
+        saved = json.dumps(candidate)
+        for sensitive in ("opaquevalue1234", "/private/", "opaque-secret", "opaque-policy"):
+            self.assertNotIn(sensitive, wire)
+            self.assertNotIn(sensitive, saved)
+        self.assertNotIn("safeForConsent", wire)

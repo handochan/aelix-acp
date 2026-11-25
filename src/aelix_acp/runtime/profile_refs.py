@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,28 @@ POLICY_FIELDS = {
 }
 
 
+MAX_PREVIEW_BYTES = 24 * 1024
+SENSITIVE = re.compile(
+    r"""(?ix)(?<!\w)["']?authorization["']?\s*[:=]\s*["']?(?:bearer|basic|token)\s+[^\s,;"']+"""
+    r"""|(?<!\w)["']?(?:api[_ -]?key|password|passwd|secret|(?:access|refresh|auth)[_ -]?token|"""
+    r"""authorization)["']?\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)"""
+    r"""|\bbearer\s+[^\s,;"']+"""
+    r"|\b(?:sk-(?:proj-|ant-)?|gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}"
+    r"|\bhttps?://[^\s/]+:[^\s/@]+@"
+)
+ABSOLUTE_PATH = re.compile(
+    r"(?i)(?<![\w:/\\.])(?:file://|[a-z]:[\\/]|\\\\|/(?!/))[^\s<>\x22\x27]+"
+)
+
+
+class DisplayTooLarge(ValueError):
+    pass
+
+
+def redact(value):
+    return ABSOLUTE_PATH.sub("[redacted path]", SENSITIVE.sub("[redacted credential]", value))
+
+
 def display_text(value, *, multiline=False):
     if not isinstance(value, str):
         raise ValueError("Invalid profile text")
@@ -31,7 +54,7 @@ def display_text(value, *, multiline=False):
 def valid_name(value):
     return (isinstance(value, str) and 0 < len(value) <= 256 and value == value.strip()
             and value not in {".", "..", "--none"} and not any(c in value for c in "/\\:")
-            and display_text(value) == value)
+            and display_text(value) == value and redact(value) == value)
 
 
 def valid_ref(value):
@@ -57,6 +80,8 @@ def source_label(scope, path):
     filename = path.name
     if (scope not in SCOPES or not filename.endswith(".md") or filename.startswith(".")
             or display_text(filename) != filename or any(c in filename for c in "/\\:")):
+        raise ValueError("Invalid profile source")
+    if redact(filename) != filename:
         raise ValueError("Invalid profile source")
     return f"{scope}:agents/{filename}"
 
@@ -105,7 +130,7 @@ def path_labels(paths, source):
 
 def preview(native, ref, source):
     raw_prompt = native["body"]
-    prompt = display_text(raw_prompt, multiline=True)
+    prompt = display_text(raw_prompt[:1024], multiline=True)
     policy = {key: native[field] for key, field in POLICY_FIELDS.items()}
     policy["extensions"] = path_labels(policy["extensions"], native["file_path"])
     result = {
@@ -120,7 +145,10 @@ def preview(native, ref, source):
         result["omittedPromptDigest"] = hashlib.sha256(raw_prompt[512:].encode("utf-8")).hexdigest()
     if not valid_preview(result, ref):
         raise ValueError("Invalid native profile preview")
-    return result
+    # Redact before the visible cut, so credentials crossing the cut are
+    # still removed. The omission digest never leaves SQLite or memory.
+    result["promptPreview"] = redact(prompt)[:512]
+    return safe_preview(result)
 
 
 def text_list(value):
@@ -168,3 +196,35 @@ def public_preview(value):
               "provider", "model", "tools", "skills", "approvalMode")
     return {**{field: value[field] for field in fields},
             "policy": {field: value["policy"][field] for field in POLICY_FIELDS}}
+
+
+def safe_preview(value):
+    """Whitelist, redact and bound the same representation for cards and SQLite."""
+    result = public_preview(value)
+    if value.get("omittedPromptDigest"):
+        result["omittedPromptDigest"] = value["omittedPromptDigest"]
+    safe = value.get("safeForConsent", True) is True
+
+    def authority(item):
+        nonlocal safe
+        if isinstance(item, list):
+            if len(item) > 128:
+                raise DisplayTooLarge()
+            return [authority(entry) for entry in item]
+        if isinstance(item, str):
+            filtered = redact(item)[:512]
+            safe = safe and filtered == item
+            return filtered
+        return item
+
+    for field in ("provider", "model", "tools", "skills"):
+        result[field] = authority(result[field])
+    for field, item in result["policy"].items():
+        result["policy"][field] = authority(item)
+    result["description"] = redact(result["description"][:2048])[:1024]
+    result["promptPreview"] = redact(result["promptPreview"])[:512]
+    if not safe:
+        result["safeForConsent"] = False
+    if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > MAX_PREVIEW_BYTES:
+        raise DisplayTooLarge()
+    return result

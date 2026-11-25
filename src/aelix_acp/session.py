@@ -449,7 +449,6 @@ class Session:
             config_id: value for config_id, value in self.controls.selections().items()
             if config_id in NATIVE_SESSION_SELECTORS
         } if native_has_history else {}
-        self.studio_resources.require_restore_guard()
         # A saved profile or tool selection restricts authority. Refuse rather
         # than resume with the runtime's broader defaults; check before client
         # MCP setup, which already needs tools/set_active.
@@ -602,7 +601,10 @@ class Session:
         resources = await self.rpc("aelix_control", method="resources/list", params={})
         available = {tool["name"] for tool in resources.get("tools", [])}
         selected = [name for name in self.active_tools if name in available]
-        await self.rpc("aelix_control", method="tools/set_active", params={"names": selected})
+        result = await self.rpc("aelix_control", method="tools/set_active", params={"names": selected})
+        if not self.studio_resources.tools_match(result, selected):
+            raise ProtocolError("Aelix did not restore the saved tool selection", -32004,
+                                {"kind": "restrictions_unenforceable", "methods": ["tools/set_active"]})
 
     async def configure_mcp(self, servers):
         before = await self.rpc("aelix_control", method="resources/list", params={})
@@ -634,6 +636,11 @@ class Session:
             return "tools" in profile and profile["tools"] is None
         except (ProtocolError, KeyError, TypeError):
             return False
+
+    async def sync_profile_tools(self):
+        self.active_tools = None
+        self.studio_resources.recorded = None
+        self.studio_resources.invalidate_pages()
 
     def require_live_worker(self, expected=None, *, committed=False):
         proc, lease = self.proc, self.lease
@@ -737,7 +744,8 @@ class Session:
                 except ProtocolError as error:
                     write_diagnostic(error.data["kind"])
 
-    async def rpc(self, command, *, _timeout=45, _image_write=None, _project_history=False, _await_response=True, **kwargs):
+    async def rpc(self, command, *, _timeout=45, _image_write=None, _project_history=False, _await_response=True,
+                  _before_native_write=None, **kwargs):
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future() if _await_response else None
         if future is not None:
@@ -762,6 +770,8 @@ class Session:
                 if not current():
                     raise image_policy.ImageRejected("stale-turn")
                 issued()  # write() can fail after handing bytes to the pipe.
+            if _before_native_write is not None:
+                _before_native_write()
             self.proc.stdin.write(raw)
             await self.proc.stdin.drain()
             # Queue writes have their own receipts. A late drain must not
@@ -1474,7 +1484,7 @@ class Session:
             async with self.publication_lock:
                 if not preserve_history:
                     await self.save()
-                if managed_change is not None:
+                if managed_change is not None or self.studio_resources.recorded is not None:
                     # Only Stop can address the candidate before publication.
                     self.server.pending_stop_sessions[self.id] = self
                 snapshot = await self.start(filename, managed_change=managed_change)
@@ -1901,6 +1911,7 @@ class Session:
 
     async def _close(self):
         self.raise_fence()
+        self.studio_resources.retire_approval()
         self.studio_resources.invalidate_pages()
         self.ending = True
         try:

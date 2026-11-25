@@ -46,7 +46,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.server.send = AsyncMock()
         self.session = SimpleNamespace(
             input_relay=None, cancelled=False, changing=0, rpc_closed=False,
-            studio_resources=SimpleNamespace(uncertain=False),
+            studio_resources=SimpleNamespace(uncertain=False, retired_binding=None, retire_approval=lambda: None),
             proc=SimpleNamespace(returncode=None), rpc=AsyncMock(return_value={}),
             state={"steeringMode": "one-at-a-time", "followUpMode": "all"},
         )

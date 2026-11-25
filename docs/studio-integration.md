@@ -274,8 +274,10 @@ are available through the same conversation extension route as running input.
 
 A `ProfileRef` contains `name`, `scope` and `revision`. Its SHA-256 includes the
 scope, resolved file URI and original Markdown bytes. Lists use a default page
-size of 40, accept limits from 1 to 100, and keep a 60-second snapshot. Start
-again when a cursor is stale. Each response fits the 256 KiB relay envelope.
+size of 40 and accept limits from 1 to 100. A binding retains up to eight
+snapshots with a 2 MiB total budget and a 60-second expiration. Start again
+when a cursor is stale. The 256 KiB reply limit reserves space for JSON-RPC
+IDs up to 4 KiB so a continuation can be replayed with another ID.
 Prompt previews are cleaned and limited to 512 Unicode scalars.
 `approvalMode` describes the profile's delegation policy.
 
@@ -287,10 +289,10 @@ could not be confirmed. Look up the original receipt and read current state.
 Reopen the session before mutating again when the worker and saved preferences
 may have diverged.
 
-ACP saves `agentRef` and `agentPreview` with each explicit named selection,
-including `/agents use` and direct management. On load, a matching ref
-restores with the saved model, permission mode and explicit tool override.
-Name-only records use the existing restoration path. For drift, ACP asks
+Studio's relay saves `agentRef` and a bounded, redacted `agentPreview`.
+On load, a matching ref restores with the saved model, permission mode and
+verified tool override. Direct management, `/agents use`, and name-only
+restoration keep the legacy name-based behavior. For drift, ACP asks
 once through `session/request_permission`, including the original and
 candidate source, revision and changed fields in the card. A stale explicit
 pick returns `profile-changed` before the card. Decline, cancellation, 45-second
@@ -299,13 +301,26 @@ the original profile and reopening the same conversation. A load refusal
 uses `-32004` and `kind:"profile_reselection_required"`. Project trust and
 native launch requirements still apply.
 
-Integration requires native to advertise `profileRefGuard:1`, provide
-`profile.ref` on `agents/show` from the same bytes it parsed for the preview,
-and support `agents/use({name,expectedProfile})`. It must compare the expected
-ref against the immutable parse it applies and return its `activeRef`.
-The pin in `runtime-reference.json` supports catalog reads, explicit clears,
-tool writes and legacy name-only restores. A named explicit selection or
-recorded-ref load issues zero native `agents/use` calls on that pin.
+When native advertises `profileRefGuard:1`, ACP requires a `profile.ref`
+bound to the parsed preview on `agents/show` and sends
+`agents/use({name,expectedProfile})`. Native uses the same immutable parse
+for comparison and application. On the interim pin, ACP sends the name alone
+after a pre-check and compares the active name and freshly resolved ref after
+application. A detected mismatch requires recovery with the original saved
+preferences. The native call can already have changed runtime or history
+state. A file change from A to B and back to A can pass both checks while B is
+applied. [Native guard request](https://github.com/handochan/aelix-ai/issues/925)
+
+ACP binds drift approval to the pending or live binding, worker, operation,
+and cancellation generation. A verified Studio host may set
+`AELIX_ACP_STUDIO_MANUAL_PROFILE_APPROVAL=1` in its adapter launch environment.
+That host must route profile cards through authenticated manual confirmation,
+including during `session/load` before binding publication. It must serialize
+confirmation against binding retirement or replacement and remove or cancel
+the card on retirement, Stop, or ACP withdrawal. A host without this
+verification keeps the opt-in unset. ACP then returns recovery before applying
+a changed recorded profile.
+
 
 ## Management
 
@@ -337,7 +352,7 @@ defines both the launcher snapshot and the versioned ACP management actions.
 | `extensions/list` | `{}` | Installed distribution/version/entry reference |
 | `extensions/action` | `{action,target?}` | list/verify/discover/install/remove/update/enable/disable/reload |
 | `agents/list` / `agents/show` | `{}` / `{name}` | Native profiles and diagnostics |
-| `agents/use` | `{name}` | Revision-bound selection on a supporting runtime. `--none` clears. |
+| `agents/use` | `{name}` | Native name-based selection. `--none` clears. |
 | `agents/run` | `{name,task,allowProject?}` | Native delegation, enabled explicitly |
 | `agents/enable` | `{enabled:bool}` | Consent + restart |
 | `workspace/trust` | `{trusted:bool}` | Consent + restart |

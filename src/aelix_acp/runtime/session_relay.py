@@ -11,7 +11,7 @@ import time
 import uuid
 
 from .. import image_policy
-from . import host_bytes
+from . import host_bytes, profile_reselection
 from .leases import acquire as acquire_lease
 from .profile_refs import text_list, valid_name, valid_ref
 from .studio_resources import refusal
@@ -28,6 +28,9 @@ MAX_RECEIPTS = 256
 MAX_RELAY_FRAME = 256 * 1024
 IMAGE_REQUEST_SECONDS = 120
 PROFILE_CURSOR_TTL = 60
+MAX_PROFILE_SNAPSHOTS = 8
+MAX_PROFILE_SNAPSHOT_BYTES = 2 * 1024 * 1024
+MAX_RESOURCE_ID_BYTES = 4096
 
 
 def advertisement(capabilities):
@@ -60,6 +63,8 @@ def supports_running_input(state):
 def bind_session(session, result, binding_id):
     if binding_id is not None and supports_running_input(session.state):
         if session.input_relay is not None:
+            session.studio_resources.retire_approval()
+            session.input_relay.invalidate_profile_pages()
             session.input_relay.invalidate_images()
         session.input_relay = SessionRelay(session, binding_id)
         result.setdefault("_meta", {})[META_KEY] = {"bindingId": binding_id}
@@ -114,9 +119,19 @@ def fits_resource(result, response_id):
     ))
 
 
+def validate_response_id(response_id):
+    if len(encode_frame(response_id)) - 1 > MAX_RESOURCE_ID_BYTES:
+        raise ProtocolError("Session resource request ID exceeds the size limit.")
+
+
+def fits_resource_reply(result):
+    # Reserve the same encoded ID space for initial replies and replays.
+    return fits_resource(result, "x" * (MAX_RESOURCE_ID_BYTES - 2))
+
+
 @dataclass
 class ProfilePage:
-    expires: float
+    snapshot_id: str
     snapshot: dict
     limit: int
     start: int
@@ -148,10 +163,12 @@ class SessionRelay:
         self.image_acceptances = {}
         self.receipts: dict[str, Receipt] = {}
         self.profile_pages: dict[str, ProfilePage] = {}
+        self.profile_snapshots = {}
         self.profile_generation = 0
 
     def invalidate_profile_pages(self):
         self.profile_pages.clear()
+        self.profile_snapshots.clear()
         self.profile_generation += 1
 
     def invalidate_images(self):
@@ -341,12 +358,29 @@ class SessionRelay:
         receipt = self.receipts[key] = Receipt(now, fingerprint, outcome)
         return receipt, True
 
+    def drop_profile_snapshot(self, snapshot_id):
+        del self.profile_snapshots[snapshot_id]
+        for token, page in tuple(self.profile_pages.items()):
+            if page.snapshot_id == snapshot_id:
+                del self.profile_pages[token]
+
+    def retain_profile_snapshot(self, identifier, snapshot):
+        # Account for the catalog and cursors even when the client uses limit=1.
+        size = len(encode_frame(snapshot)) + 384 * len(snapshot["profiles"])
+        if size > MAX_PROFILE_SNAPSHOT_BYTES:
+            return False
+        while (len(self.profile_snapshots) >= MAX_PROFILE_SNAPSHOTS
+               or sum(size for size, _ in self.profile_snapshots.values()) + size > MAX_PROFILE_SNAPSHOT_BYTES):
+            self.drop_profile_snapshot(next(iter(self.profile_snapshots)))
+        self.profile_snapshots[identifier] = (size, self.clock() + PROFILE_CURSOR_TTL)
+        return True
+
     async def profiles_list(self, payload, *, response_id):
         payload = require_object(payload)
         now = self.clock()
-        for token, page in tuple(self.profile_pages.items()):
-            if now >= page.expires:
-                del self.profile_pages[token]
+        for identifier, (_, deadline) in tuple(self.profile_snapshots.items()):
+            if now >= deadline:
+                self.drop_profile_snapshot(identifier)
         if set(payload) == {"cursor"}:
             cursor = require_string(payload["cursor"], "cursor")
             page = self.profile_pages.get(cursor)
@@ -364,7 +398,7 @@ class SessionRelay:
                 return refusal("cursor-stale")
             if snapshot.get("accepted") is False:
                 return snapshot
-            page = ProfilePage(self.clock() + PROFILE_CURSOR_TTL, snapshot, limit, 0)
+            page = ProfilePage(uuid.uuid4().hex, snapshot, limit, 0)
         if page.result is not None:
             return page.result
         profiles = page.snapshot["profiles"]
@@ -373,13 +407,15 @@ class SessionRelay:
         while end >= page.start:
             following = cursor if end < len(profiles) else None
             result = {**page.snapshot, "profiles": profiles[page.start:end], "nextCursor": following}
-            if fits_resource(result, response_id):
+            if fits_resource_reply(result):
                 break
             end -= 1
         if end < page.start or (end == page.start and end < len(profiles)):
             return refusal("result-too-large")
         if following is not None:
-            self.profile_pages[following] = ProfilePage(page.expires, page.snapshot, page.limit, end)
+            if page.start == 0 and not self.retain_profile_snapshot(page.snapshot_id, page.snapshot):
+                return refusal("result-too-large")
+            self.profile_pages[following] = ProfilePage(page.snapshot_id, page.snapshot, page.limit, end)
         page.result = result
         return result
 
@@ -387,7 +423,7 @@ class SessionRelay:
         require_fields(payload, {"name"})
         if not valid_name(payload["name"]):
             raise ProtocolError("Invalid profile name")
-        return await self.session.studio_resources.show(payload["name"], lambda result: fits_resource(result, response_id))
+        return await self.session.studio_resources.show(payload["name"], fits_resource_reply)
 
     async def profiles_use(self, payload, *, response_id):
         require_fields(payload, {"profile", "requestId"})
@@ -414,15 +450,18 @@ class SessionRelay:
         if not owned:
             return resource_write_result(await asyncio.shield(receipt.outcome))
         session = self.session
+        operation = profile_reselection.Operation(session.studio_resources)
         try:
-            result = await self.apply_resource(method, value, response_id)
-        except asyncio.CancelledError:
-            receipt.outcome.set_result({"status": "unknown"} if session.studio_resources.uncertain else
-                                       {"status": "completed", "rpcCode": -32603})
-            raise
-        except Exception as error:
-            outcome = ({"status": "unknown"} if session.studio_resources.uncertain else
-                       {"status": "completed", "rpcCode": getattr(error, "code", -32603)})
+            result = await self.apply_resource(method, value, operation)
+        except (Exception, asyncio.CancelledError) as error:
+            if operation.uncertain_effect:
+                session.studio_resources.mark_uncertain()
+                outcome = {"status": "unknown"}
+            else:
+                outcome = {"status": "completed", "rpcCode": getattr(error, "code", -32603)}
+            if isinstance(error, asyncio.CancelledError):
+                receipt.outcome.set_result(outcome)
+                raise
         else:
             outcome = {"status": "completed", "result": result}
         receipt.outcome.set_result(outcome)
@@ -431,7 +470,7 @@ class SessionRelay:
             await session.studio_resources.publish()
         return settled
 
-    async def apply_resource(self, method, value, response_id):
+    async def apply_resource(self, method, value, operation):
         session = self.session
         resources = session.studio_resources
         if (session.mutation_lock.locked() or session.changing or session.turn_active or session.rpc_closed
@@ -448,15 +487,20 @@ class SessionRelay:
             async with session.mutation_lock:
                 if resources.uncertain:
                     return refusal("busy")
+                session.reset_cancellation()
+                operation.generation = session.cancel_generation
                 if method == "profiles/use":
-                    session.reset_cancellation()
                     expected = {"accepted": True, "activeAgent": value["name"] if value else None,
                                 "activeRef": value, "toolOverride": None}
-                    if not fits_resource(expected, response_id):
-                        return refusal("result-too-large")
-                    result, _ = await resources.select(value)
-                    return result if fits_resource(result, response_id) else refusal("result-too-large")
-                return await resources.set_tools(value, lambda result: fits_resource(result, response_id))
+                    if not fits_resource_reply(expected):
+                        return refusal("profile-refused")
+                    result = await resources.select(value, operation)
+                    if fits_resource_reply(result):
+                        return result
+                    if operation.uncertain_effect:
+                        raise ProtocolError("Outcome unknown.", OUTCOME_UNKNOWN)
+                    return refusal("profile-refused")
+                return await resources.set_tools(value, fits_resource_reply, operation)
 
     async def _write_images(self, command, turn, message, refs, receipt, issued, fence):
         session = self.session

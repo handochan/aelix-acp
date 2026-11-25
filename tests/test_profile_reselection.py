@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 
-from aelix_acp.runtime.profile_reselection import APPROVAL_SECONDS
+from aelix_acp.runtime.profile_reselection import APPROVAL_SECONDS, MANUAL_APPROVAL_ENV
 from support import AcpClient
 from test_session_relay import initialize_offer, META
 from test_studio_resources import CASES, QUIET
@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 root = Path.cwd()
 Path(os.environ["AELIX_ACP_READY_FILE"]).write_text(os.environ["AELIX_ACP_NONCE"])
@@ -60,7 +61,9 @@ for line in sys.stdin:
     elif name == "get_messages":
         result = {"messages": []}
     elif name == "capabilities":
-        result = {"version": 1, "methods": methods, "profileRefGuard": 1, "activeAgent": active}
+        result = {"version": 1, "methods": methods, "activeAgent": active}
+        if not Path("unguarded").exists():
+            result["profileRefGuard"] = 1
     elif name == "permissions/get":
         result = {"mode": mode}
     elif name == "permissions/set":
@@ -70,11 +73,18 @@ for line in sys.stdin:
         result = {"tools": [{"name": "read"}], "activeTools": tools}
     elif name == "tools/set_active":
         tools = params["names"]
-        result = {"activeTools": tools}
+        result = {"activeTools": ["read"] if Path("wrong-restore-tools").exists() else tools}
     elif name == "agents/show":
+        if Path("pause-show").exists():
+            Path("inspecting").touch()
+            deadline = time.monotonic() + 8
+            while Path("pause-show").exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
         try:
             ref, profile = read_profile()
-            result = {"profile": {**profile, "ref": ref}}
+            result = {"profile": profile}
+            if not Path("unguarded").exists():
+                profile["ref"] = ref
         except FileNotFoundError:
             success = False
     elif name == "agents/use":
@@ -87,7 +97,9 @@ for line in sys.stdin:
             active = ref["name"]
             tools = profile["tools"]
             log("profile-applied", {"ref": ref, "tools": tools})
-            result = {"message": "Agent profile selected", "activeRef": ref}
+            result = {"message": "Agent profile selected"}
+            if not Path("unguarded").exists():
+                result["activeRef"] = ref
     response = {"type": "response", "command": frame["type"], "success": success, "id": frame["id"], "data": result}
     if not success:
         response["error"] = "profile not found"
@@ -106,16 +118,21 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         self.user.parent.mkdir(parents=True)
         self.project.parent.mkdir(parents=True)
         self.old_ref = self.write_profile(self.user, 0)
-        script = self.root / "guarded.py"
-        script.write_text(GUARDED_CHILD, encoding="utf-8")
-        self.client = await AcpClient.start(
-            self.root, sys.executable, prefix=[str(script)], capabilities=initialize_offer()["clientCapabilities"],
-            entry=("-c", "from aelix_acp.runtime import profile_reselection as r;"
-                   "r.APPROVAL_SECONDS=0.3;from aelix_acp.server import main;main()"),
-        )
-        self.addAsyncCleanup(self.client.close)
+        self.script = self.root / "guarded.py"
+        self.script.write_text(GUARDED_CHILD, encoding="utf-8")
+        self.client = await self.start_client()
         self.session = (await self.client.request("session/new", self.open_params("b-21")))["sessionId"]
         self.original = self.write_record()
+
+    async def start_client(self, *, manual=True):
+        client = await AcpClient.start(
+            self.root, sys.executable, prefix=[str(self.script)], capabilities=initialize_offer()["clientCapabilities"],
+            extra_env={MANUAL_APPROVAL_ENV: "1"} if manual else None,
+            entry=("-c", "from aelix_acp.runtime import profile_reselection as r;"
+                   "r.APPROVAL_SECONDS=1.5;from aelix_acp.server import main;main()"),
+        )
+        self.addAsyncCleanup(client.close)
+        return client
 
     def write_profile(self, path, index, suffix=b""):
         vector = CASES["profile-ref"]["vectors"][index]
@@ -225,8 +242,9 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
                 self.permission(candidate)
                 self.assertEqual(len(self.calls("agents/use")), CASES[case]["assert"]["nativeUseCalls"])
         cancelled = CASES["load-drift-silence"]["withdraw"]
-        self.assertTrue(any(message["method"] == cancelled["method"] and
-                            message["params"]["requestId"] == self.client.requests[0]["id"] for message in self.client.updates))
+        await self.wait_until(lambda: any(message["method"] == cancelled["method"] and
+                              message["params"]["requestId"] == self.client.requests[0]["id"]
+                              for message in self.client.updates))
         wait.set()
         await asyncio.sleep(0)
         self.assertEqual(self.calls("agents/use"), [])
@@ -336,3 +354,76 @@ class ProfileReselectionTests(unittest.IsolatedAsyncioTestCase):
         raw = self.permission(candidate)
         self.assertIn("The omitted portion of the prompt changed.", raw["description"])
         self.assertEqual([field["field"] for field in raw["differences"]], ["revision", "omittedPrompt"])
+
+
+    async def wait_until(self, check):
+        async with asyncio.timeout(6):
+            while not check():
+                await asyncio.sleep(0.01)
+
+    async def test_stop_during_starting_inspection_returns_recovery(self):
+        self.write_profile(self.project, 1)
+        paused = self.root / "pause-show"
+        paused.touch()
+        loading = asyncio.create_task(self.assert_load_error("load-drift-cancel"))
+        await self.wait_until(lambda: (self.root / "inspecting").exists())
+        try:
+            # Send Stop on the wire while native is blocked. Processing it
+            # must not depend on native answering the inspection.
+            stopping = asyncio.create_task(self.client.request("session/cancel", {"sessionId": self.session}))
+            await self.wait_until(lambda: any(identifier > 3 for identifier in self.client.pending))
+            # The server handles Stop admission before reading this request.
+            await self.client.request("session/list", {})
+        finally:
+            paused.unlink()
+        await stopping
+        await loading
+        self.assertFalse(self.client.requests)
+        self.assertEqual(self.calls("agents/use"), [])
+
+    async def test_replacement_withdraws_card_before_busy_response_and_late_allow(self):
+        candidate = self.write_profile(self.project, 1)
+        release = asyncio.Event()
+
+        async def delayed(_):
+            await release.wait()
+            return "allow-once"
+
+        self.client.permission = delayed
+        loading = asyncio.create_task(self.assert_load_error("load-drift-cancel"))
+        await self.wait_until(lambda: bool(self.client.requests))
+        self.permission(candidate)
+        with self.assertRaisesRegex(RuntimeError, "already starting"):
+            await self.client.request("session/load", {**self.open_params("b-new"), "sessionId": self.session})
+        await loading
+        await self.wait_until(lambda: any(update["method"] == "$/cancel_request" for update in self.client.updates))
+        release.set()
+        self.assertEqual(self.calls("agents/use"), [])
+
+    async def test_unguarded_restore_detects_post_apply_change(self):
+        (self.root / "unguarded").touch()
+        (self.root / "replace-after-guard").touch()
+        (self.root / "replacement").write_bytes(CASES["profile-ref"]["vectors"][2]["rawUtf8"].encode())
+        with self.assertRaises(RuntimeError) as failure:
+            await self.load()
+        self.assertEqual(json.loads(str(failure.exception))["data"]["reason"], "changed-again")
+        self.assertEqual(self.calls("agents/use"), [{"name": "quiet"}])
+        self.assertEqual(len(self.calls("profile-applied")), 1)
+        self.assertEqual(self.preferences(), self.original)
+
+    async def test_restore_rejects_nonempty_ack_for_empty_override(self):
+        (self.root / "wrong-restore-tools").touch()
+        with self.assertRaises(RuntimeError) as failure:
+            await self.load()
+        self.assertEqual(json.loads(str(failure.exception))["data"]["kind"], "restrictions_unenforceable")
+        self.assertEqual(self.calls("tools/set_active"), [{"names": []}])
+        self.assertEqual(self.preferences(), self.original)
+
+
+    async def test_unverified_host_cannot_supply_approval(self):
+        await self.client.close()
+        self.client = await self.start_client(manual=False)
+        self.write_profile(self.project, 1)
+        await self.assert_load_error("load-drift-silence")
+        self.assertFalse(self.client.requests)
+        self.assertEqual(self.calls("agents/use"), [])
