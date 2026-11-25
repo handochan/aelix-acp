@@ -386,7 +386,9 @@ apply, at SQLite commit admission, and before publishing the binding.
 kind and method. List rows retain the native saved value, source of the
 decision, applied and in-force values, live observation, and pending state.
 A tool list also returns the saved session `toolOverride` and the worker's
-`activeTools`. The shared pager sorts selection keys by UTF-8 bytes and binds
+`activeTools`. The native row and inventory reads share the session mutation
+lock. If native reports conflicting live values between those reads, refresh
+the list. The shared pager sorts selection keys by UTF-8 bytes and binds
 each snapshot to its session binding, method, and kind. Repeat `kind` on
 continuations. A cursor expires 60 seconds after the snapshot is taken.
 Replays before expiry return the same page. The reply budget includes the JSON

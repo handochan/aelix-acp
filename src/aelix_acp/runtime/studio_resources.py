@@ -94,6 +94,16 @@ class StudioResources:
             return refusal("unsupported")
         if self.selection_operation is not None:
             return refusal("busy")
+        if kind == "tool":
+            # The pin reports native rows and loaded/active tools in two RPCs.
+            # Keep tool/profile writes and override publication outside both reads.
+            if self.session.mutation_lock.locked():
+                return refusal("busy")
+            async with self.session.mutation_lock:
+                return await self._selections_catalog(kind)
+        return await self._selections_catalog(kind)
+
+    async def _selections_catalog(self, kind):
         try:
             data = await self.rpc(selections.LIST, kind=kind)
             rows = self.selection_rows(kind, data)
@@ -108,6 +118,12 @@ class StudioResources:
                 if not text_list(active):
                     raise ValueError("Invalid active tools response")
                 tools = {tool["name"] for tool in resources["tools"]}
+                # Native can also change tools independently of ACP. Reject
+                # an observed disagreement between the two samples.
+                active_names = set(active)
+                if any(type(row["live"]) is bool and row["live"] != (row["key"] in active_names)
+                       for row in rows.values() if row["role"] == "item"):
+                    return refusal("cursor-stale")
             pending = data["policyPending"]
             if type(pending) is not bool:
                 raise ValueError("Invalid selection policy status")

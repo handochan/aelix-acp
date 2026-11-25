@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aelix_acp.runtime import profile_reselection, session_relay, studio_selections
 from aelix_acp.server import Server, Session
@@ -282,6 +282,42 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
         self.snapshots["tool"]["items"] = []
         self.active = ["한" * 90000]
         self.assertEqual(await self.call("selections-list-tool-first"), too_large)
+
+    async def test_tool_page_cannot_mix_rows_with_a_concurrent_tool_override(self):
+        catalog_read = asyncio.Event()
+        held_reads, held_writes = [], []
+        inventory = self.controls["resources/list"]
+
+        def read_inventory(request):
+            if not held_reads:
+                held_reads.append(request)
+                catalog_read.set()
+                return None
+            return inventory(request)
+
+        def change_tools(request):
+            held_writes.append(request)
+            self.active = request["params"]["names"]
+            self.requested.set()
+
+        self.controls.update({"resources/list": read_inventory, "tools/set_active": change_tools})
+        self.session.save = AsyncMock()
+        listing = asyncio.create_task(self.call("selections-list-tool-first"))
+        await asyncio.wait_for(catalog_read.wait(), 5)
+        write = asyncio.create_task(self.call("tools-set-empty"))
+        entered = asyncio.create_task(self.requested.wait())
+        done, _ = await asyncio.wait((write, entered), timeout=5, return_when=asyncio.FIRST_COMPLETED)
+        self.assertTrue(done)
+        self.reply(held_reads[0], inventory(held_reads[0]))
+        result = await listing
+        if held_writes:
+            self.reply(held_writes[0], {"activeTools": []})
+        await write
+        entered.cancel()
+        await asyncio.gather(entered, return_exceptions=True)
+        self.assertTrue(result["items"][0]["live"])
+        self.assertEqual(result["activeTools"], ["read"])
+        self.assertIsNone(result["toolOverride"])
 
     @patch.object(profile_reselection, "host_verified_manual_approval", return_value=True)
     async def test_confirm_approve_refuse_cancel_and_timeout(self, _):
