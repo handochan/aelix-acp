@@ -218,8 +218,14 @@ class BackpressureTests(unittest.TestCase):
 
     @staticmethod
     def stop(proc):
+        # End input first so ACP reaps its native child before the temporary
+        # state is removed; Windows keeps an orphaned child's database locked.
         if proc.poll() is None:
-            proc.kill()
+            proc.stdin.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         proc.wait(timeout=5)
         for pipe in (proc.stdin, proc.stdout, proc.stderr):
             pipe.close()
