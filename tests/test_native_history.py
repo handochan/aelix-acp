@@ -166,18 +166,42 @@ class NativeHistoryFrames(unittest.IsolatedAsyncioTestCase):
 
 
 class HistoryReplayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_protected_replay_preserves_pre_upgrade_native_cache_text(self):
+        def assistant_update(text):
+            return {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}
+
+        recovered = assistant_update("Request failed: ordinary previously recovered assistant text")
+        with TemporaryDirectory() as directory:
+            server = Server(SimpleNamespace(state_dir=directory))
+            server.send = AsyncMock()
+            session = Session(server, "fixture", directory)
+            session.private_host = True
+            with contextlib.closing(server.db):
+                with server.db:
+                    server.db.executemany("INSERT INTO recovered_history VALUES(?, ?, ?)",
+                                          [(session.id, -1, None), (session.id, 0, json.dumps(recovered))])
+                append_event(server.db, session.id, assistant_update("Request failed: legacy failure diagnostic"))
+
+                await server.replay_history(session)
+
+        updates = [call.args[0]["params"]["update"] for call in server.send.await_args_list]
+        self.assertEqual(updates, [recovered, assistant_update("Request failed.")])
+
     async def test_unrepresentable_tool_result_does_not_discard_neighboring_updates(self):
         with TemporaryDirectory() as directory:
             server = Server(SimpleNamespace(state_dir=directory))
             session = SimpleNamespace(id="fixture", read_native_history=AsyncMock(return_value=[
                 {"role": "user", "content": "before"},
                 {"role": "toolResult", "tool_call_id": "call", "content": [{"type": "text", "text": "x" * 256}]},
-                {"role": "assistant", "content": "after"},
+                {"role": "assistant", "content": "Request failed: ordinary recovered text"},
             ]))
             with contextlib.closing(server.db), patch.object(native_history, "TOOL_CONTENT_BYTES", 128):
                 updates = await server.native_history(session)
-                self.assertEqual(list(history(server.db, session.id)), updates)
-                self.assertEqual([updates[0]["content"]["text"], updates[2]["content"]["text"]], ["before", "after"])
+                recorded = list(history(server.db, session.id))
+                self.assertEqual(recorded[2]["_meta"], {store.ASSISTANT_ORIGIN_META: "model"})
+                self.assertEqual([store.display_recorded_update(update, protected=True) for update in recorded], updates)
+                self.assertEqual([updates[0]["content"]["text"], updates[2]["content"]["text"]],
+                                 ["before", "Request failed: ordinary recovered text"])
                 self.assertEqual(updates[1]["toolCallId"], "call")
                 self.assertEqual(updates[1]["content"][0]["content"]["text"], native_history.TOOL_RESULT_OMITTED)
 
@@ -242,7 +266,7 @@ class HistoryReplayTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     blocker.rollback()
                     await asyncio.gather(recovery, live)
-            self.assertEqual(list(history(db, "fixture")), [update])
+            self.assertEqual(list(history(db, "fixture")), [store.with_assistant_origin(update, "model")])
             self.assertEqual(list(history(db, "other")), [update])
 
 
@@ -273,7 +297,7 @@ class HistoryReplayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(unhandled, [])
             self.assertEqual(list(history(db, "fixture")), [])
             await cache_recovered_history(directory, "fixture", [update])
-            self.assertEqual(list(history(db, "fixture")), [update])
+            self.assertEqual(list(history(db, "fixture")), [store.with_assistant_origin(update, "model")])
 
 
 def history_stop_adapter(mode):

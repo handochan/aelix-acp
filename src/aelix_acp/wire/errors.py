@@ -29,6 +29,12 @@ class BackendError(ProtocolError):
         super().__init__(message, -32603, {"kind": "backend_error", "command": command})
 
 
+class NativeAssistantError(ProtocolError):
+    def __init__(self, message: str, cause_kind: str):
+        super().__init__(message, -32603)
+        self.cause_kind = cause_kind
+
+
 def require_object(value: object, name: str = "params") -> dict:
     if not isinstance(value, dict):
         raise ProtocolError(f"{name} must be an object")
@@ -103,7 +109,9 @@ def after_dispatch(error: BaseException) -> ProtocolError:
         return error
     detail = {"kind": "turn_failed_after_dispatch", "retryable": False}
     data = getattr(error, "data", None)
-    if isinstance(data, dict):
+    if isinstance(error, NativeAssistantError):
+        detail["cause"] = {"kind": error.cause_kind, "retryable": False}
+    elif isinstance(data, dict):
         cause = {key: data[key] for key in ("kind", "command") if isinstance(data.get(key), str)}
         if cause:
             detail["cause"] = cause
