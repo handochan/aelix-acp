@@ -5,6 +5,7 @@ import json
 META = "aelix/sessionLockHolder"
 WRITER_FLAG = "--session-writer-kind"
 ERROR_FLAG = "--rpc-session-lock-errors"
+LAUNCH_FLAGS = frozenset({WRITER_FLAG, ERROR_FLAG})
 STARTUP_PREFIX = b"AELIX_RPC_STARTUP_ERROR/1 "
 STARTUP_LIMIT = 256  # Includes the final LF.
 

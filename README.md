@@ -172,8 +172,11 @@ PYTHONPATH=src:tests python -m unittest discover -s tests -v
 # 모듈 하나만: tests/support.py를 가져오므로 tests도 경로에 둡니다.
 PYTHONPATH=src:tests python -m unittest tests.test_children -v
 
-# 고정한 native workspace(uv sync --all-packages)로 실제 프로세스 테스트까지 실행합니다.
-# 로컬 합성 모델 endpoint와 임시 MCP만 사용하고 사용자 키나 인터넷 모델 호출은 쓰지 않습니다.
+# 공개 릴리스 휠 검증. 새 v0.1.0 체크아웃, Python 3.12와 uv를 사용합니다.
+# 휠과 SHA256SUMS를 확인한 뒤 로컬 합성 모델과 임시 MCP로 실제 프로세스를 테스트합니다.
+python scripts/test_native.py --core /absolute/path/to/fresh-v0.1.0-checkout --install-release
+
+# 개발 전용. 고정된 native 소스 workspace에 uv sync --all-packages를 실행한 뒤 사용합니다.
 python scripts/test_native.py --core /absolute/path/to/aelix-ai --check-ref
 
 # 실제 AionCore host + 이 ACP + native. 합성 모델, renderer는 실행하지 않습니다.

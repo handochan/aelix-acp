@@ -86,10 +86,14 @@ For a Studio-managed launch (`AELIX_ACP_STUDIO_MANAGED=1`), ACP marks the
 native RPC writer with `--session-writer-kind=studio` and requests structured
 lock errors with a fresh `--rpc-session-lock-errors=<nonce>`. Offer the integer
 `1` in `initialize.clientCapabilities._meta["aelix/sessionLockHolder"]` to receive
-a verified `holder`. ACP sends `null` for unknown holders, Windows in v0.1.0,
-adapter leases and clients without the offer. Generic launches use the
-existing native refusal text. ACP keeps the native transcript path out of
-structured lock errors.
+a verified `holder`. ACP sends `null` for unknown holders, adapter leases
+and clients without the offer. Intel Macs (`darwin-x64`) and Windows use the
+generic lock text with a `null` holder in native v0.1.0. Write exclusion
+remains active. The Intel attribution fix is tracked in
+[aelix-ai #930](https://github.com/handochan/aelix-ai/issues/930).
+Both flags are reserved in `--aelix-arg` for every ACP launch. Generic
+launches use the existing native refusal text. ACP keeps the native
+transcript path out of structured lock errors.
 [Native control-v1](https://github.com/handochan/aelix-ai/blob/v0.1.0/docs/contracts/control-v1.md#session-lock-errors-on-opted-in-stdio-868-adr-0316)
 
 ### Native provider failures (ACP #64, Host #71)

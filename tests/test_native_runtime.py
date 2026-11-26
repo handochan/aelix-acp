@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import json
 import os
+import platform
 import signal
 from pathlib import Path
 import sqlite3
@@ -1288,6 +1289,17 @@ def setup(api):
         self.assertIn("configOptions", result)
 
     async def test_studio_managed_worker_and_cli_report_the_contending_writer(self):
+        # v0.1.0's fstatfs ABI omits holder proof on Darwin x86_64 (aelix-ai #930).
+        intel_darwin = sys.platform == "darwin" and platform.machine() == "x86_64"
+
+        def assert_holder(actual, kind):
+            if os.name != "posix":
+                self.assertIsNone(actual)
+            elif intel_darwin:
+                self.assertIn(actual, (kind, None))
+            else:
+                self.assertEqual(actual, kind)
+
         await self.prompt("Persist a shared session")
         await self.client.close()
         offer = {"_meta": {**PROTECTED_HOST["_meta"], session_lock.META: 1}}
@@ -1340,8 +1352,8 @@ runpy.run_module("aelix_coding_agent", run_name="__main__", alter_sys=True)
         record = err.splitlines()[-1]
         self.assertTrue(record.startswith(session_lock.STARTUP_PREFIX))
         details = json.loads(record[len(session_lock.STARTUP_PREFIX):])
-        self.assertEqual((details["kind"], details["nonce"], details.get("holderKind")),
-                         ("session_locked", nonce, "studio" if os.name == "posix" else None))
+        self.assertEqual((details["kind"], details["nonce"]), ("session_locked", nonce))
+        assert_holder(details.get("holderKind"), "studio")
 
         # A successful branch returns to the original binding before later writes.
         created = await self.manage("sessions/branch", {"kind": "clone"})
@@ -1361,8 +1373,9 @@ runpy.run_module("aelix_coding_agent", run_name="__main__", alter_sys=True)
             with self.assertRaises(RuntimeError) as caught:
                 await self.client.request("session/load", params, timeout=30)
             error = json.loads(str(caught.exception))
-            self.assertEqual((error["code"], error["data"]["lockedBy"], error["data"]["holder"]),
-                             (SESSION_LOCKED, "native", "cli" if os.name == "posix" else None))
+            self.assertEqual((error["code"], error["data"]["kind"], error["data"]["lockedBy"]),
+                             (SESSION_LOCKED, "session_locked", "native"))
+            assert_holder(error["data"]["holder"], "cli")
         finally:
             self.model_gate.set()
             try:

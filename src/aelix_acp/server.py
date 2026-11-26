@@ -34,7 +34,7 @@ from .wire.transport import decode_frame, encode_frame, ErrorReplies, InvalidFra
 from .runtime.extensions import run_extension_action, require_consent
 from .runtime.leases import acquire as acquire_lease
 from .runtime.leases import lease_path
-from .runtime import forks, host_bytes, native_history, session_relay, transcript
+from .runtime import forks, host_bytes, native_history, session_lock, session_relay, transcript
 from .runtime.children import NESTED_TOOL_CALLS, nested_only
 
 from .session import CONCURRENT_CONTROLS, LONG_CONTROLS, Session, text_content, tool_call
@@ -1090,6 +1090,8 @@ def main():
     parser.add_argument("--provider")
     parser.add_argument("--model")
     args = parser.parse_args()
+    if any(arg.split("=", 1)[0] in session_lock.LAUNCH_FLAGS for arg in args.aelix_arg):
+        parser.error("session writer attribution flags are reserved for Studio-managed launches")
     if args.max_sessions < 1 or args.max_sessions > 256 or any(not math.isfinite(value) or value < 0 for value in (args.turn_timeout, args.command_timeout)):
         parser.error("max-sessions must be 1..256 and timeouts must be finite and nonnegative")
     if args.managed_extensions is not None and any(

@@ -308,7 +308,7 @@ class Session:
         prefix_options = {argument.split("=", 1)[0] for argument in launch_prefix}
         if prefix_options.intersection(SESSION_SELECTORS):
             raise ProtocolError("Adapter launch cannot override native session selection")
-        if self.studio_writer and prefix_options & {session_lock.WRITER_FLAG, session_lock.ERROR_FLAG}:
+        if prefix_options & session_lock.LAUNCH_FLAGS:
             raise ProtocolError("Adapter launch cannot override Studio session writer attribution")
         if self.lease is None:
             self.lease = acquire_lease(self.server.args.state_dir, self.id)
