@@ -8,13 +8,13 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aelix_acp.server import ProtocolError, Server, Session
 from aelix_acp.wire.errors import BackendError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH, after_dispatch, is_native_session_locked
 from aelix_acp.runtime.leases import acquire
-from aelix_acp.runtime.store import append_event, load_preferences
+from aelix_acp.runtime.store import append_event, load_preferences, with_assistant_origin
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -34,6 +34,59 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         await self.session.live_history.flush()
         self.server.db.close()
         self.tmp.cleanup()
+
+    async def test_guarded_load_frame_count_is_sealed_after_earlier_output(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                entered, release = asyncio.Event(), asyncio.Event()
+                captured = []
+                guarded_replies = []
+
+                async def write(raw, *, before_queue=None, after_queue=None):
+                    frame = json.loads(raw)
+                    if before_queue is not None:
+                        before_queue()
+                        guarded_replies.append(frame["id"])
+                    captured.append(frame)
+                    if after_queue is not None:
+                        after_queue()
+                        entered.set()
+                        await release.wait()
+
+                self.server.output = SimpleNamespace(write=write)
+                self.session.load_display_frames = {"version": 1, "totalFrames": 0}
+                self.server.sessions[self.session.id] = self.session
+                resources = self.session.studio_resources
+                resources.starting_binding = "fixture"
+                restore = Mock()
+                resources.restore_operation = restore
+                self.server.send = Server.send.__get__(self.server)
+                update = {"sessionUpdate": "agent_message_chunk",
+                          "content": {"type": "text", "text": "Recovery"}}
+                notify = asyncio.create_task(
+                    self.session.notify("session/update", {"sessionId": self.session.id, "update": update}))
+                await asyncio.wait_for(entered.wait(), 5)
+                result = {"_meta": {"aelix/transcript": self.session.load_display_frames}}
+                request = {"jsonrpc": "2.0", "id": 1, "method": "session/load",
+                           "params": {"sessionId": self.session.id}}
+                with patch.object(self.server, "dispatch", return_value=result):
+                    reply = asyncio.create_task(self.server.handle(request))
+                    if cancel:
+                        notify.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await notify
+                    else:
+                        release.set()
+                        await asyncio.wait_for(notify, 5)
+                    await asyncio.wait_for(reply, 5)
+                restore.require_restore_current.assert_called_once_with()
+                self.assertEqual(guarded_replies, [1])
+                self.assertIsNone(resources.restore_operation)
+                self.assertIsNone(resources.starting_binding)
+                self.assertIsNone(self.session.load_display_frames)
+                self.assertEqual(captured[0]["params"]["update"], update)
+                self.assertEqual(captured[1]["result"]["_meta"]["aelix/transcript"]["totalFrames"], 1)
+                self.assertEqual(captured[2]["params"]["update"]["sessionUpdate"], "current_mode_update")
 
     async def test_close_session_rejects_held_mutation_lock(self):
         async with self.session.mutation_lock:
@@ -556,29 +609,57 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.events, [])
         self.assertEqual(diagnostics.getvalue(), "")
 
-    async def test_canonical_protected_replay_redacts_only_recorded_failure_entries(self):
+    async def test_canonical_protected_load_counts_and_coordinates_failure_replay(self):
+        meta = "aelix/transcript"
         await self.server.dispatch("initialize", {"protocolVersion": 1,
-            "clientCapabilities": {"_meta": {"aelix/transcript": {"version": 1}}}})
-        self.session.private_host = True
-        self.session.controls.capabilities = {"version": 1, "methods": ["transcript/list"]}
-        self.session.proc = SimpleNamespace(returncode=None)
-        self.session.lease = SimpleNamespace(closed=False)
-        meta = {"aelix/transcript": {"source": "adapter", "eventId": "failure"}}
-        append_event(self.server.db, self.session.id, {"sessionUpdate": "agent_message_chunk", "_meta": meta,
-            "content": {"type": "text", "text": "Request failed: fixture-secret"}})
+            "clientCapabilities": {"_meta": {meta: {"version": 1}}}})
+        self.session.cwd = str(Path(self.tmp.name).resolve())
+        await self.session.save()
+        legacy = {"sessionUpdate": "agent_message_chunk",
+                  "content": {"type": "text", "text": "Request failed: fixture-secret"}}
+        tagged_legacy = self.session.adapter_message(legacy)
+        current = self.session.adapter_message({**legacy, "content": {"type": "text", "text": "Request failed."}})
+        for update in (legacy, tagged_legacy, with_assistant_origin(current, "prompt_failure")):
+            append_event(self.server.db, self.session.id, update)
 
-        async def rpc(*_args, **_kwargs):
+        async def rpc(command, **kwargs):
+            if command == "get_session_stats":
+                return {}
+            self.assertEqual((command, kwargs["method"]), ("aelix_control", "transcript/list"))
             return {"nativeSessionId": "native", "bindingId": "binding", "leafId": "first", "totalMessages": 1,
                     "nextCursor": None,
                     "entries": [{"entryId": "first", "parentEntryId": None, "sequence": 1,
                                  "message": {"role": "assistant", "content": "Request failed: ordinary model text"}}]}
 
-        self.session.rpc = rpc
-        await self.server.replay_history(self.session)
-        updates = [frame["params"]["update"] for frame in self.events]
-        self.assertEqual([update["content"]["text"] for update in updates],
-                         ["Request failed: ordinary model text", "Request failed."])
-        self.assertEqual(updates[1]["_meta"], meta)
+        async def start(session, _session_file):
+            session.private_host = True
+            session.controls.capabilities = {"version": 1, "methods": ["transcript/list"]}
+            session.proc = SimpleNamespace(returncode=None)
+            session.lease = SimpleNamespace(closed=False)
+            session.rpc = rpc
+
+        async def write(raw, *, after_queue=None):
+            self.events.append(json.loads(raw))
+            if after_queue is not None:
+                after_queue()
+
+        self.server.output = SimpleNamespace(write=write)
+        self.server.send = Server.send.__get__(self.server)
+        with patch.object(Session, "start", start), patch.object(Session, "commands"):
+            await self.server.handle({"jsonrpc": "2.0", "id": 10, "method": "session/load",
+                                      "params": {"cwd": self.session.cwd, "sessionId": self.session.id}})
+
+        reply_index = next(index for index, frame in enumerate(self.events) if frame.get("id") == 10)
+        marker = self.events[reply_index]["result"]["_meta"][meta]
+        updates = [frame["params"]["update"] for frame in self.events[:reply_index]
+                   if frame.get("method") == "session/update"]
+        native, legacy_failure, current_failure = updates
+        self.assertEqual((marker["totalMessages"], marker["totalFrames"]), (1, len(updates)))
+        self.assertEqual(native["content"]["text"], "Request failed: ordinary model text")
+        self.assertEqual(native["_meta"][meta], {"source": "replay", "nativeSessionId": "native",
+                         "entryId": "first", "parentEntryId": None, "sequence": 1, "role": "assistant", "part": 0})
+        self.assertEqual(legacy_failure, {**tagged_legacy, "content": current["content"]})
+        self.assertEqual(current_failure, current)
 
     async def test_native_abort_has_no_provider_cause(self):
         self.native(failure={"role": "assistant", "stop_reason": "aborted", "error_message": "Connection error."})

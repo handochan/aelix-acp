@@ -306,21 +306,27 @@ def _cache_recovered_history(directory, session_id, updates, stop):
         _recovery_transaction(db, stop, insert, batch, finish=marker)
 
 
-def history(db: sqlite3.Connection, session_id: str):
+def history_records(db: sqlite3.Connection, session_id: str):
+    """Yield the store, stable position and display update in replay order."""
     # A replay can await client output while this connection records live
     # updates. Keep the same cutoff for the lifetime of the cursor.
     (last,) = db.execute("SELECT max(sequence) FROM events WHERE session_id=?", (session_id,)).fetchone()
     if db.execute("SELECT 1 FROM recovered_history WHERE session_id=? AND position=-1", (session_id,)).fetchone():
-        for (value,) in db.execute("SELECT value FROM recovered_history WHERE session_id=? AND position>=0 "
-                                   "ORDER BY position", (session_id,)):
+        for position, value in db.execute("SELECT position,value FROM recovered_history WHERE session_id=? "
+                                          "AND position>=0 ORDER BY position", (session_id,)):
             update = json.loads(value)
             if update.get("sessionUpdate") == "agent_message_chunk":
                 # Cache membership establishes native origin for pre-upgrade rows.
                 update.setdefault("_meta", {}).setdefault(ASSISTANT_ORIGIN_META, "model")
-            yield update
-    for (value,) in db.execute("SELECT value FROM events WHERE session_id=? AND sequence<=? ORDER BY sequence",
-                               (session_id, last)):
-        yield json.loads(value)
+            yield "recovered", position + 1, update
+    for sequence, value in db.execute("SELECT sequence,value FROM events WHERE session_id=? AND sequence<=? "
+                                      "ORDER BY sequence", (session_id, last)):
+        yield "events", sequence, json.loads(value)
+
+
+def history(db: sqlite3.Connection, session_id: str):
+    for _, _, update in history_records(db, session_id):
+        yield update
 
 
 def with_assistant_origin(update: dict, origin: str) -> dict:

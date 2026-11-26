@@ -1093,6 +1093,8 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
                         } for call in self.calls))
                 finally:
                     if write is not None:
+                        if not write.done():
+                            write.cancel()
                         await asyncio.gather(write, return_exceptions=True)
 
     async def test_stale_queued_catalogue_probe_never_touches_target(self):
