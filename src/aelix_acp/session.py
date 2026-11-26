@@ -2014,13 +2014,7 @@ class Session:
             # Keep waiting for the actual manual compaction outcome.
             return False
         self.cancelled = True
-        for operation in (self.studio_resources.waiting_operation, self.studio_resources.legacy_operation,
-                          self.studio_resources.recovering_operation):
-            if operation is not None:
-                operation.retire()
-        selection = self.studio_resources.selection_operation
-        if selection is not None and not selection.dispatched:
-            selection.retire()
+        self.studio_resources.retire_pre_dispatch_writes()
         self.invalidate_image_acceptance()
         self.image_epoch = None
         self.tool_arrived.set()

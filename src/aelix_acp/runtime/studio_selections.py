@@ -36,17 +36,9 @@ class SelectionTargetIO:
         if operation is not None:
             operation.require_current()
         try:
-            async with asyncio.timeout(TARGET_PROBE_WAIT) as wait:
-                if operation is not None:
-                    operation.probe_wait = wait
-                try:
-                    await self.slots.acquire()
-                finally:
-                    if operation is not None:
-                        operation.probe_wait = None
+            async with asyncio.timeout(TARGET_PROBE_WAIT):
+                await self.slots.acquire()
         except TimeoutError:
-            if operation is not None and operation.retired:
-                raise profile_reselection.Stopped() from None
             raise TargetProbeBusy() from None
         loop = asyncio.get_running_loop()
         result = loop.create_future()
@@ -92,14 +84,6 @@ class SelectionWrite(profile_reselection.Operation):
         self.target = None
         self.kind = None
         self.native_keys = {}
-        self.probe_wait = None
-
-    def retire(self):
-        super().retire()
-        # Expire only the slot wait. A probe already running retains its
-        # semaphore permit until its worker calls complete().
-        if self.probe_wait is not None and not self.probe_wait.expired():
-            self.probe_wait.reschedule(asyncio.get_running_loop().time())
 
     def awaiting_native(self):
         return self.reply is not None and not self.reply.done()

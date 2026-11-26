@@ -95,18 +95,20 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
         await session.update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": rendered}})
 
-    async def control(method, params=None):
+    async def control(method, params=None, *, before_write=None):
         if session.cancelled and method in SELECTION_MUTATIONS:
             raise ProtocolError("Resource change cancelled.", -32004)
         if method not in session.controls.capabilities.get("methods", []):
             raise ProtocolError(f"/{name} needs Aelix runtime control v1 ({method}); update the Aelix runtime", -32004)
         timeout = getattr(session.server.args, "command_timeout", 600) or None
         if method == "resources/reload":
-            return await session.reload_resources(params or {}, timeout=timeout, refresh_first=True)
+            return await session.reload_resources(params or {}, timeout=timeout, refresh_first=True,
+                                                  before_write=before_write)
         if method == "tools/set_active":
-            return await session.studio_resources.legacy_tools(params or {}, timeout=timeout)
+            return await session.studio_resources.legacy_tools(params or {}, timeout=timeout, before_write=before_write)
+        fence = {"_before_native_write": before_write} if before_write is not None else {}
         try:
-            return await session.rpc("aelix_control", method=method, params=params or {}, _timeout=timeout)
+            return await session.rpc("aelix_control", method=method, params=params or {}, _timeout=timeout, **fence)
         except BackendError as error:
             if method not in ("resources/list", "agents/show"):
                 raise
@@ -164,14 +166,14 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
                 raise ProtocolError("Unknown ACP session for this workspace and profile")
             await output(await session.server.client_action(session, "open_session", {"sessionId": args}))
     elif name == "reload":
-        async with session.studio_resources.selection_lock:
-            result = await control("resources/reload")
+        async with session.studio_resources.slash_write() as before_write:
+            result = await control("resources/reload", before_write=before_write)
         await output(result)
         await session.commands()
     elif name in {"tools", "skills", "hooks", "mcp"}:
         if name == "tools" and args:
-            async with session.studio_resources.selection_lock:
-                result = await control("tools/set_active", {"names": shlex.split(args)})
+            async with session.studio_resources.slash_write() as before_write:
+                result = await control("tools/set_active", {"names": shlex.split(args)}, before_write=before_write)
                 session.active_tools = result["activeTools"]
                 session.studio_resources.invalidate_pages()
             await output(session.studio_resources.public_inventory(result))
@@ -185,12 +187,16 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
             key, separator, value = args.partition(" ")
             if not separator:
                 raise ProtocolError("Use /settings KEY JSON_VALUE, or /settings to list supported settings")
-            async with session.studio_resources.selection_lock:
-                result = await control("settings/set", {"key": key, "value": json_argument(value)})
+            async with session.studio_resources.slash_write() as before_write:
+                result = await control("settings/set", {"key": key, "value": json_argument(value)},
+                                       before_write=before_write)
             await output(result)
     elif name == "scoped-models":
         if args:
-            await output(await control("settings/set", {"key": "enabled_models", "value": shlex.split(args)}))
+            async with session.studio_resources.slash_write() as before_write:
+                result = await control("settings/set", {"key": "enabled_models", "value": shlex.split(args)},
+                                       before_write=before_write)
+            await output(result)
         else:
             await output((await control("settings/get")).get("settings", {}).get("enabled_models", []))
     elif name in {"login", "logout"} and args and " " not in args:
@@ -202,9 +208,9 @@ async def execute(session, text: str) -> tuple[bool, str | None]:
         if operation == "list":
             await output(await control("agents/list"))
         elif operation in {"show", "use"}:
-            lock = session.studio_resources.selection_lock if operation == "use" else nullcontext()
-            async with lock:
-                result = await control("agents/" + operation, {"name": remainder.strip()})
+            lock = session.studio_resources.slash_write() if operation == "use" else nullcontext()
+            async with lock as before_write:
+                result = await control("agents/" + operation, {"name": remainder.strip()}, before_write=before_write)
                 await output(session.studio_resources.public_native_profile(result) if operation == "show" else result)
                 if operation == "use":
                     await session.controls.refresh()

@@ -50,6 +50,7 @@ class StudioResources:
         self.profile_operation = None
         self.tool_operation = None
         self.selection_operation = None
+        self.resource_writes = set()
         self.waiting_operation = None
         self.legacy_operation = None
         self.recovering_operation = None
@@ -121,35 +122,55 @@ class StudioResources:
             raise ProtocolError("Native tool selection was refused.", error.code, data) from None
 
     def retire_approval(self, *, keep_recovery=False):
+        self.retire_pre_dispatch_writes(keep_recovery=keep_recovery)
         operation = (self.profile_operation or self.tool_operation or self.selection_operation
-                     or self.waiting_operation or self.legacy_operation or self.restore_operation)
+                     or self.legacy_operation or self.restore_operation)
         if operation is not None:
             operation.retire()
-        if not keep_recovery and self.recovering_operation is not None:
-            self.recovering_operation.retire()
+
+    def retire_pre_dispatch_writes(self, *, keep_recovery=False):
+        for operation in self.resource_writes:
+            if not operation.dispatched and not (keep_recovery and operation is self.recovering_operation):
+                operation.retire()
+
+    @asynccontextmanager
+    async def track_write(self, operation):
+        self.resource_writes.add(operation)
+        try:
+            async with operation.cancel_on_retirement():
+                yield
+        finally:
+            self.resource_writes.discard(operation)
+
+    @asynccontextmanager
+    async def slash_write(self):
+        operation = reselection.Operation(self)
+        async with self.track_write(operation), self.selection_lock:
+            operation.require_current()
+            yield operation.before_write
 
     @asynccontextmanager
     async def selection_write(self, operation):
         # Wait before reserving session admission. Stop, close and replacement
         # can still retire this operation while the outstanding read owns the lock.
-        self.waiting_operation = operation
-        try:
-            await self.selection_lock.acquire()
-        finally:
-            self.waiting_operation = None
-        try:
-            # A historical Stop does not prevent a new idle write. A Stop
-            # admitted during this wait retires the operation explicitly.
-            session = self.session
-            if session.server.sessions.get(session.id) is not session:
-                raise reselection.Stopped()
-            if session.compaction_recovery_needed:
-                operation.require_admission(allow_cancelled=True)
-            else:
-                operation.require_current(allow_cancelled=True)
-            yield
-        finally:
-            self.selection_lock.release()
+        async with self.track_write(operation):
+            self.waiting_operation = operation
+            try:
+                await self.selection_lock.acquire()
+            finally:
+                self.waiting_operation = None
+            try:
+                # A historical Stop does not prevent a new idle write.
+                session = self.session
+                if session.server.sessions.get(session.id) is not session:
+                    raise reselection.Stopped()
+                if session.compaction_recovery_needed:
+                    operation.require_admission(allow_cancelled=True)
+                else:
+                    operation.require_current(allow_cancelled=True)
+                yield
+            finally:
+                self.selection_lock.release()
 
     async def recover_selection_write(self, operation):
         session = self.session

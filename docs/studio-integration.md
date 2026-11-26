@@ -396,7 +396,10 @@ are read after those writes finish. A read waits at most five seconds to
 acquire that lock, then returns the existing `unreadable` outcome if it
 cannot get a snapshot. `cursor-stale` applies to invalid continuations.
 Relay and legacy management writers wait for the selection lock before
-reserving session activity. Stop and Close retire an outstanding waiter.
+reserving session activity. Stop, Close, binding retirement, and reload
+cancel resource writes at any await before their first native mutation.
+This releases the request's activity lease and locks, including while a
+read-only probe or native preflight reply is outstanding.
 After acquiring the lock, a writer rechecks its lifetime and tries session
 admission without waiting for a prompt or slash command.
 Legacy management applies the Stop and Close fence again before its first
@@ -414,8 +417,7 @@ envelope. A row or common header that cannot fit returns `result-too-large`.
 ACP runs selection target discovery and file identity checks on up to four
 daemon probe threads per adapter while retaining the write locks for write
 checks. A running probe holds its slot until it returns, even if its request
-is cancelled. Slot acquisition waits up to five seconds. Stop and Close
-expire a pre-dispatch write's slot wait so it can release session activity.
+is cancelled. Slot acquisition waits up to five seconds.
 A saturated pre-dispatch write whose wait expires returns `busy`. On EOF,
 ACP completes normal worker, transport, and store
 cleanup and can exit with a blocked read-only probe still outstanding.

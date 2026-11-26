@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from aelix_acp.runtime import profile_reselection, session_relay, studio_selections
+from aelix_acp.runtime import commands, profile_reselection, session_relay, studio_selections
 from aelix_acp.server import Server, Session
 from aelix_acp.wire.errors import ProtocolError
 from aelix_acp.wire.transport import encode_frame
@@ -946,6 +946,154 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
             if write is not None:
                 await asyncio.gather(write, return_exceptions=True)
         self.assertFalse(self.mutations)
+
+    @asynccontextmanager
+    async def park_resource_write(self, stage):
+        if stage == "probe-slot":
+            async with self.saturated_probe_pool() as entered:
+                yield entered
+            return
+        entered = asyncio.Event()
+        if stage == "recovery":
+            async def hold_recovery(**_):
+                entered.set()
+                await asyncio.Future()
+
+            with patch.multiple(self.session, compaction_recovery_needed=True, rpc_closed=True, proc=None,
+                                recover_after_compaction=hold_recovery):
+                yield entered
+            return
+        if stage == "selection-lock":
+            lock = self.session.studio_resources.selection_lock
+            acquire = lock.acquire
+
+            async def observe_lock():
+                entered.set()
+                await acquire()
+
+            async with lock:
+                with patch.object(lock, "acquire", observe_lock):
+                    yield entered
+            return
+        if stage in ("target-probe", "version-probe"):
+            loop = asyncio.get_running_loop()
+            release = Event()
+            owner, name = ((studio_selections, "project_target") if stage == "target-probe"
+                           else (studio_selections.TargetFence, "require_version"))
+            probe = getattr(owner, name)
+
+            def hold_probe(*args):
+                loop.call_soon_threadsafe(entered.set)
+                release.wait(10)
+                return probe(*args)
+
+            try:
+                with patch.object(owner, name, hold_probe):
+                    yield entered
+            finally:
+                release.set()
+            return
+        requests = []
+
+        def hold_reply(request):
+            requests.append(request)
+            entered.set()
+
+        replies = {
+            "selections/list": self.snapshots["skill"],
+            "resources/list": {"tools": [{"name": str(self.root / "tool")}]},
+            "agents/show": {},
+        }
+        try:
+            with patch.dict(self.controls, {stage: hold_reply}):
+                yield entered
+        finally:
+            for request in requests:
+                self.reply(request, replies[stage])
+
+    async def test_retirement_releases_all_pre_dispatch_resource_waits(self):
+        self.session.cancel_native = AsyncMock()
+        self.session.save = AsyncMock()
+        self.server.close_session = AsyncMock(return_value={})
+        self.session.controls.capabilities["methods"] += ["agents/show", "agents/use", "resources/reload"]
+        params = {"sessionId": self.session.id}
+        raw_tool = str(self.root / "tool")
+        opaque_tool = self.relay.identifiers.key("tool", raw_tool)
+
+        async def prompt(blocks, *_):
+            self.session.reset_cancellation()
+            if blocks[0]["text"].startswith("/tools"):
+                await commands.execute(self.session, blocks[0]["text"])
+            return {"stopReason": "end_turn"}
+
+        self.session.prompt = prompt
+        stages = (
+            ("selection-lock", "selections-set-skill"),
+            ("recovery", "selections-set-skill"),
+            ("probe-slot", "selections-set-skill"),
+            ("target-probe", "selections-set-skill"),
+            ("version-probe", "selections-set-skill"),
+            ("selections/list", "selections-set-skill"),
+            ("resources/list", "tools-set-empty"),
+            ("agents/show", "profiles-use"),
+            ("resources/list", "legacy"),
+            ("selection-lock", "slash"),
+            ("resources/list", "slash"),
+        )
+        cases = [(stage, write_case, retire) for stage, write_case in stages
+                 for retire in ("session/cancel", "session/close")]
+        cases += [("target-probe", "selections-set-skill", retire)
+                  for retire in ("binding-retire", "session/load", "resources/reload")]
+        for index, (stage, write_case, retire) in enumerate(cases, start=1):
+            with self.subTest(stage=stage, write=write_case, retire=retire):
+                self.session.studio_resources.retired_binding = None
+                self.calls.clear()
+                if write_case == "legacy":
+                    request = self.server.dispatch("_aelix/manage", {
+                        **params, "action": "tools/set_active", "arguments": {"names": [opaque_tool]},
+                    })
+                elif write_case == "slash":
+                    request = self.server.dispatch("session/prompt", {
+                        **params, "prompt": [{"type": "text", "text": f"/tools {opaque_tool}"}],
+                    })
+                else:
+                    payload = {**CASES[write_case]["post"]["payload"],
+                               "requestId": f"019aa123-0001-7000-8000-{index:012x}"}
+                    request = self.call(write_case, payload=payload)
+                write = None
+                try:
+                    async with self.park_resource_write(stage) as entered:
+                        write = asyncio.create_task(request)
+                        await asyncio.wait_for(entered.wait(), 2)
+                        if retire == "binding-retire":
+                            self.session.studio_resources.retire_replaced_approval("replacement")
+                        elif retire == "session/load":
+                            with self.assertRaises(ProtocolError):
+                                await self.server.dispatch(retire, {
+                                    **params, "cwd": self.session.cwd,
+                                    "_meta": {session_relay.META_KEY: {"bindingId": self.relay.binding_id}},
+                                })
+                        elif retire == "resources/reload":
+                            with self.assertRaises(ProtocolError):
+                                await self.server.dispatch("_aelix/manage", {**params, "action": retire})
+                        elif retire == "session/close" and self.session.mutation_lock.locked():
+                            with self.assertRaises(ProtocolError):
+                                await self.server.dispatch(retire, params)
+                        else:
+                            await self.server.dispatch(retire, params)
+                        with self.assertRaises(ProtocolError) as cancelled:
+                            await asyncio.wait_for(asyncio.shield(write), 1)
+                        self.assertEqual(cancelled.exception.code, -32004)
+                        self.assertEqual(await self.server.dispatch("session/prompt", {
+                            **params, "prompt": [{"type": "text", "text": "next"}],
+                        }), {"stopReason": "end_turn"})
+                        self.assertEqual(await self.server.dispatch("session/close", params), {})
+                        self.assertFalse(any(call.get("method") in {
+                            "selections/set", "tools/set_active", "agents/use",
+                        } for call in self.calls))
+                finally:
+                    if write is not None:
+                        await asyncio.gather(write, return_exceptions=True)
 
     async def test_stale_queued_catalogue_probe_never_touches_target(self):
         for invalidate in (self.relay.invalidate_list_pages,

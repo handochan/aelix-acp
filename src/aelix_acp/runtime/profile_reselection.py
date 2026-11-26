@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import uuid
 
@@ -33,6 +34,7 @@ class Operation:
         self.no_effect = False
         self.retired = False
         self.permission = None
+        self.pre_dispatch = None
 
     @property
     def uncertain_effect(self):
@@ -48,6 +50,24 @@ class Operation:
         self.retired = True
         if self.permission is not None:
             self.permission.cancel()
+        if not self.dispatched and self.pre_dispatch is not None and not self.pre_dispatch.expired():
+            self.pre_dispatch.reschedule(asyncio.get_running_loop().time())
+
+    @asynccontextmanager
+    async def cancel_on_retirement(self):
+        # Cover every pre-dispatch await with one cancellation scope. Native
+        # dispatch commits the operation to the usual reply/outcome handling.
+        deadline = asyncio.timeout(None)
+        self.pre_dispatch = deadline
+        try:
+            async with deadline:
+                yield
+        except TimeoutError:
+            if deadline.expired() and self.retired:
+                raise Stopped() from None
+            raise
+        finally:
+            self.pre_dispatch = None
 
     def require_admission(self, *, allow_cancelled=False):
         s = self.session
@@ -63,8 +83,8 @@ class Operation:
                 or s.proc is not self.worker or s.rpc_closed or s.ending):
             raise Stopped()
 
-    def before_write(self):
-        self.require_current()
+    def before_write(self, *, allow_cancelled=False):
+        self.require_current(allow_cancelled=allow_cancelled)
         self.dispatched = True
         if self.resources.profile_operation is self:
             self.resources.invalidate_pages()

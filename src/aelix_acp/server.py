@@ -536,12 +536,21 @@ class Server:
                 method == "_aelix/manage" and params.get("action") == "sessions/close")
             if close_requested and candidate is not None:
                 candidate.studio_resources.retire_approval()
-            if method == "session/load" and self.relay_enabled:
-                replacement = session_relay.open_binding(params.get("_meta"))
+            if method == "session/load":
+                replacement = session_relay.open_binding(params.get("_meta")) if self.relay_enabled else None
                 cwd = params.get("cwd")
-                if (candidate is not None and replacement is not None and isinstance(cwd, str)
+                if (candidate is not None and isinstance(cwd, str)
                         and str(Path(cwd).expanduser().resolve()) == candidate.cwd):
-                    candidate.studio_resources.retire_replaced_approval(replacement)
+                    resources = candidate.studio_resources
+                    binding = resources.binding()
+                    if replacement is not None and binding is not None and replacement != binding:
+                        resources.retire_replaced_approval(replacement)
+                    else:
+                        resources.retire_pre_dispatch_writes()
+            if (live is not None and method == "_aelix/manage" and params.get("action") == "resources/reload"
+                    and isinstance(params.get("arguments", {}), dict)
+                    and live.studio_resources.supports("resources/reload")):
+                live.studio_resources.retire_pre_dispatch_writes()
             pending_open = live is not None and live.studio_resources.restore_operation is not None
             if pending_open or (method in ("session/load", "session/delete", "session/close")
                                 and session_id in self.starting_ids):
@@ -887,9 +896,9 @@ class Server:
         operation = operation or profile_reselection.Operation(resources)
 
         def before_write():
-            operation.require_current(allow_cancelled=already_cancelled)
             if session.stop_pending():
                 raise profile_reselection.Stopped()
+            operation.before_write(allow_cancelled=already_cancelled)
 
         resources.legacy_operation = operation
         try:
