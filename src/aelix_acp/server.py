@@ -21,7 +21,7 @@ import math
 
 from .image_policy import VERIFIED_IMAGE_POLICIES
 from . import __version__
-from .wire.errors import (ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH,
+from .wire.errors import (BackendError, ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH,
                           fork_head_changed, require_object, require_string)
 from .runtime.store import (open_store, load_preferences, history_records, legacy_permission_mode,
                             save_preferences, cache_recovered_history, display_recorded_update,
@@ -307,29 +307,55 @@ class Server:
     async def branch_session(self, session, arguments):
         if "sessions/branch" not in session.controls.capabilities.get("methods", []):
             raise ProtocolError("Aelix runtime does not support non-destructive branching", -32004)
-        result = await session.rpc("aelix_control", method="sessions/branch", params=arguments,
-                                  _timeout=getattr(self.args, "command_timeout", 600) or None)
-        if result.get("cancelled"):
-            return result
-        filename = result.get("sessionFile")
-        if not isinstance(filename, str) or not Path(filename).is_file():
-            raise ProtocolError("Aelix did not persist the new branch", -32603)
-        identifier = str(uuid.uuid4())
-        preferences = load_preferences(self.db, session.id)
-        preferences.pop("config", None)
-        preferences.pop("forkProjection", None)
-        preferences.pop("forkHead", None)
-        preferences["backendMessageCount"] = 1
-        def save_branch(db):
-            db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?)", (identifier, session.cwd, self.args.profile,
-                       filename, result.get("title") or "Aelix branch", int(time.time())))
-            save_preferences(db, identifier, preferences)
+        guarded = session.native_lock_errors()
+        worker = session.proc
+        original = (session.state.get("sessionFile"), session.state.get("sessionId"))
+        settled = False
+        keep_worker = not guarded
+        try:
+            try:
+                result = await session.rpc("aelix_control", method="sessions/branch", params=arguments,
+                                           _timeout=getattr(self.args, "command_timeout", 600) or None)
+            except ProtocolError as error:
+                # A refusal confirms the outcome. Timeout and stream loss leave it unknown.
+                settled = isinstance(error, BackendError) or error.code == SESSION_LOCKED
+                raise
+            settled = True
+            if guarded and not await session.verify_branch_binding(worker, original):
+                settled = False
+                raise ProtocolError("Aelix did not return to the original session", -32603)
+            if result.get("cancelled"):
+                keep_worker = True
+                return result
+            filename = result.get("sessionFile")
+            if not isinstance(filename, str) or not Path(filename).is_file():
+                raise ProtocolError("Aelix did not persist the new branch", -32603)
+            identifier = str(uuid.uuid4())
+            preferences = load_preferences(self.db, session.id)
+            preferences.pop("config", None)
+            preferences.pop("forkProjection", None)
+            preferences.pop("forkHead", None)
+            preferences["backendMessageCount"] = 1
 
-        await write_store(self.args.state_dir, save_branch)
-        await session.controls.refresh()
-        await session.restore_tools()
-        await session.save()
-        return {"sessionId": identifier, "parentSessionId": session.id}
+            def save_branch(db):
+                db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?)", (identifier, session.cwd, self.args.profile,
+                           filename, result.get("title") or "Aelix branch", int(time.time())))
+                save_preferences(db, identifier, preferences)
+
+            await write_store(self.args.state_dir, save_branch)
+            await session.controls.refresh()
+            await session.restore_tools()
+            await session.save()
+            keep_worker = True
+            return {"sessionId": identifier, "parentSessionId": session.id}
+        except Exception:
+            if guarded and settled:
+                # Native can publish a branch even when its return switch fails.
+                keep_worker = await session.verify_branch_binding(worker, original)
+            raise
+        finally:
+            if not keep_worker:
+                await session.close()
 
     async def native_history(self, session):
         messages = await session.read_native_history()

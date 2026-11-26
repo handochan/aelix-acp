@@ -9,10 +9,11 @@ import sqlite3
 import sys
 import tempfile
 import textwrap
+import uuid
 import unittest
 
 from support import AcpClient, process_alive
-from aelix_acp.runtime import host_bytes, session_relay
+from aelix_acp.runtime import host_bytes, session_lock, session_relay
 from aelix_acp.runtime.leases import acquire as acquire_lease
 from aelix_acp.runtime.store import ASSISTANT_ORIGIN_META, append_event
 from aelix_acp.wire.errors import ProtocolError, SESSION_LOCKED, TURN_FAILED_AFTER_DISPATCH
@@ -1286,6 +1287,76 @@ def setup(api):
         result = await self.client.request("session/load", {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}, timeout=60)
         self.assertIn("configOptions", result)
 
+    async def test_studio_managed_worker_and_cli_report_the_contending_writer(self):
+        await self.prompt("Persist a shared session")
+        await self.client.close()
+        offer = {"_meta": {**PROTECTED_HOST["_meta"], session_lock.META: 1}}
+        self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities=offer,
+                                            extra_env={"AELIX_ACP_STUDIO_MANAGED": "1"})
+        params = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
+        await self.client.request("session/load", params)
+        capabilities = await self.client.request("_aelix/capabilities", {"sessionId": self.session})
+        if not session_lock.supported(capabilities["runtime"]):
+            if os.environ.get("AELIX_ACP_REQUIRE_LOCK_HOLDER") != "1":
+                self.skipTest("This native workspace does not offer ADR-0316 lock errors")
+            self.fail("The pinned native release must advertise sessionLockErrors: 1")
+        with contextlib.closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            native_file = db.execute("SELECT file FROM sessions WHERE id=?", (self.session,)).fetchone()[0]
+        env = {key: os.environ[key] for key in ["PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"] if key in os.environ}
+        env.update(HOME=str(self.root / "home"), USERPROFILE=str(self.root / "home"),
+                   AELIX_CODING_AGENT_DIR=str(self.root / "agent"), AELIX_SETTINGS_PATH=str(self.root / "agent/settings.json"))
+        nonce = uuid.uuid4().hex
+        contender = await asyncio.create_subprocess_exec(
+            EXECUTABLE, "--mode", "rpc", f"--rpc-session-lock-errors={nonce}",
+            "--offline", "--no-extensions", "--session", native_file,
+            env=env, cwd=self.root, stdin=-1, stdout=-1, stderr=-1,
+        )
+        try:
+            out, err = await asyncio.wait_for(contender.communicate(), 20)
+        finally:
+            if contender.returncode is None:
+                contender.kill()
+                await contender.wait()
+        self.assertEqual((contender.returncode, out), (1, b""))
+        self.assertIn(b"already open in another terminal", err)
+        record = err.splitlines()[-1]
+        self.assertTrue(record.startswith(session_lock.STARTUP_PREFIX))
+        details = json.loads(record[len(session_lock.STARTUP_PREFIX):])
+        self.assertEqual((details["kind"], details["nonce"], details.get("holderKind")),
+                         ("session_locked", nonce, "studio" if os.name == "posix" else None))
+
+        # A successful branch returns to the original binding before later writes.
+        created = await self.manage("sessions/branch", {"kind": "clone"})
+        self.assertEqual(created["parentSessionId"], self.session)
+        await self.client.request("session/close", {"sessionId": self.session})
+        requests = len(self.model_requests)
+        self.model_gate = asyncio.Event()
+        cli = await asyncio.create_subprocess_exec(
+            EXECUTABLE, "--mode", "json", "--offline", "--no-extensions", "--session", native_file,
+            "--print", "CLI holder turn", env=env, cwd=self.root, stdin=-3, stdout=-1, stderr=-1,
+        )
+        try:
+            async with asyncio.timeout(30):
+                while len(self.model_requests) == requests and cli.returncode is None:
+                    await asyncio.sleep(0.01)
+            self.assertGreater(len(self.model_requests), requests, "CLI did not start a turn")
+            with self.assertRaises(RuntimeError) as caught:
+                await self.client.request("session/load", params, timeout=30)
+            error = json.loads(str(caught.exception))
+            self.assertEqual((error["code"], error["data"]["lockedBy"], error["data"]["holder"]),
+                             (SESSION_LOCKED, "native", "cli" if os.name == "posix" else None))
+        finally:
+            self.model_gate.set()
+            try:
+                _, err = await asyncio.wait_for(cli.communicate(), 20)
+            finally:
+                if cli.returncode is None:
+                    cli.kill()
+                    await cli.wait()
+        self.assertEqual(cli.returncode, 0, err.decode(errors="replace"))
+        self.assertIn("configOptions", await self.client.request("session/load", params))
+        self.assertEqual(await self.prompt("Continue after CLI"), {"stopReason": "end_turn"})
+
     async def test_standard_head_fork_opens_child_in_a_second_adapter(self):
         import sqlite3
 
@@ -1616,7 +1687,9 @@ def setup(api):
         loaded = await self.client.request("session/load", {
             "sessionId": self.session, "cwd": str(self.root), "mcpServers": [],
         })
-        self.assertNotIn("aelix/transcriptCapability", loaded.get("_meta", {}))
+        # A capable worker may advertise transcript v1 to a legacy client.
+        # Only a client that offers it can receive a completed replay snapshot.
+        self.assertNotIn("aelix/transcript", loaded.get("_meta", {}))
         replayed = [frame["params"]["update"] for frame in self.client.updates
                     if frame.get("method") == "session/update"
                     and frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"]

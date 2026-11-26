@@ -27,7 +27,7 @@ from .wire.process import terminate_owned
 from .stdio import write_diagnostic
 from .wire.transport import encode_frame
 from . import image_policy
-from .runtime import native_frames, native_history, transcript
+from .runtime import native_frames, native_history, session_lock, transcript
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
 from .runtime.provider_errors import provider_failure_kind
@@ -196,6 +196,9 @@ class Session:
         self.initial_mode = initial_mode
         self.proc = None
         self.pending = {}
+        self.pending_commands = {}
+        self.studio_writer = os.environ.get("AELIX_ACP_STUDIO_MANAGED") == "1"
+        self.startup_lock = None
         self.history_requests = set()
         self.tasks = set()
         self.done = None
@@ -305,6 +308,8 @@ class Session:
         prefix_options = {argument.split("=", 1)[0] for argument in launch_prefix}
         if prefix_options.intersection(SESSION_SELECTORS):
             raise ProtocolError("Adapter launch cannot override native session selection")
+        if self.studio_writer and prefix_options & {session_lock.WRITER_FLAG, session_lock.ERROR_FLAG}:
+            raise ProtocolError("Adapter launch cannot override Studio session writer attribution")
         if self.lease is None:
             self.lease = acquire_lease(self.server.args.state_dir, self.id)
         self.fork_peer_lease = acquire_lease(self.server.args.state_dir, self.id, purpose="fork-peer-v1")
@@ -326,6 +331,7 @@ class Session:
         # remains Ask until native confirms the just-read policy below.
         self.controls.permission_mode = "default"
         self.stderr_tail = bytearray()  # A refusal from an earlier worker must not label this one.
+        self.startup_lock = session_lock.StartupLock(uuid.uuid4().hex) if self.studio_writer else None
         tcp = sys.platform == "win32"
         self.socket_dir = _make_session_dir(tcp=tcp)
         os.chmod(self.socket_dir, 0o700)
@@ -334,6 +340,8 @@ class Session:
         args = [self.server.args.aelix, *launch_prefix, "--mode", "rpc", "--offline", "--no-extensions",
                 "--permission-mode", self.launch_mode,
                 "--append-system-prompt-file", str(PACKAGE / "profiles" / f"{self.server.args.profile}.md")]
+        if self.startup_lock is not None:
+            args += [f"{session_lock.WRITER_FLAG}=studio", f"{session_lock.ERROR_FLAG}={self.startup_lock.nonce}"]
         args += ["--agents" if self.agents_enabled else "--no-agents"]
         if self.trust_project is not None:
             args += ["--approve" if self.trust_project else "--deny"]
@@ -432,15 +440,24 @@ class Session:
                 await self.proc.wait()
                 raise
         self.stderr_task = asyncio.create_task(self.read_stderr())
-        self.tasks = {asyncio.create_task(self.read_rpc()), self.stderr_task}
+        self.reader = asyncio.create_task(self.read_rpc())
+        self.tasks = {self.reader, self.stderr_task}
         try:
             self.state = await self.rpc("get_state")
-        except ProtocolError:
+        except (ProtocolError, ConnectionError):
+            if self.startup_lock is not None and not self.rpc_closed:
+                # A startup rejection can close stdin before get_state drains.
+                await asyncio.wait({self.reader}, timeout=2)
             await self.raise_if_locked()
             raise
+        finally:
+            self.startup_lock = None
         if not ready_file.is_file() or ready_file.read_text() != nonce:
             raise ProtocolError("The tool approval bridge did not load; refusing this session", -32603)
         if fork_source is not None:
+            # The explicit switch below comes before the normal capability refresh.
+            if self.studio_writer:
+                self.controls.capabilities = await self.rpc("aelix_control", method="capabilities", params={})
             if saved_agent and self.studio_resources.recorded is None:
                 try:
                     await self.rpc("aelix_control", method="agents/show", params={"name": saved_agent})
@@ -591,8 +608,34 @@ class Session:
     async def raise_if_locked(self):
         """Report native's writer-lock refusal as a structured, final error."""
         await self.settle_exit()
-        if is_native_session_locked(self.stderr_tail.decode("utf-8", errors="replace")):
+        if self.startup_lock is not None:
+            if details := self.startup_lock.refusal(self.proc.returncode):
+                raise self.native_lock_error(details) from None
+        elif is_native_session_locked(self.stderr_tail.decode("utf-8", errors="replace")):
             raise session_locked(self.id, "native") from None
+
+    def native_lock_error(self, details):
+        return session_locked(self.id, "native", session_lock.holder(
+            details, getattr(self.server, "client_capabilities", {}),
+        ))
+
+    def native_lock_errors(self):
+        return self.studio_writer and session_lock.supported(self.controls.capabilities)
+
+    async def verify_branch_binding(self, worker, original):
+        if worker is None or self.proc is not worker or worker.returncode is not None or self.rpc_closed:
+            return False
+        try:
+            state = await self.rpc("get_state", _timeout=5)
+        except (ProtocolError, OSError):
+            return False
+        if (self.proc is not worker or worker.returncode is not None or self.rpc_closed
+                or not isinstance(state, dict)
+                or (state.get("sessionFile"), state.get("sessionId")) != original
+                or state.get("isStreaming") is not False or state.get("isCompacting") is not False):
+            return False
+        self.state = state
+        return True
 
     async def settle_exit(self):
         # Native explains a startup refusal on stderr and exits. Let a worker
@@ -789,6 +832,8 @@ class Session:
         future = asyncio.get_running_loop().create_future() if _await_response else None
         if future is not None:
             self.pending[request_id] = future
+            if self.studio_writer:
+                self.pending_commands[request_id] = (command, kwargs.get("method"))
         if _project_history:
             self.history_requests.add(request_id)
         if (task := asyncio.current_task()) in self.interventions:
@@ -835,6 +880,7 @@ class Session:
                 raise ProtocolError(f"Aelix RPC {command} timed out", -32007, {"kind": "timeout", "command": command}) from None
         finally:
             self.pending.pop(request_id, None)
+            self.pending_commands.pop(request_id, None)
             if _project_history:
                 self.history_requests.discard(request_id)
 
@@ -843,9 +889,13 @@ class Session:
         while chunk := await self.proc.stderr.read(4096):
             # Bounded copy for native refusals reported only on stderr.
             self.stderr_tail = (self.stderr_tail + chunk)[-STDERR_TAIL:]
+            if self.startup_lock is not None:
+                self.startup_lock.read_stderr(chunk)
             if not self.private_host:
                 text = f"[aelix:{self.id[:8]}] " + decoder.decode(chunk)
                 await self.server.forward_stderr(text.encode("utf-8"))
+        if self.startup_lock is not None:
+            self.startup_lock.stderr_eof = True
 
     async def read_native_history(self):
         try:
@@ -856,9 +906,10 @@ class Session:
             raise native_history.unavailable()
         return messages
 
-    async def rpc_frames(self):
+    async def rpc_frames(self, *, on_data=None):
         async for line, envelope, projected in native_frames.read_frames(
-            self.proc.stdout, private=self.private_host, wants_history=self.history_requests.__contains__
+            self.proc.stdout, private=self.private_host, wants_history=self.history_requests.__contains__,
+            on_data=on_data,
         ):
             if projected is not None:
                 request_id, messages = projected
@@ -882,8 +933,9 @@ class Session:
 
     async def read_rpc(self):
         self.reader = asyncio.current_task()
+        startup = self.startup_lock
         try:
-            async for line in self.rpc_frames():
+            async for line in self.rpc_frames(on_data=startup.saw_stdout if startup is not None else None):
                 try:
                     event = json.loads(line)
                     if not isinstance(event, dict):
@@ -891,20 +943,15 @@ class Session:
                 except ValueError:
                     write_diagnostic("[aelix-acp] Ignored non-JSON child stdout")
                     continue
-                future = self.pending.get(event.get("id"))
+                request_id = event.get("id")
+                future = self.pending.get(request_id)
                 if event.get("type") == "response" and future is not None:
                     if not future.done():
-                        if event.get("success"):
-                            future.set_result(event.get("data") or {})
-                        elif is_native_session_locked(event.get("error", "")):
-                            future.set_exception(session_locked(self.id, "native"))
-                        else:
-                            detail = "Native RPC failed" if self.private_host else str(event.get("error", "RPC failed"))
-                            error = BackendError(detail, event.get("command", "unknown"))
-                            error.studio_tool_lock = tool_lock_key(event.get("error"))
-                            future.set_exception(error)
+                        self.complete_rpc(future, event, self.pending_commands.get(request_id))
                 else:
                     await self.event(event)
+            if startup is not None:
+                startup.stdout_eof = True
         except Exception as exc:
             detail = "Aelix stream failed" if self.private_host else f"Aelix stream failed: {exc}"
             self.failure = TurnFailure(detail)
@@ -922,6 +969,25 @@ class Session:
                 task = asyncio.create_task(self.close())
                 self.server.cleanup_tasks.add(task)
                 task.add_done_callback(self.server.cleanup_tasks.discard)
+
+    def complete_rpc(self, future, event, expected):
+        if expected is not None and (event.get("command") != expected[0] or type(event.get("success")) is not bool):
+            return  # Only a response for this command can establish its outcome.
+        if event.get("success"):
+            future.set_result(event.get("data") or {})
+            return
+        details = event.get("errorDetails")
+        if self.native_lock_errors():
+            if expected in (("switch_session", None), ("aelix_control", "sessions/branch")) and session_lock.contention(details):
+                future.set_exception(self.native_lock_error(details))
+                return
+        elif is_native_session_locked(event.get("error", "")):
+            future.set_exception(session_locked(self.id, "native"))
+            return
+        detail = "Native RPC failed" if self.private_host else str(event.get("error", "RPC failed"))
+        error = BackendError(detail, event.get("command", "unknown"))
+        error.studio_tool_lock = tool_lock_key(event.get("error"))
+        future.set_exception(error)
 
     def clear_image_sample(self):
         if self.socket_dir and self.image_epoch:
