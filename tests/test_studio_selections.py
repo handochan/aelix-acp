@@ -1108,6 +1108,33 @@ class SelectionsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(self.relay.list_pages)
                 self.assertFalse(self.server.selection_target_io.slots.locked())
 
+    async def test_close_fences_queued_catalogue_probe_before_cleanup_runs(self):
+        closing, release = asyncio.Event(), asyncio.Event()
+
+        async def deferred_cleanup():
+            closing.set()
+            await release.wait()
+
+        close = None
+        try:
+            with patch.object(self.session, "_close", deferred_cleanup), patch.object(
+                studio_selections, "project_target", wraps=studio_selections.project_target
+            ) as probe:
+                async with self.saturated_probe_pool() as waiting:
+                    listing = asyncio.create_task(self.call("selections-list-tool-first"))
+                    await asyncio.wait_for(waiting.wait(), 5)
+                    close = asyncio.create_task(self.server.dispatch(
+                        "session/close", {"sessionId": self.session.id}))
+                    await asyncio.wait_for(closing.wait(), 5)
+                result = await asyncio.wait_for(listing, 5)
+                probe.assert_not_called()
+                self.assertEqual(result, CASES["relay-error-unreadable"]["result"])
+                self.assertFalse(self.relay.list_pages)
+        finally:
+            release.set()
+            if close is not None:
+                self.assertEqual(await close, {})
+
     async def test_cancelled_probe_awaiter_does_not_free_the_running_threads_slot(self):
         pool = self.server.selection_target_io
         loop = asyncio.get_running_loop()

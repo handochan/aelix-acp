@@ -422,7 +422,7 @@ A saturated pre-dispatch write whose wait expires returns `busy`. On EOF,
 ACP completes normal worker, transport, and store
 cleanup and can exit with a blocked read-only probe still outstanding.
 After waiting for a slot, catalogue reads recheck their binding and snapshot
-generation before starting a filesystem probe.
+generation and check for pending Close before starting a filesystem probe.
 Daemon probes avoid the default executor's shutdown join on Windows and
 POSIX. The OS releases their read handles on exit. ACP refuses a fresh
 native selection snapshot while Stop is pending. Stop sends its own control

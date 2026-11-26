@@ -234,13 +234,13 @@ class StudioResources:
     async def selections_catalog(self, kind):
         if not self.supports_selection(kind, selections.LIST):
             return refusal("unsupported")
-        if self.session.changing or self.session.rpc_closed:
+        if self.session.changing or self.session.rpc_closed or self.session._close_task is not None:
             return refusal("unreadable")
         relay = self.session.input_relay
         generation = relay.list_generation if relay is not None else None
 
         def require_snapshot_current():
-            if (self.session.input_relay is not relay
+            if (self.session._close_task is not None or self.session.input_relay is not relay
                     or (relay is not None and (relay.list_generation != generation
                                                or self.retired_binding == relay.binding_id))):
                 raise reselection.Stopped()
