@@ -11,8 +11,7 @@ SOCKET_PATH_TOO_LONG = -33004
 
 # Native's own refusal when another process holds the session's writer lock
 # (aelix-ai cli/entry.py `_session_owned_message` and the runtime's swap path).
-# Until aelix-ai reports the lock holder (Studio request R7), this phrase is the
-# only signal. Keep every match in `is_native_session_locked`.
+# Unopted workers use the legacy text signal.
 _NATIVE_LOCKED_PHRASE = "already open in another terminal"
 _MAX_MESSAGE = 2000
 
@@ -52,12 +51,12 @@ def is_native_session_locked(text: object) -> bool:
     return _NATIVE_LOCKED_PHRASE in str(text).casefold()
 
 
-def session_locked(session_id: str, locked_by: str) -> ProtocolError:
-    """A session another writer holds. `holder` stays null until R7 provides it."""
+def session_locked(session_id: str, locked_by: str, holder: str | None = None) -> ProtocolError:
+    """A writer conflict, optionally with the verified native holder kind."""
     where = "the Aelix CLI or another Aelix process" if locked_by == "native" else "another Aelix Studio window"
     return ProtocolError(f"This session is open in {where}. Close it there, then open it again.",
                          SESSION_LOCKED, {"kind": "session_locked", "sessionId": session_id,
-                                          "lockedBy": locked_by, "holder": None, "retryable": False})
+                                          "lockedBy": locked_by, "holder": holder, "retryable": False})
 
 
 def fork_head_changed() -> ProtocolError:

@@ -201,11 +201,14 @@ adapter's own store cannot replace that code. When the adapter process itself
 dies or the transport closes, there is no adapter error; that replay is the
 host's to prevent (planned in handochan/aelix-studio-host#6).
 
-A native writer-lock refusal ("already open in another terminal", whether at
-startup or on a session switch) and a second adapter's ACP lease become
-`-33001` (`session_locked`). Until aelix-ai reports the lock holder (Studio
-request R7), native's refusal text is the only signal; one function in
-`wire/errors.py` matches it so R7 can replace it.
+Native writer-lock refusals and conflicting ACP leases become `-33001`
+(`session_locked`). For R7, ACP gives Studio-managed native workers a writer
+kind and a fresh startup nonce. It verifies the startup refusal against that
+nonce and reads correlated lock-error details on a capable worker's session
+switch or branch return. A negotiated Host can receive the verified holder
+kind. Generic workers use the native refusal text matched by `wire/errors.py`.
+See [the Studio contract](studio-integration.md) for the capability and
+platform behavior.
 
 With transcript v1 negotiated, session load stages the selected branch from
 native `transcript/list` and reconciles it with ACP tool metadata and adapter

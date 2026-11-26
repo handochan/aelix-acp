@@ -5,9 +5,9 @@ Python 3.11+ 어댑터입니다. `0.2.0a1`은 첫 공동 Beta를 위한 **개발
 ACP 패키지는 표준 라이브러리만 사용하며, Aelix는 별도 프로세스로 실행합니다.
 
 이 버전은 Aelix의 **runtime-control v1**을 필요로 합니다. 공개 `aelix==0.1.0b2`에는
-이 API가 없어 세션을 시작하지 않습니다(`-32004`). 검증한 native 소스는
-[`runtime-reference.json`](runtime-reference.json)에 고정합니다. 지금은 beta.3 출시 전
-aelix-ai main 후보이며, beta.3가 나오면 그 tag로 다시 고정합니다.
+이 API가 없어 세션을 시작하지 않습니다(`-32004`). 검증 대상은
+[`runtime-reference.json`](runtime-reference.json)에 기록한 aelix-ai `v0.1.0` 공개 릴리스입니다.
+이 파일의 커밋과 SHA-256을 사용해 릴리스 휠을 확인합니다.
 beta.2 Preview 내부 검증 빌드는 ACP `117cf6c9d536c4aa98b1f3a6481c12464584960c`를 그대로 씁니다.
 
 ## 구현 범위
@@ -39,9 +39,10 @@ beta.2 Preview 내부 검증 빌드는 ACP `117cf6c9d536c4aa98b1f3a6481c12464584
 
 ## 실행
 
-검증된 본체 체크아웃에서 `uv sync --all-packages`로 workspace 패키지를 함께 설치합니다.
-그 환경에 ACP를 설치하거나 독립 환경에서 해당 Aelix 경로를 지정합니다.
-본체 umbrella 패키지만 Git URL로 설치하면 이전 공개 하위 패키지가 섞일 수 있습니다.
+[`v0.1.0` 릴리스](https://github.com/handochan/aelix-ai/releases/tag/v0.1.0)의
+휠 4개를 같은 환경에 설치합니다. 해당 환경에 ACP를 설치하거나 독립 환경에서
+Aelix 실행 경로를 지정합니다. ACP CI와 동일하게 검증하려면 Python 3.12와 uv로
+`python scripts/test_native.py --core /absolute/path/to/fresh-v0.1.0-checkout --install-release`를 실행합니다.
 
 ```sh
 python -m pip install /absolute/path/to/aelix-acp
@@ -75,8 +76,9 @@ POSIX에서 native를 닫을 때는 SIGTERM 뒤 기다렸다가 SIGKILL합니다
 프레임이 클라이언트와 기록에 남습니다. Windows는 그대로 Job Object를 닫아 즉시 끝냅니다.
 같은 저장 세션을 두 ACP 프로세스가 열면 OS 파일 잠금으로 두 번째를 거부합니다.
 CLI 등 다른 native 프로세스가 같은 transcript를 쓰고 있으면 native가 거부하며,
-어댑터는 이를 `-33001` 구조화 오류로 전달합니다. 보유자 정보는 aelix-ai의
-잠금 보유자 API(Studio 요청 R7)가 생길 때까지 `null`입니다.
+어댑터는 이를 `-33001` 구조화 오류로 전달합니다. Studio 관리 워커는 보유자
+확인을 켜며, Host가 capability를 선언하면 확인된 `cli` 또는 `studio` 값을 받습니다.
+Windows와 보유자를 확인할 수 없는 경우에는 `null`을 전달합니다.
 
 `--max-sessions` 기본 16, `--turn-timeout`·`--command-timeout` 기본 600초입니다.
 시간 제한 0은 무제한입니다. `--enable-agents`는 새 세션의 native 위임 기본값입니다.
@@ -170,8 +172,11 @@ PYTHONPATH=src:tests python -m unittest discover -s tests -v
 # 모듈 하나만: tests/support.py를 가져오므로 tests도 경로에 둡니다.
 PYTHONPATH=src:tests python -m unittest tests.test_children -v
 
-# 고정한 native workspace(uv sync --all-packages)로 실제 프로세스 테스트까지 실행합니다.
-# 로컬 합성 모델 endpoint와 임시 MCP만 사용하고 사용자 키나 인터넷 모델 호출은 쓰지 않습니다.
+# 공개 릴리스 휠 검증. 새 v0.1.0 체크아웃, Python 3.12와 uv를 사용합니다.
+# 휠과 SHA256SUMS를 확인한 뒤 로컬 합성 모델과 임시 MCP로 실제 프로세스를 테스트합니다.
+python scripts/test_native.py --core /absolute/path/to/fresh-v0.1.0-checkout --install-release
+
+# 개발 전용. 고정된 native 소스 workspace에 uv sync --all-packages를 실행한 뒤 사용합니다.
 python scripts/test_native.py --core /absolute/path/to/aelix-ai --check-ref
 
 # 실제 AionCore host + 이 ACP + native. 합성 모델, renderer는 실행하지 않습니다.

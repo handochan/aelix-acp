@@ -142,7 +142,7 @@ async def _scan_history(history, data):
         await asyncio.sleep(0)
 
 
-async def read_frames(reader, *, private, wants_history):
+async def read_frames(reader, *, private, wants_history, on_data=None):
     """Yield a line, its oversized tool envelope, or a projected history response."""
 
     line = bytearray()
@@ -151,6 +151,9 @@ async def read_frames(reader, *, private, wants_history):
     history_id = None
     ignored = oversized = False
     while chunk := await reader.read(65536):
+        if on_data is not None:
+            on_data()
+            on_data = None
         start = 0
         while start < len(chunk):
             newline = chunk.find(b"\n", start)

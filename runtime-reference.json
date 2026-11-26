@@ -1,9 +1,17 @@
 {
   "repository": "https://github.com/handochan/aelix-ai",
-  "commit": "83714045439478b17ab0c61248dc5c414435927a",
+  "tag": "v0.1.0",
+  "commit": "aceeb29c5df1f9ae8978f737c020324af7197ab8",
+  "version": "0.1.0",
   "runtimeControlVersion": 1,
-  "workspaceInstallRequired": true,
+  "workspaceInstallRequired": false,
   "minimumPython": "3.11",
-  "status": "beta.3-candidate",
-  "note": "aelix-ai main before the v0.1.0-beta.3 cut; re-pin to the tagged release when it is published."
+  "status": "release",
+  "sha256sums": "4615f26d519ea343f8379aba3388fb7a60395c982b43a0dafd8e42fa9878a07b",
+  "wheels": {
+    "aelix-0.1.0-py3-none-any.whl": "1676cab184a9836c1c8117e88a58bfae6916e33ca328c9b6b07a2a701ccf8a67",
+    "aelix_agent_core-0.1.0-py3-none-any.whl": "e81092cb5273c1df601d54e1df95c010ff1b1042f7e6b50ef79fa32e03aec8f8",
+    "aelix_ai-0.1.0-py3-none-any.whl": "e9b67e2937696b990b09056f54d7a0f6f2e9bf0f8f259d5c6afe80cf101ee395",
+    "aelix_coding_agent-0.1.0-py3-none-any.whl": "22b3e033194296a61647a58d54bc397ae7869b43021e62dd86541dafc03ff884"
+  }
 }

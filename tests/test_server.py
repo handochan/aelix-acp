@@ -824,6 +824,28 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((error.code, error.data["kind"], error.data["lockedBy"]), (SESSION_LOCKED, "session_locked", "native"))
         self.assertNotIn("/private/file.jsonl", json.dumps(error.data) + str(error))
 
+    async def test_native_structured_lock_errors_require_the_correlated_command(self):
+        from aelix_acp.runtime import session_lock
+
+        reader = asyncio.StreamReader()
+        self.session.proc = SimpleNamespace(stdout=reader, returncode=None)
+        self.session.studio_writer = True
+        self.session.controls.capabilities = {"sessionLockErrors": 1}
+        self.session.server.client_capabilities = {"_meta": {session_lock.META: 1}}
+        future = asyncio.get_running_loop().create_future()
+        self.session.pending["swap"] = future
+        self.session.pending_commands["swap"] = ("switch_session", None)
+        refusal = {"type": "response", "id": "swap", "success": False,
+                   "errorDetails": {"kind": "session_locked", "holderKind": "studio"}}
+        reader.feed_data(json.dumps({**refusal, "command": "get_state"}).encode() + b"\n")
+        reader.feed_data(json.dumps({**refusal, "command": "switch_session",
+                                     "errorDetails": {"kind": "session_locked", "holderKind": "cli"}}).encode() + b"\n")
+        reader.feed_eof()
+        self.session._close_task = asyncio.get_running_loop().create_future()
+        await self.session.read_rpc()
+        error = future.exception()
+        self.assertEqual((error.code, error.data["holder"]), (SESSION_LOCKED, "cli"))
+
     def test_a_second_adapter_lease_is_a_structured_lock(self):
         held = acquire(self.tmp.name, "shared")
         try:

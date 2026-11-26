@@ -2,8 +2,8 @@
 
 Handoff for the separate `aelix-studio` project. This is an API contract,
 not evidence that its UI is connected. Bundle the ACP version and exact
-native workspace commit from `runtime-reference.json` together. Older public
-Aelix lacks these operations. Advertise client actions only after implementing them.
+native release from `runtime-reference.json` together. Verify the released wheels
+against its checksums. Advertise client actions only after implementing them.
 
 ## Standard ACP
 
@@ -70,7 +70,7 @@ also listed in `agentCapabilities._meta["aelix/errors"]`:
 
 | Code | `data` | Meaning |
 |---|---|---|
-| `-33001` | `{kind:"session_locked", sessionId, lockedBy:"native"\|"acp", holder:null, retryable:false}` | Another writer holds the session: the CLI or another native process (`native`), or another adapter process (`acp`). Show it; reopen after that writer closes. `holder` stays `null` until aelix-ai reports the lock holder (Studio request R7). |
+| `-33001` | `{kind:"session_locked", sessionId, lockedBy:"native"\|"acp", holder:"cli"\|"studio"\|null, retryable:false}` | Another writer holds the session. Reopen after that writer closes. `lockedBy` identifies the native writer lock or the adapter lease. |
 | `-33002` | `{kind:"turn_failed_after_dispatch", retryable:false, cause?}` | The turn failed after native accepted work, where the failure would otherwise be `-32603`. Model calls or tool effects may have happened; do not resend automatically. |
 
 AionCore maps both to a non-retryable protocol error, so its automatic turn
@@ -80,9 +80,21 @@ a failure with a more specific code keeps that code instead of `-33002`:
 `-32003`, `-32006`, `-32008` or `-33001`. AionCore treats all of them as
 non-retryable too. An adapter crash or closed transport has no adapter error at
 all; AionCore v0.2.2 replays that turn once until handochan/aelix-studio-host#6
-lands. The native lock is
-recognized from native's own refusal text until R7 provides a structured
-signal; the native transcript path is never copied into the error.
+lands.
+
+For a Studio-managed launch (`AELIX_ACP_STUDIO_MANAGED=1`), ACP marks the
+native RPC writer with `--session-writer-kind=studio` and requests structured
+lock errors with a fresh `--rpc-session-lock-errors=<nonce>`. Offer the integer
+`1` in `initialize.clientCapabilities._meta["aelix/sessionLockHolder"]` to receive
+a verified `holder`. ACP sends `null` for unknown holders, adapter leases
+and clients without the offer. Intel Macs (`darwin-x64`) and Windows use the
+generic lock text with a `null` holder in native v0.1.0. Write exclusion
+remains active. The Intel attribution fix is tracked in
+[aelix-ai #930](https://github.com/handochan/aelix-ai/issues/930).
+Both flags are reserved in `--aelix-arg` for every ACP launch. Generic
+launches use the existing native refusal text. ACP keeps the native
+transcript path out of structured lock errors.
+[Native control-v1](https://github.com/handochan/aelix-ai/blob/v0.1.0/docs/contracts/control-v1.md#session-lock-errors-on-opted-in-stdio-868-adr-0316)
 
 ### Native provider failures (ACP #64, Host #71)
 
@@ -93,7 +105,7 @@ If native supplies a structured `message.error` object, ACP reads its integer
 object is authoritative, including when the resulting cause is `unknown`.
 See [native #921](https://github.com/handochan/aelix-ai/issues/921).
 
-Native pin `83714045` serializes failed HTTP responses, connection failures,
+The `83714045` baseline serializes failed HTTP responses, connection failures,
 and stream errors into the same `error_message` field. A provider can supply
 identical text in an HTTP 200 stream, including a complete SDK-formatted
 diagnostic. ACP uses `unknown` for every failure on this pin that lacks
@@ -200,9 +212,9 @@ its content or a terminal result. A valid empty snapshot has
 `totalMessages: 0`; a damaged but readable native path sets `recovered: true`.
 
 The adapter advertises support in `agentCapabilities._meta["aelix/transcript"]`
-as `{"version":1}`. This advertisement describes adapter support. The current
-native pin `83714045` uses legacy replay. Host #4 needs a native pin that
-includes aelix-ai #655 to enable transcript v1.
+as `{"version":1}`. The native `v0.1.0` release includes aelix-ai #655 and offers
+`transcript/list` on eligible writer-owned CLI-RPC bindings. Host #4 requires
+both the adapter offer and the session capability to apply replay.
 
 Offer `{"version":1}` in `clientCapabilities._meta["aelix/transcript"]`.
 Each successful `session/new` or `session/load` with a supporting native worker
