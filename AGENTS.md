@@ -27,7 +27,7 @@ gh project item-list 9 --owner handochan --format json --limit 100
 ## Product and adapter boundaries
 
 - Preview uses released beta.2 native wheels without source patches or forced private-core upgrades, with ACP pinned at `117cf6c9d536c4aa98b1f3a6481c12464584960c`. Verify source/wheel identity and actual capabilities; a `0.1.0b2` version string does not prove released-wheel behavior.
-- Main targets the Beta: runtime-control v1 at the native commit in `runtime-reference.json`, re-pinned to the beta.3 release when it is cut. It does not run on public beta.2.
+- Main targets the Beta with runtime-control v1 and the public native release in `runtime-reference.json`. The beta.2 Preview uses the separately pinned adapter.
 - Through the first Beta, reuse Aion UI surfaces and connect actual native state. A separate implementation of every slash command is not required; new `/clear` implementation is excluded.
 - Ask/Yolo is a design target until implemented and accepted; do not advertise unsupported modes or emulate native capabilities from names alone.
 - Keep native configuration/auth/session semantics in Aelix. ACP translates protocol and capabilities; verify actual native history for fork/import/clone.

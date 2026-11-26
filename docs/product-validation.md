@@ -2,9 +2,10 @@
 
 ## Delegated children (aelix-ai #612) — 2026-11-20
 
-Candidate: this adapter with native aelix-ai
-`83714045439478b17ab0c61248dc5c414435927a` (`runtime-reference.json`), which
-has the `children/` family, `aelix_child`, `aelix_notice` and child approvals.
+This run used native aelix-ai `83714045439478b17ab0c61248dc5c414435927a`,
+which has the `children/` family, `aelix_child`, `aelix_notice` and child approvals.
+The current [runtime reference](../runtime-reference.json) points to the public
+v0.1.0 release at `aceeb29c5df1f9ae8978f737c020324af7197ab8`.
 Host: macOS arm64; Python 3.12.13 unless named. Commits are this branch's
 checkpoints. The product code is final at `8e932ac`; later commits change docs
 only. The live rows at `8533b45` ran on product code that changed after it:
