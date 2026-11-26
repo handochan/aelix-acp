@@ -1291,7 +1291,25 @@ def setup(api):
         await self.prompt("Persist a shared session")
         await self.client.close()
         offer = {"_meta": {**PROTECTED_HOST["_meta"], session_lock.META: 1}}
-        self.client = await AcpClient.start(self.root, EXECUTABLE, capabilities=offer,
+        native = (EXECUTABLE,)
+        if os.name == "posix":
+            # Same proof path as the native real-child tests. The account
+            # cache is independent of HOME and can be shared on CI runners.
+            launcher = self.root / "native-holder-probe.py"
+            launcher.write_text("""import runpy
+from pathlib import Path
+
+try:
+    from aelix_agent_core.session import _lock_proof_posix
+except ImportError:
+    pass
+else:
+    _lock_proof_posix._cache_base = lambda: Path(__file__).parent
+
+runpy.run_module("aelix_coding_agent", run_name="__main__", alter_sys=True)
+""", encoding="utf-8")
+            native = (sys.executable, str(launcher))
+        self.client = await AcpClient.start(self.root, native[0], prefix=native[1:], capabilities=offer,
                                             extra_env={"AELIX_ACP_STUDIO_MANAGED": "1"})
         params = {"cwd": str(self.root), "sessionId": self.session, "mcpServers": []}
         await self.client.request("session/load", params)
@@ -1307,7 +1325,7 @@ def setup(api):
                    AELIX_CODING_AGENT_DIR=str(self.root / "agent"), AELIX_SETTINGS_PATH=str(self.root / "agent/settings.json"))
         nonce = uuid.uuid4().hex
         contender = await asyncio.create_subprocess_exec(
-            EXECUTABLE, "--mode", "rpc", f"--rpc-session-lock-errors={nonce}",
+            *native, "--mode", "rpc", f"--rpc-session-lock-errors={nonce}",
             "--offline", "--no-extensions", "--session", native_file,
             env=env, cwd=self.root, stdin=-1, stdout=-1, stderr=-1,
         )
@@ -1332,7 +1350,7 @@ def setup(api):
         requests = len(self.model_requests)
         self.model_gate = asyncio.Event()
         cli = await asyncio.create_subprocess_exec(
-            EXECUTABLE, "--mode", "json", "--offline", "--no-extensions", "--session", native_file,
+            *native, "--mode", "json", "--offline", "--no-extensions", "--session", native_file,
             "--print", "CLI holder turn", env=env, cwd=self.root, stdin=-3, stdout=-1, stderr=-1,
         )
         try:

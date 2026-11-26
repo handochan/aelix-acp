@@ -937,7 +937,8 @@ class Session:
         self.reader = asyncio.current_task()
         startup = self.startup_lock
         try:
-            async for line in self.rpc_frames(on_data=startup.saw_stdout if startup is not None else None):
+            frames = self.rpc_frames() if startup is None else self.rpc_frames(on_data=startup.saw_stdout)
+            async for line in frames:
                 try:
                     event = json.loads(line)
                     if not isinstance(event, dict):
