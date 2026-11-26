@@ -24,7 +24,7 @@ AD = {
 META = "aelix/sessionRelay"
 STATE, STEER, FOLLOW_UP, LOOKUP = AD["requests"]
 AD["requests"] += [name for name in CASES["relay-discovery"]["response"]["body"]["data"]["requests"]
-                   if not name.startswith("_aelix/session/selections/") and name not in AD["requests"]]
+                   if name not in AD["requests"]]
 
 
 def request_id(number):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import uuid
 
@@ -33,6 +34,7 @@ class Operation:
         self.no_effect = False
         self.retired = False
         self.permission = None
+        self.pre_dispatch = None
 
     @property
     def uncertain_effect(self):
@@ -48,18 +50,41 @@ class Operation:
         self.retired = True
         if self.permission is not None:
             self.permission.cancel()
+        if not self.dispatched and self.pre_dispatch is not None and not self.pre_dispatch.expired():
+            self.pre_dispatch.reschedule(asyncio.get_running_loop().time())
 
-    def require_current(self):
+    @asynccontextmanager
+    async def cancel_on_retirement(self):
+        # Cover every pre-dispatch await with one cancellation scope. Native
+        # dispatch commits the operation to the usual reply/outcome handling.
+        deadline = asyncio.timeout(None)
+        self.pre_dispatch = deadline
+        try:
+            async with deadline:
+                yield
+        except TimeoutError:
+            if deadline.expired() and self.retired:
+                raise Stopped() from None
+            raise
+        finally:
+            self.pre_dispatch = None
+
+    def require_admission(self, *, allow_cancelled=False):
         s = self.session
-        if (self.retired or s.cancelled or s.cancel_generation != self.generation
-                or self.worker is None or self.worker.returncode is not None
-                or s.proc is not self.worker or s.rpc_closed or s.ending
+        if (self.retired or (s.cancelled and not allow_cancelled) or s.cancel_generation != self.generation
                 or s.server.closing or s.server.input_closed or self.resources.binding() != self.binding
                 or (self.binding is not None and self.binding == self.resources.retired_binding)):
             raise Stopped()
 
-    def before_write(self):
-        self.require_current()
+    def require_current(self, *, allow_cancelled=False):
+        self.require_admission(allow_cancelled=allow_cancelled)
+        s = self.session
+        if (self.worker is None or self.worker.returncode is not None
+                or s.proc is not self.worker or s.rpc_closed or s.ending):
+            raise Stopped()
+
+    def before_write(self, *, allow_cancelled=False):
+        self.require_current(allow_cancelled=allow_cancelled)
         self.dispatched = True
         if self.resources.profile_operation is self:
             self.resources.invalidate_pages()
@@ -155,7 +180,6 @@ async def approve(operation, before, after):
         if before["promptTruncated"] and after["promptTruncated"]:
             lines.append("The omitted portion of the prompt may have changed.")
     lines.append("Use this version of the profile?")
-    server = session.server
     params = {
         "sessionId": session.id,
         "toolCall": {"toolCallId": "profile-change-" + uuid.uuid4().hex,
@@ -169,8 +193,14 @@ async def approve(operation, before, after):
     }
     if len(encode_frame(params)) > APPROVAL_BYTES:
         return "unanswered"
+    return await request_approval(operation, params, timeout=APPROVAL_SECONDS)
+
+
+async def request_approval(operation, params, *, timeout):
+    session = operation.session
+    server = session.server
     task = asyncio.create_task(server.client_request(
-        "session/request_permission", params, withdraw=True, timeout=APPROVAL_SECONDS,
+        "session/request_permission", params, withdraw=True, timeout=timeout,
         max_response_bytes=4096, before_send=operation.require_current,
     ))
     operation.permission = task

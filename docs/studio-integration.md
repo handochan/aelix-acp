@@ -343,9 +343,9 @@ gets up to 45 s to end before it is killed, so `{}` can take that long (see
 [Delegated children](#delegated-children) and the close latency measured in
 [product validation](product-validation.md)).
 
-## Studio session profiles and tools
+## Studio session profiles, tools, and project selections
 
-This section is part of Studio #7 Unit A.
+This section covers Studio #7 units A and B.
 
 Offer `clientCapabilities._meta["aelix/sessionRelay"] = {version:1, notifications:false}`
 and use the binding echoed by `session/new` or `session/load`. The host sends
@@ -359,6 +359,8 @@ are available through the same conversation extension route as running input.
 | `profiles/show` | `{name}` | Current winner's ref, relative source, prompt preview, and model, tool, skill and policy fields |
 | `profiles/use` | `{profile,requestId}` | On success, active name and ref with `toolOverride:null`. A null profile clears the selection. |
 | `tools/set-active` | `{names,requestId}` | On success, persisted `toolOverride` and native `activeTools`. An empty array explicitly enables zero tools. |
+| `selections/list` | `{kind,limit?}` or `{kind,cursor}` | Project and global scope status, selection rows, policy pending, and next cursor |
+| `selections/set` | `{scope:"project",kind,changes,requestId}` | Saved project changes, relative filenames, mismatches, and native apply status |
 | `requests/lookup` | `{requestId}` | Receipt in the original binding, with `pending`, `completed`, `unknown`, or `unavailable` status |
 
 A `ProfileRef` contains `name`, `scope` and `revision`. Its SHA-256 includes the
@@ -373,8 +375,8 @@ Prompt previews are cleaned and limited to 512 Unicode scalars.
 
 An idle write uses a UUIDv7 and shares the binding's 256 receipts with running
 input. Identical requests share the result for up to 600 seconds. Reusing an
-ID for different content returns `-32602`. A completed write is accepted once
-native application and SQLite persistence succeed. `-33100` means the effect
+ID for different content returns `-32602`. Profile and tool override writes
+are accepted once native application and SQLite persistence succeed. `-33100` means the effect
 could not be confirmed. Look up the original receipt and read current state.
 Reopen the session before mutating again when the worker and saved preferences
 may have diverged.
@@ -412,6 +414,148 @@ or ACP withdrawal. The adapter rechecks operation lifetime after native
 apply, at SQLite commit admission, and before publishing the binding.
 [Host #76](https://github.com/handochan/aelix-studio-host/issues/76)
 
+### Project selections
+
+`kind` is `tool`, `skill`, or `mcp`. Native must advertise the requested
+kind and method. List rows retain the native saved value, source of the
+decision, applied and in-force values, live observation, and pending state.
+A tool list also returns the saved session `toolOverride` and the worker's
+`activeTools`. ACP takes the active tools and loaded rows from one native
+snapshot. The pinned native snapshot marks excluded tools with the
+`excluded` lock tag and supplies the live state for every tool row. A prompt
+can change that live state through an extension hook while the snapshot
+remains consistent. Fresh selection reads share a separate lock with ACP
+tool, profile, reload, and selection writes so the override and native state
+are read after those writes finish. A read waits at most five seconds to
+acquire that lock, then returns the existing `unreadable` outcome if it
+cannot get a snapshot. `cursor-stale` applies to invalid continuations.
+Relay and legacy management writers wait for the selection lock before
+reserving session activity. Stop, Close, binding retirement, and reload
+cancel resource writes at any await before their first native mutation.
+This releases the request's activity lease and locks, including while a
+read-only probe or native preflight reply is outstanding.
+After acquiring the lock, a writer rechecks its lifetime and tries session
+admission without waiting for a prompt or slash command.
+Legacy management applies the Stop and Close fence again before its first
+native mutation, including after any inventory preflight.
+The first resource write after a compaction timeout can recover the saved
+session under its activity lease. Stop and Close still retire that request
+during restart. ACP checks the binding and replacement worker before
+mutation. A checked profile preview remains usable in the same binding and
+its revision is resolved again on the replacement worker.
+The shared pager sorts selection keys by UTF-8 bytes and binds
+each snapshot to its session binding, method, and kind. Repeat `kind` on
+continuations. A cursor expires 60 seconds after the snapshot is taken.
+Replays before expiry return the same page. The reply budget includes the JSON
+envelope. A row or common header that cannot fit returns `result-too-large`.
+ACP runs selection target discovery and file identity checks on up to four
+daemon probe threads per adapter while retaining the write locks for write
+checks. A running probe holds its slot until it returns, even if its request
+is cancelled. Slot acquisition waits up to five seconds.
+A saturated pre-dispatch write whose wait expires returns `busy`. On EOF,
+ACP completes normal worker, transport, and store
+cleanup and can exit with a blocked read-only probe still outstanding.
+After waiting for a slot, catalogue reads recheck their binding and snapshot
+generation and check for pending Close before starting a filesystem probe.
+Daemon probes avoid the default executor's shutdown join on Windows and
+POSIX. The OS releases their read handles on exit. ACP refuses a fresh
+native selection snapshot while Stop is pending. Stop sends its own control
+frames independently of any outstanding snapshot reply. An already-started
+tool or skill settings read can still block the pinned native event loop,
+which delays native handling of the Stop frames.
+[Native off-loop settings I/O](https://github.com/handochan/aelix-ai/issues/929)
+Identifiers pass through unchanged when they are nonblank, at most 8,192
+Unicode characters, and contain no slash, backslash, leading drive prefix,
+non-displayable Unicode character, or text flagged by the existing sensitive
+text redaction. The names `.` and `..` and the prefixes `selection:` and
+`readonly:` are reserved. Native v0.1.0 uses reversible hex after
+`readonly:` for display-only keys containing invalid Unicode. Every native
+identifier outside the pass-through rules becomes a binding-scoped
+`selection:<hex>` key. The same key appears in rows, active tool and override
+lists, changes, apply deltas, and keyed refusals. Use it in `tools/set-active`
+and `selections/set` and refresh after rebinding. ACP resolves the key against
+the current native inventory and stores the native override so it can restore
+it after restart. The session management inventory and tool selector use the
+same keys. Profile skill source labels describe provenance.
+Every projected selection label passes the sensitive-text check, including
+labels that differ from their native keys. Projected inventory descriptions,
+reasons, and error messages use the same redaction.
+
+Set accepts 1–1024 distinct, ordered `{key,on}` entries with boolean
+`on`. ACP checks each key and lock against a fresh native list and sends
+project scope exclusively. Global listings report `writable:false` with
+`reason:"management-helper"`. Global writes return `-33102` before a native
+call. Confirmation, paths, cwd, and commands are outside the payload schema.
+Under the session write lease, ACP requires the expected project filename,
+rejects aliased directories and files, and checks the project and global file
+identities before dispatch and after native replies. A reported save must
+create or atomically replace the project file. Unexpected file or directory
+changes produce an unknown outcome and fence the worker. The pinned native
+writer resolves and locks its own target later. A path retarget can still
+affect another file before ACP detects it, and a retarget restored before
+readback may be invisible if its effect is outside the observed files. A native
+guard must bind the expected project directory and target to the transaction.
+Beta allows project writes with this residual risk.
+[Native target guard](https://github.com/handochan/aelix-ai/issues/927) ·
+[Beta decision](https://github.com/handochan/aelix-studio/issues/7#issuecomment-7176049795)
+
+First-time creation of `.aelix/settings.json` uses one standard
+`session/request_permission` card tied to the native confirm ID, operation,
+worker, binding, and cancellation generation. The approval path is disabled
+pending Host #76's authenticated, binding-bound manual confirmation signal.
+Until then, an edit requiring creation returns `consent-required` with
+`cause:"unanswered"` before dispatching a native save. Existing project files
+remain editable. The approval path offers allow once and reject once, with
+withdrawal on Stop, retirement, or 45-second expiry. Project trust is checked
+separately. [Host #76](https://github.com/handochan/aelix-studio-host/issues/76)
+
+For tools and skills, native saves `defaultTools` or `skills` in
+`.aelix/settings.json`. The effect is `next_request`. A confirmed save can
+return `accepted:true` with `apply.applied:false`, including a deferred apply.
+Refresh the list to confirm applied state and surface mismatches alongside the
+saved result. An explicit tool override, including `[]`, is restored and
+verified under the same mutation lock before replying to an immediate tool
+apply. If native defers a tool apply while an override exists, reopen the
+session before prompting so startup can apply that override to the saved
+defaults. The override is still stored in the session preferences.
+
+ACP reads the saved catalog again after a write and compares all requested
+keys. It derives changed values from the keyed snapshots because the pin
+reports display labels that can be shared by multiple rows. A missing
+requested row returns `selection-missing`. Its `written` paths report any
+observed partial save so the client can refresh before taking another action.
+This is a settled outcome and can leave the worker available. An unknown
+write outcome uses `-33100` and fences the worker.
+When native refuses a missing row before saving, `written` is empty even
+if an external edit had already replaced the file.
+Atomic batch validation requires a native transaction change.
+[Native batch validation and keyed results](https://github.com/handochan/aelix-ai/issues/928)
+
+MCP edits `mcpServers.<name>.enabled` in the project `.aelix/mcp.json` when
+that file is in effect. The project file replaces the global MCP file as a
+whole. The native writer requires an existing file. MCP saves return
+`effect:"restart"` and `apply:null`. Close and load the same session on a
+new worker, then list again to check the applied and live values.
+
+### Restoring inheritance proposal
+
+The pinned native `selections/set` accepts boolean edits. Its tool and skill
+editors can sometimes drop a selector while setting a boolean. Equal
+effective values are skipped, so a boolean write cannot guarantee removal of a
+scope's override. An omitted MCP `enabled` defaults to true within the
+effective file.
+
+For D16 v1.1, advertise supported kinds with `selectionUnsetKinds` and
+extend a change entry with the disjoint form `{key,unset:true}`. Start with
+tool and skill. Native would remove that row's explicit selector under the
+existing scope lock, then re-evaluate it from the lower-priority scope or
+defaults. It would refuse an unset when a shared pattern or replacing list
+still decides the row or removing it would change unrelated rows. An absent
+override is an idempotent no-op, including when the file does not exist.
+ACP would forward project unsets through the same receipt and apply path. The
+global helper would use its existing expected-revision check and lock. Studio
+would offer “Restore inherited value” for advertised kinds and confirm the
+source on a fresh list. MCP needs a separate per-server inheritance contract.
 
 ## Management
 

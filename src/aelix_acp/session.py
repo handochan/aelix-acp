@@ -27,7 +27,7 @@ from .wire.process import terminate_owned
 from .stdio import write_diagnostic
 from .wire.transport import encode_frame
 from . import image_policy
-from .runtime import native_frames, native_history, session_lock, transcript
+from .runtime import native_frames, native_history, profile_reselection, session_lock, studio_selections, transcript
 from .runtime.controls import SessionControls, MODE_IDS
 from .runtime.context import SessionContext
 from .runtime.provider_errors import provider_failure_kind
@@ -62,7 +62,7 @@ READ_ONLY_COMMANDS = frozenset({"get_state", "get_messages", "get_available_mode
                                 "export_html", "abort", "abort_retry", "abort_bash"})
 READ_ONLY_CONTROLS = frozenset({"capabilities", "resources/list", "settings/get", "permissions/get",
                                 "permissions/evaluate", "mcp/status", "extensions/list", "auth/status",
-                                "agents/list", "agents/show", "commands/cancel",
+                                "agents/list", "agents/show", "commands/cancel", studio_selections.LIST,
                                 "children/list", "children/events", transcript.METHOD})
 # aelix-ai #612: a host's view of and interventions on delegated children. Native
 # answers them during a turn and during agents/run (its CONCURRENT_METHODS and the
@@ -206,6 +206,7 @@ class Session:
         self.rpc_closed = False
         self.cancelled = False
         self.cancel_generation = 0
+        self.direct_cancels = 0
         self.turn_active = False
         self.input_relay = None
         self.private_host = getattr(server, "host_bytes", None) is not None
@@ -534,8 +535,11 @@ class Session:
                     # history, or native resumed without a model) the saved one applies.
                     await self.controls.set(config_id, config[config_id], publish=False)
         metadata = getattr(self.server, "client_capabilities", {}).get("_meta", {})
-        if metadata.get("aelix/clientActions") is True and "ui/enable" in methods:
-            await self.rpc("aelix_control", method="ui/enable", params=ui_enable_params(methods))
+        client_actions = metadata.get("aelix/clientActions") is True
+        relay_selections = self.studio_resources.binding() is not None and studio_selections.SET in methods
+        if (client_actions or relay_selections) and "ui/enable" in methods:
+            await self.rpc("aelix_control", method="ui/enable",
+                           params=ui_enable_params(methods if client_actions else ()))
         if guard_selectors:
             await self.selector_startup(nonce, "finish")
         snapshot = None
@@ -647,7 +651,7 @@ class Session:
         if self.proc.returncode is not None:
             await asyncio.wait({self.stderr_task}, timeout=2)
 
-    async def restore_tools(self):
+    async def restore_tools(self, *, operation=None):
         if self.active_tools is None:
             return
         try:
@@ -656,7 +660,8 @@ class Session:
             resources = await self.rpc("aelix_control", method="resources/list", params={})
             available = {tool["name"] for tool in resources.get("tools", [])}
             selected = [name for name in self.active_tools if name in available]
-            result = await self.rpc("aelix_control", method="tools/set_active", params={"names": selected})
+            hook = {"_before_native_write": operation.require_current} if operation is not None else {}
+            result = await self.rpc("aelix_control", method="tools/set_active", params={"names": selected}, **hook)
             if not self.studio_resources.tools_match(result, selected):
                 raise ProtocolError("Aelix did not restore the saved tool selection", -32004,
                                     {"kind": "restrictions_unenforceable", "methods": ["tools/set_active"]})
@@ -665,12 +670,16 @@ class Session:
                 self.studio_resources.mark_uncertain()
             raise
 
-    async def reload_resources(self, arguments, *, timeout, refresh_first=False):
+    async def reload_resources(self, arguments, *, timeout, refresh_first=False, before_write=None):
+        fence = {"_before_native_write": before_write} if before_write is not None else {}
         try:
-            result = await self.rpc("aelix_control", method="resources/reload", params=arguments, _timeout=timeout)
+            result = await self.rpc("aelix_control", method="resources/reload", params=arguments, _timeout=timeout,
+                                    **fence)
             if refresh_first:
                 await self.controls.refresh()
             await self.restore_tools()
+        except profile_reselection.Stopped:
+            raise  # The pre-dispatch fence refused the reload before native changed.
         except BaseException:
             if self.active_tools is not None and not self.studio_resources.uncertain:
                 self.studio_resources.mark_uncertain()
@@ -678,7 +687,7 @@ class Session:
         self.studio_resources.invalidate_pages()
         return result
 
-    async def configure_mcp(self, servers):
+    async def configure_mcp(self, servers, *, before_write=None):
         before = await self.rpc("aelix_control", method="resources/list", params={})
         active = before.get("activeTools", [])
         available = {tool["name"] for tool in before.get("tools", [])}
@@ -686,7 +695,8 @@ class Session:
         desired = self.active_tools if self.active_tools is not None else active
         # Profile selection also installs native filters. Clear the actual
         # live filter for every idle reconfiguration, not just GUI selections.
-        await self.rpc("aelix_control", method="tools/set_active", params={"names": []})
+        fence = {"_before_native_write": before_write} if before_write is not None else {}
+        await self.rpc("aelix_control", method="tools/set_active", params={"names": []}, **fence)
         try:
             result = await self.rpc("aelix_control", method="mcp/configure", params={"servers": servers}, _timeout=60)
         except ProtocolError:
@@ -827,7 +837,7 @@ class Session:
                     write_diagnostic(error.data["kind"])
 
     async def rpc(self, command, *, _timeout=45, _image_write=None, _project_history=False, _await_response=True,
-                  _before_native_write=None, **kwargs):
+                  _before_native_write=None, _selection_write=None, **kwargs):
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future() if _await_response else None
         pending_commands = self.pending_commands if getattr(self, "studio_writer", False) else None
@@ -857,6 +867,8 @@ class Session:
                 issued()  # write() can fail after handing bytes to the pipe.
             if _before_native_write is not None:
                 _before_native_write()
+            if _selection_write is not None:
+                _selection_write.reply = future
             self.proc.stdin.write(raw)
             await self.proc.stdin.drain()
             # Queue writes have their own receipts. A late drain must not
@@ -880,6 +892,8 @@ class Session:
                         await self.rpc("abort", _timeout=5)
                 raise ProtocolError(f"Aelix RPC {command} timed out", -32007, {"kind": "timeout", "command": command}) from None
         finally:
+            if _selection_write is not None:
+                _selection_write.reply = None
             self.pending.pop(request_id, None)
             if pending_commands is not None:
                 pending_commands.pop(request_id, None)
@@ -990,6 +1004,12 @@ class Session:
         detail = "Native RPC failed" if self.private_host else str(event.get("error", "RPC failed"))
         error = BackendError(detail, event.get("command", "unknown"))
         error.studio_tool_lock = tool_lock_key(event.get("error"))
+        operation = self.studio_resources.selection_operation
+        if operation is not None and operation.reply is future:
+            message = event.get("error")
+            error.studio_selection_refusal = studio_selections.native_refusal(message)
+            if error.studio_selection_refusal == "selection-missing":
+                error.studio_selection_key = operation.missing_key_hint(message)
         future.set_exception(error)
 
     def clear_image_sample(self):
@@ -1086,16 +1106,26 @@ class Session:
                 return
             # A child's question is registered before its task runs: a frame read meanwhile can void it.
             void = self.open_question(event) if event.get("method") == "childApproval" else None
-            task = asyncio.create_task(self.handle_ui(event, void))
+            worker = self.proc
+            operation = self.studio_resources.selection_operation
+            selection_confirm = event.get("method") == "confirm" and (
+                (operation is not None and operation.awaiting_native())
+                or (self.input_relay is not None and event.get("title") == studio_selections.CREATE_TITLE)
+            )
+            claimed = selection_confirm and operation is not None and operation.claim_confirmation(event)
+            task = asyncio.create_task(self.handle_selection_confirm(event, operation if claimed else None, worker)
+                                       if selection_confirm
+                                       else self.handle_ui(event, void))
             self.tasks.add(task)
             self.ui_tasks.add(task)
             task.add_done_callback(self.tasks.discard)
             task.add_done_callback(self.ui_tasks.discard)
             if event.get("method") not in UI_NOTIFICATIONS:
                 self.unstarted.add(task)  # handle_ui's first step takes it out
-                task.add_done_callback(lambda ended: self.answer_unstarted(ended, event, void))
+                task.add_done_callback(lambda ended: self.answer_unstarted(
+                    ended, event, void, worker, operation if claimed else None))
 
-    def answer_unstarted(self, task, event, void):
+    def answer_unstarted(self, task, event, void, worker, selection=None):
         """A dialog's task ended before it first ran: native's one answer is `{cancelled: true}` (fix round 2, F2).
 
         A `session/cancel` handled in the loop turn that created the task cancels
@@ -1111,7 +1141,9 @@ class Session:
         self.unstarted.discard(task)
         if void is not None:
             self.questions.pop(void, None)
-        if self.proc and self.proc.returncode is None and not self.rpc_closed:
+        if selection is not None:
+            selection.consent_cause = "cancelled"
+        if worker is not None and self.proc is worker and worker.returncode is None and not self.rpc_closed:
             with contextlib.suppress(ConnectionError, RuntimeError):
                 self.proc.stdin.write((json.dumps({"type": "extension_ui_response", "id": event.get("id"),
                                                    "cancelled": True}) + "\n").encode())
@@ -1451,6 +1483,55 @@ class Session:
             self.proc.stdin.write((json.dumps({"type": "extension_ui_response", "id": event.get("id"), **answer}) + "\n").encode())
             await self.proc.stdin.drain()
 
+    async def handle_selection_confirm(self, event, operation, worker):
+        self.unstarted.discard(asyncio.current_task())
+        confirm_id = event.get("id")
+        if not isinstance(confirm_id, str) or not confirm_id:
+            return
+        cause = "unanswered"
+        if operation is not None and operation.awaiting_native():
+            try:
+                operation.require_current()
+                if operation.may_confirm_creation():
+                    params = {
+                        "sessionId": self.id,
+                        "toolCall": {
+                            "toolCallId": "selection-create-" + uuid.uuid4().hex,
+                            "title": "Create project settings?", "kind": "edit", "status": "pending",
+                            "rawInput": {"description": studio_selections.CREATE_TITLE},
+                        },
+                        "options": [
+                            {"optionId": "allow-once", "name": "Create this file", "kind": "allow_once"},
+                            {"optionId": "reject-once", "name": "Do not create", "kind": "reject_once"},
+                        ],
+                    }
+                    async with asyncio.timeout(profile_reselection.APPROVAL_SECONDS):
+                        cause = await profile_reselection.request_approval(
+                            operation, params, timeout=profile_reselection.APPROVAL_SECONDS)
+                if cause is None:
+                    await self.server.selection_target_io.run(operation.target.require_version, operation.target.before)
+                # The native dialog or binding may have ended during the
+                # filesystem check. Validate them again before writing consent.
+                operation.require_current()
+                if not operation.awaiting_native():
+                    cause = "unanswered"
+                if cause is None and not operation.may_confirm_creation():
+                    cause = "cancelled"
+            except (profile_reselection.Stopped, asyncio.CancelledError):
+                cause = "cancelled"
+            except studio_selections.UnsafeTarget:
+                cause = "cancelled"
+            except TimeoutError:
+                cause = "unanswered"
+            operation.consent_cause = cause
+        if self.proc is worker and worker is not None and worker.returncode is None and not self.rpc_closed:
+            answer = {"confirmed": True} if cause is None else {"cancelled": True}
+            with contextlib.suppress(ConnectionError, RuntimeError):
+                if cause is None:
+                    operation.confirmation_sent = True
+                worker.stdin.write(encode_frame({"type": "extension_ui_response", "id": confirm_id, **answer}))
+                await worker.stdin.drain()
+
     async def child_approval(self, event, void=None):
         """A delegated child asks before a change (aelix-ai #612, ADR-0308): `session/request_permission`.
 
@@ -1718,11 +1799,11 @@ class Session:
                 -32003 if cancelled else -32004, details,
             ) from failure
 
-    async def recover_after_compaction(self, *, for_prompt=False):
+    async def recover_after_compaction(self, *, preserve_cancellation=False):
         if not self.compaction_recovery_needed:
             return
         try:
-            await self.restart(preserve_history=True, preserve_cancellation=for_prompt)
+            await self.restart(preserve_history=True, preserve_cancellation=preserve_cancellation)
         finally:
             self.server.sessions[self.id] = self
         self.compaction_recovery_needed = False
@@ -1740,7 +1821,7 @@ class Session:
         # addresses this generation throughout recovery and receipt admission.
         self.reset_cancellation()
         if self.compaction_recovery_needed:
-            await self.recover_after_compaction(for_prompt=True)
+            await self.recover_after_compaction(preserve_cancellation=True)
         prior = await write_store(self.server.args.state_dir, begin_turn, self.id, key, fingerprint,
                                   diagnostic="turn_receipt_write_failed")
         if prior is not None:
@@ -1991,6 +2072,12 @@ class Session:
         with contextlib.suppress(ProtocolError, TimeoutError):
             await self.rpc("abort", _timeout=5)
 
+    def stop_pending(self):
+        pending = getattr(self.server, "cancel_tasks", {}).get(self.id)
+        return (self.direct_cancels > 0 or (self.cancelled and self.turn_active)
+                or (pending is not None and pending.session is self and pending.generation == self.cancel_generation
+                    and not pending.task.done()))
+
     def begin_cancel(self):
         """Apply Stop to the admitted turn and its dialogs before any I/O."""
         # Every open child question ends, during a manual /compact too (fix round 1, P-LOW-3).
@@ -2001,6 +2088,7 @@ class Session:
             # Keep waiting for the actual manual compaction outcome.
             return False
         self.cancelled = True
+        self.studio_resources.retire_pre_dispatch_writes()
         self.invalidate_image_acceptance()
         self.image_epoch = None
         self.tool_arrived.set()
@@ -2012,7 +2100,11 @@ class Session:
 
     async def cancel(self, *, again=False):
         if self.begin_cancel():
-            await self.cancel_native(again=again)
+            self.direct_cancels += 1
+            try:
+                await self.cancel_native(again=again)
+            finally:
+                self.direct_cancels -= 1
 
     async def cancel_native(self, *, again=False):
         generation = self.cancel_generation
@@ -2040,7 +2132,9 @@ class Session:
 
     async def _close(self):
         self.raise_fence()
-        self.studio_resources.retire_approval()
+        # Closing the old worker is part of an admitted recovery. Explicit
+        # client Close retires the recovery at server admission instead.
+        self.studio_resources.retire_approval(keep_recovery=True)
         self.studio_resources.invalidate_pages()
         self.ending = True
         try:

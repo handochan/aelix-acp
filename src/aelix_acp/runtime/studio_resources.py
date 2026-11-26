@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 import os
 from pathlib import Path
 import re
 
 from . import profile_reselection as reselection
+from . import studio_selections as selections
 from .profile_refs import (DisplayTooLarge, catalog_description, file_identity, preview, public_preview, source_label,
-                           text_list, valid_name, valid_ref)
+                           valid_name, valid_ref)
+from .resource_identifiers import ResourceIdentifiers, ordinary_name, public_name, public_text_fields
 from ..wire.errors import BackendError, ProtocolError
 
 MAX_PREVIEWS = 100
@@ -18,6 +21,7 @@ MAX_CATALOG_SOURCE_BYTES = 32 * 1024 * 1024
 UNAVAILABLE = object()
 TOO_LARGE = object()
 TOOL_LOCK = re.compile(r"Cannot turn on (.+): \1 is (?:locked off for this run: |removed for this run by ).+\Z")
+SELECTION_MUTATIONS = frozenset({"agents/use", "tools/set_active", "resources/reload", "mcp/configure", "settings/set"})
 
 
 def refusal(reason, **details):
@@ -36,6 +40,8 @@ def internal_error():
 class StudioResources:
     def __init__(self, session):
         self.session = session
+        self.selection_lock = asyncio.Lock()
+        self.unbound_identifiers = ResourceIdentifiers()
         self.recorded = None
         self.previews = OrderedDict()
         self.uncertain = False
@@ -43,21 +49,157 @@ class StudioResources:
         self.retired_binding = None
         self.profile_operation = None
         self.tool_operation = None
+        self.selection_operation = None
+        self.resource_writes = set()
+        self.waiting_operation = None
+        self.legacy_operation = None
+        self.recovering_operation = None
         self.restore_operation = None
 
     def binding(self):
         relay = self.session.input_relay
         return self.starting_binding or (relay.binding_id if relay is not None else None)
 
-    def retire_approval(self):
-        operation = self.profile_operation or self.tool_operation or self.restore_operation
+    @property
+    def identifiers(self):
+        relay = self.session.input_relay
+        return relay.identifiers if relay is not None else self.unbound_identifiers
+
+    def public_inventory(self, data):
+        result = dict(data)
+        identifiers = self.identifiers
+        for field in ("activeTools", "toolOverride"):
+            if field in result:
+                result[field] = identifiers.names("tool", result[field])
+        for kind in ("tool", "skill"):
+            field = kind + "s"
+            if field in result:
+                result[field] = [{**public_text_fields(row, "description"), "name": identifiers.key(kind, row["name"])}
+                                 for row in result[field]]
+        if "skippedTools" in result:
+            result["skippedTools"] = [
+                {**public_text_fields(row, "reason"), "tool": identifiers.key("tool", row["tool"])}
+                for row in result["skippedTools"]
+            ]
+        if "extensionErrors" in result:
+            result["extensionErrors"] = [public_text_fields(row, "message") for row in result["extensionErrors"]]
+        for field in ("commands", "prompts"):
+            if field in result:
+                result[field] = [public_text_fields(row, "description") for row in result[field]]
+        for field in ("mcp", "servers"):
+            if field in result:
+                result[field] = [public_text_fields(row, "name", "clientName", "description", "reason")
+                                 for row in result[field]]
+        return result
+
+    def public_native_profile(self, result):
+        profile = result.get("profile")
+        if not isinstance(profile, dict):
+            return result
+        identifiers = self.identifiers
+        return {**result, "profile": {**public_text_fields(profile, "description", "body"), **{
+            field: identifiers.names("tool", profile[field]) for field in ("tools", "exclude_tools") if field in profile
+        }}}
+
+    async def legacy_tools(self, arguments, *, timeout, before_write=None):
+        names = arguments.get("names")
+        if not isinstance(names, list) or not all(map(public_name, names)):
+            raise ProtocolError("Expected tool identifiers")
+        identifiers = self.identifiers
+        if any(not ordinary_name(name) for name in names):
+            resources = await self.rpc("resources/list")
+            available = identifiers.index("tool", (tool["name"] for tool in resources["tools"]))
+            if any(name not in available for name in names):
+                raise ProtocolError("Tool identifier is unavailable")
+            names = [available[name] for name in names]
+        try:
+            fence = {"_before_native_write": before_write} if before_write is not None else {}
+            return await self.session.rpc("aelix_control", method="tools/set_active",
+                                          params={**arguments, "names": names}, _timeout=timeout, **fence)
+        except BackendError as error:
+            key = getattr(error, "studio_tool_lock", None) or tool_lock_key(str(error))
+            data = {"kind": "tool_locked", "key": identifiers.key("tool", key)} if key in names else error.data
+            raise ProtocolError("Native tool selection was refused.", error.code, data) from None
+
+    def retire_approval(self, *, keep_recovery=False):
+        self.retire_pre_dispatch_writes(keep_recovery=keep_recovery)
+        operation = (self.profile_operation or self.tool_operation or self.selection_operation
+                     or self.legacy_operation or self.restore_operation)
         if operation is not None:
             operation.retire()
+
+    def retire_pre_dispatch_writes(self, *, keep_recovery=False):
+        for operation in self.resource_writes:
+            if not operation.dispatched and not (keep_recovery and operation is self.recovering_operation):
+                operation.retire()
+
+    @asynccontextmanager
+    async def track_write(self, operation):
+        self.resource_writes.add(operation)
+        try:
+            async with operation.cancel_on_retirement():
+                yield
+        finally:
+            self.resource_writes.discard(operation)
+
+    @asynccontextmanager
+    async def slash_write(self):
+        operation = reselection.Operation(self)
+        async with self.track_write(operation), self.selection_lock:
+            operation.require_current()
+            yield operation.before_write
+
+    @asynccontextmanager
+    async def selection_write(self, operation):
+        # Wait before reserving session admission. Stop, close and replacement
+        # can still retire this operation while the outstanding read owns the lock.
+        async with self.track_write(operation):
+            self.waiting_operation = operation
+            try:
+                await self.selection_lock.acquire()
+            finally:
+                self.waiting_operation = None
+            try:
+                # A historical Stop does not prevent a new idle write.
+                session = self.session
+                if session.server.sessions.get(session.id) is not session:
+                    raise reselection.Stopped()
+                if session.compaction_recovery_needed:
+                    operation.require_admission(allow_cancelled=True)
+                else:
+                    operation.require_current(allow_cancelled=True)
+                yield
+            finally:
+                self.selection_lock.release()
+
+    async def recover_selection_write(self, operation):
+        session = self.session
+        if not session.compaction_recovery_needed:
+            return False
+        operation.require_admission(allow_cancelled=True)
+        # The request is now admitted. Clear only historical cancellation
+        # and keep this generation through the replacement worker's startup.
+        session.reset_cancellation()
+        operation.generation = session.cancel_generation
+        previews = self.previews.copy()
+        self.recovering_operation = operation
+        try:
+            await session.recover_after_compaction(preserve_cancellation=True)
+        finally:
+            self.recovering_operation = None
+        operation.require_admission()
+        operation.worker = session.proc
+        operation.require_current()
+        # A checked preview remains scoped to this binding. Explicit use
+        # still resolves its revision again on the replacement worker.
+        self.previews.update(previews)
+        return True
 
     def retire_replaced_approval(self, replacement):
         binding = self.binding()
         if binding is not None and binding != replacement:
             self.retired_binding = binding
+            self.invalidate_pages()
             self.retire_approval()
 
     def mark_uncertain(self):
@@ -68,17 +210,181 @@ class StudioResources:
         supported = self.session.controls.capabilities.get("methods", [])
         return all(method in supported for method in methods)
 
+    def supports_selection(self, kind, *methods):
+        kinds = self.session.controls.capabilities.get("selectionKinds")
+        return isinstance(kinds, list) and kind in kinds and self.supports(*methods)
+
     def guarded(self):
         version = self.session.controls.capabilities.get("profileRefGuard")
         return type(version) is int and version == 1 and self.supports("agents/show", "agents/use")
 
     async def rpc(self, method, *, operation=None, **params):
+        if method == selections.LIST and self.session.stop_pending():
+            raise reselection.Stopped()
         kwargs = {"_before_native_write": operation.before_write} if operation is not None else {}
         return await self.session.rpc("aelix_control", method=method, params=params, **kwargs)
 
     def invalidate_pages(self):
         if relay := self.session.input_relay:
-            relay.invalidate_profile_pages()
+            relay.invalidate_list_pages()
+
+    def selection_rows(self, kind, data):
+        return selections.check_snapshot(kind, data, self.identifiers)
+
+    async def selections_catalog(self, kind):
+        if not self.supports_selection(kind, selections.LIST):
+            return refusal("unsupported")
+        if self.session.changing or self.session.rpc_closed or self.session._close_task is not None:
+            return refusal("unreadable")
+        relay = self.session.input_relay
+        generation = relay.list_generation if relay is not None else None
+
+        def require_snapshot_current():
+            if (self.session._close_task is not None or self.session.input_relay is not relay
+                    or (relay is not None and (relay.list_generation != generation
+                                               or self.retired_binding == relay.binding_id))):
+                raise reselection.Stopped()
+
+        try:
+            data = await self.rpc(selections.LIST, kind=kind)
+            rows = self.selection_rows(kind, data)
+            scopes = data["scopes"]
+            target = await self.session.server.selection_target_io.run(
+                selections.project_target, self.session, kind, scopes, before_start=require_snapshot_current)
+            public_scopes = {scope: selections.exposed_scope(kind, scope, scopes[scope], target is not None)
+                             for scope in ("global", "project")}
+            pending = data["policyPending"]
+            if type(pending) is not bool:
+                raise ValueError("Invalid selection policy status")
+            items = [selections.public_row(kind, key, rows[key])
+                     for key in sorted(rows, key=lambda key: key.encode("utf-8"))]
+        except (BackendError, reselection.Stopped, selections.TargetProbeBusy, KeyError, TypeError, ValueError):
+            return refusal("unreadable")
+        identifiers = self.identifiers
+        return {"kind": kind, "effect": selections.EFFECTS[kind], "scopes": public_scopes, "items": items,
+                "policyPending": pending, "diagnostics": [
+                    {"code": "native-problem", "key": None, "source": None} for _ in data["problems"]],
+                "toolOverride": identifiers.names("tool", self.session.active_tools) if kind == "tool" else None,
+                "activeTools": [row["key"] for row in items if row["live"]] if kind == "tool" else None}
+
+    async def set_selections(self, value, fits, operation):
+        kind, changes = value["kind"], value["changes"]
+        if not self.supports_selection(kind, selections.LIST, selections.SET):
+            return refusal("unsupported")
+        self.selection_operation = operation
+        self.invalidate_pages()
+        try:
+            return await self._set_selections(kind, changes, fits, operation)
+        except selections.TargetProbeBusy:
+            if operation.dispatched:
+                raise
+            return refusal("busy")
+        finally:
+            if operation.permission is not None:
+                operation.permission.cancel()
+            self.selection_operation = None
+            self.invalidate_pages()
+
+    async def _set_selections(self, kind, changes, fits, operation):
+        target_io = self.session.server.selection_target_io
+        try:
+            data = await self.rpc(selections.LIST, kind=kind)
+            rows = self.selection_rows(kind, data)
+            scopes = data["scopes"]
+            target = await target_io.run(selections.project_target, self.session, kind, scopes, operation=operation)
+            project = selections.exposed_scope(kind, "project", scopes["project"], target is not None)
+            for edit in changes:
+                key = edit["key"]
+                row = rows.get(key)
+                if row is None:
+                    return refusal("selection-missing", scope="project", written=[],
+                                   mismatches=[{"key": key, "reason": "missing"}])
+                if row["lock"] is not None or row["role"] != "item" or row["refusal"] is not None:
+                    return refusal("selection-locked", scope="project", written=[],
+                                   mismatches=[{"key": key, "reason": "locked"}])
+        except (BackendError, KeyError, TypeError, ValueError):
+            return refusal("unreadable")
+        operation.require_current()
+        if not project["writable"] or project["exists"] != target.exists:
+            return refusal("scope-readonly", scope="project", written=[])
+        if not project["exists"] and (not operation.may_confirm_creation() or not self.supports("ui/enable")):
+            return refusal("consent-required", cause="unanswered", scope="project", written=[])
+        operation.target, operation.kind = target, kind
+        operation.native_keys = {edit["key"]: rows[edit["key"]]["key"] for edit in changes}
+        native_changes = [{"key": operation.native_keys[edit["key"]], "on": edit["on"]} for edit in changes]
+        try:
+            # Keep the last filesystem check under the mutation and selection
+            # locks. The synchronous dispatch hook still fences Stop/close
+            # after this thread returns and immediately before the pipe write.
+            await target_io.run(target.require_version, target.before, operation=operation)
+            native = await self.session.rpc(
+                "aelix_control", method=selections.SET,
+                params={"scope": "project", "kind": kind, "changes": native_changes},
+                _before_native_write=operation.before_write, _selection_write=operation, _timeout=90,
+            )
+        except selections.UnsafeTarget:
+            if operation.dispatched:
+                raise
+            return refusal("scope-readonly", scope="project", written=[])
+        except BackendError as error:
+            reason = getattr(error, "studio_selection_refusal", None)
+            if reason is None or (reason == "cancelled" and operation.confirmation_sent):
+                raise
+            if reason == "selection-missing":
+                # Native validates row keys before entering the save path.
+                # The edit that removed the row may itself have replaced mcp.json.
+                operation.no_effect = True
+                result = await self.missing_selections(kind, changes, getattr(error, "studio_selection_key", None))
+                return result if fits(result) else refusal("result-too-large")
+            await target_io.run(target.require_version, target.before)
+            operation.no_effect = True
+            if reason == "cancelled":
+                if not project["exists"] or operation.confirm_id is not None:
+                    return refusal("consent-required", cause="cancelled", scope="project", written=[])
+                return refusal("cancelled")
+            if reason == "consent-required":
+                return refusal(reason, cause=operation.consent_cause or "unanswered",
+                               scope="project", written=[])
+            if reason == "scope-readonly":
+                return refusal(reason, scope="project", written=[])
+            return refusal(reason)
+        operation.require_current()
+        result = selections.project_readback(kind, native, target.path, self.identifiers)
+        version = await target_io.run(target.verify_save, result["written"])
+        operation.require_current()
+        if kind == "tool" and self.session.active_tools is not None:
+            if result["apply"]["deferred"]:
+                # A native deferred apply can still turn tools back on after
+                # a repair RPC. Reopen with the saved override before prompting.
+                self.mark_uncertain()
+            else:
+                await self.session.restore_tools(operation=operation)
+                operation.require_current()
+        after = self.selection_rows(kind, await self.rpc(selections.LIST, kind=kind))
+        operation.require_current()
+        await target_io.run(target.require_version, version)
+        operation.require_current()
+        changed, mismatches = selections.verified_diff(rows, after, changes, native["mismatches"])
+        if any(mismatch["reason"] == "missing" for mismatch in mismatches):
+            result = refusal("selection-missing", scope="project", written=result["written"], mismatches=mismatches)
+        else:
+            result.update(changed=changed, mismatches=mismatches)
+        if not fits(result):
+            raise internal_error()
+        return result
+
+    async def missing_selections(self, kind, changes, hint):
+        # The pin gives just the first missing row, in a truncated display
+        # message. Read all requested keys and include an unambiguous hint
+        # even if that row has already reappeared.
+        try:
+            after = self.selection_rows(kind, await self.rpc(selections.LIST, kind=kind))
+        except (ProtocolError, OSError, KeyError, TypeError, ValueError):
+            after = None
+        return refusal("selection-missing", scope="project", written=[], mismatches=[
+            {"key": edit["key"], "reason": "missing"} for edit in changes
+            if edit["key"] == hint or (after is not None and edit["key"] not in after)
+        ])
 
     def reset(self, preferences):
         self.recorded = reselection.recorded_profile(preferences)
@@ -171,7 +477,7 @@ class StudioResources:
                 "activeAgent": name if valid_name(name) else None, "activeRef": active_ref,
                 "diagnostics": diagnostics, "nextCursor": None}
 
-    async def inspect(self, name, *, revision_bound=False):
+    async def inspect(self, name, *, revision_bound=False, for_display=False):
         if not self.supports("agents/show"):
             return UNAVAILABLE
         try:
@@ -192,6 +498,10 @@ class StudioResources:
                 if native != confirmed or (ref, source, stamp) != await asyncio.to_thread(file_identity, confirmed):
                     return None
             result = preview(native, ref, source)
+            if for_display:
+                identifiers = self.identifiers
+                result["displayTools"] = identifiers.names("tool", native["tools"])
+                result["displayExcludeTools"] = identifiers.names("tool", native["exclude_tools"])
         except DisplayTooLarge:
             return TOO_LARGE
         except (BackendError, OSError, KeyError, TypeError, ValueError, RuntimeError):
@@ -206,14 +516,18 @@ class StudioResources:
             self.previews.popitem(last=False)
 
     async def show(self, name, fits):
-        candidate = await self.inspect(name, revision_bound=self.guarded())
+        candidate = await self.inspect(name, revision_bound=self.guarded(), for_display=True)
         if candidate is UNAVAILABLE:
             return refusal("unsupported")
         if candidate is TOO_LARGE:
             return refusal("result-too-large")
         if candidate is None:
             return refusal("profile-unavailable", name=name)
-        result = {"profile": public_preview(candidate)}
+        profile = public_preview(candidate)
+        if "displayTools" in candidate:
+            profile["tools"] = candidate["displayTools"]
+            profile["policy"]["excludeTools"] = candidate["displayExcludeTools"]
+        result = {"profile": profile}
         if not fits(result):
             return refusal("result-too-large")
         self.remember(candidate)
@@ -397,22 +711,25 @@ class StudioResources:
     def tools_match(result, names):
         active = result.get("activeTools") if isinstance(result, dict) else None
         return (isinstance(result, dict) and result.get("accepted", True) is True
-                and text_list(active) and len(active) == len(names) and set(active) == set(names))
+                and isinstance(active, list) and all(isinstance(name, str) for name in active)
+                and len(active) == len(names) and set(active) == set(names))
 
     async def set_tools(self, names, fits, operation):
         if not self.supports("resources/list", "tools/set_active"):
             return refusal("unsupported")
         self.tool_operation = operation
+        identifiers = self.identifiers
         try:
             resources = await self.rpc("resources/list")
             operation.require_current()
-            available = {tool["name"] for tool in resources["tools"]}
+            available = identifiers.index("tool", (tool["name"] for tool in resources["tools"]))
             for name in names:
                 if name not in available:
                     return refusal("tool-unavailable", key=name)
             if not fits({"accepted": True, "toolOverride": names, "activeTools": names}):
                 return refusal("result-too-large")
-            result = await self.rpc("tools/set_active", names=names, operation=operation)
+            native_names = [available[name] for name in names]
+            result = await self.rpc("tools/set_active", names=native_names, operation=operation)
             active = result.get("activeTools")
             if "accepted" in result and type(result["accepted"]) is not bool:
                 raise internal_error()
@@ -421,11 +738,11 @@ class StudioResources:
                 if reason == "write-failed":
                     operation.no_effect = True
                     return refusal(reason)
-                if reason in ("tool-locked", "tool-unavailable") and key in names:
+                if reason in ("tool-locked", "tool-unavailable") and key in native_names:
                     operation.no_effect = True
-                    return refusal(reason, key=key)
+                    return refusal(reason, key=identifiers.key("tool", key))
                 raise internal_error()
-            if not self.tools_match(result, names):
+            if not self.tools_match(result, native_names):
                 raise internal_error()
             operation.require_current()
             self.session.active_tools = active
@@ -435,12 +752,13 @@ class StudioResources:
             if not operation.dispatched:
                 raise
             key = getattr(error, "studio_tool_lock", None) or tool_lock_key(str(error))
-            if key in names:
+            if key in native_names:
                 operation.no_effect = True
-                return refusal("tool-locked", key=key)
+                return refusal("tool-locked", key=identifiers.key("tool", key))
             raise
         finally:
             self.tool_operation = None
             if operation.dispatched:
                 self.invalidate_pages()
-        return {"accepted": True, "toolOverride": active, "activeTools": active}
+        public = identifiers.names("tool", active)
+        return {"accepted": True, "toolOverride": public, "activeTools": public}

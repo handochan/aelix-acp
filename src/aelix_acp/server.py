@@ -27,6 +27,9 @@ from .runtime.store import (open_store, load_preferences, history_records, legac
                             save_preferences, cache_recovered_history, display_recorded_update,
                             with_assistant_origin, write_store)
 from .runtime.controls import MODE_IDS
+from .runtime.resource_identifiers import public_text_fields
+from .runtime.studio_resources import SELECTION_MUTATIONS
+from .runtime.studio_selections import SelectionTargetIO
 from .runtime import managed_extensions
 from .runtime.subagents import META_KEY as SUBAGENTS_META
 from .stdio import StdinReader, offer_stderr, write_diagnostic
@@ -34,7 +37,7 @@ from .wire.transport import decode_frame, encode_frame, ErrorReplies, InvalidFra
 from .runtime.extensions import run_extension_action, require_consent
 from .runtime.leases import acquire as acquire_lease
 from .runtime.leases import lease_path
-from .runtime import forks, host_bytes, native_history, session_lock, session_relay, transcript
+from .runtime import forks, host_bytes, native_history, profile_reselection, session_lock, session_relay, transcript
 from .runtime.children import NESTED_TOOL_CALLS, nested_only
 
 from .session import CONCURRENT_CONTROLS, LONG_CONTROLS, Session, text_content, tool_call
@@ -71,6 +74,7 @@ class Server:
     def __init__(self, args):
         self.args = args
         self.db = open_store(args.state_dir)
+        self.selection_target_io = SelectionTargetIO()
         self.initialized = False
         self.relay_enabled = False
         self.host_bytes = None
@@ -562,14 +566,25 @@ class Server:
             session_id = require_string(params.get("sessionId"), "sessionId")
             live = self.sessions.get(session_id)
             candidate = self.pending_stop_sessions.get(session_id) or live
-            if method == "session/close" and candidate is not None:
+            close_requested = method == "session/close" or (
+                method == "_aelix/manage" and params.get("action") == "sessions/close")
+            if close_requested and candidate is not None:
                 candidate.studio_resources.retire_approval()
-            if method == "session/load" and self.relay_enabled:
-                replacement = session_relay.open_binding(params.get("_meta"))
+            if method == "session/load":
+                replacement = session_relay.open_binding(params.get("_meta")) if self.relay_enabled else None
                 cwd = params.get("cwd")
-                if (candidate is not None and replacement is not None and isinstance(cwd, str)
+                if (candidate is not None and isinstance(cwd, str)
                         and str(Path(cwd).expanduser().resolve()) == candidate.cwd):
-                    candidate.studio_resources.retire_replaced_approval(replacement)
+                    resources = candidate.studio_resources
+                    binding = resources.binding()
+                    if replacement is not None and binding is not None and replacement != binding:
+                        resources.retire_replaced_approval(replacement)
+                    else:
+                        resources.retire_pre_dispatch_writes()
+            if (live is not None and method == "_aelix/manage" and params.get("action") == "resources/reload"
+                    and isinstance(params.get("arguments", {}), dict)
+                    and live.studio_resources.supports("resources/reload")):
+                live.studio_resources.retire_pre_dispatch_writes()
             pending_open = live is not None and live.studio_resources.restore_operation is not None
             if pending_open or (method in ("session/load", "session/delete", "session/close")
                                 and session_id in self.starting_ids):
@@ -577,14 +592,32 @@ class Server:
             registered = session_id in self.sessions or self.db.execute(
                 "SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
             if registered:
-                with acquire_lease(self.args.state_dir, session_id, purpose="activity"):
-                    readback = method == "_aelix/manage" and params.get("action") in (
-                        "resources/list", "agents/list", "agents/show", "mcp/status", "permissions/get",
-                    )
-                    if (live is not None and live.studio_resources.uncertain and not readback
-                            and method not in {"session/load", "session/close", "session/delete"}):
-                        raise ProtocolError("Reopen the session to recover its profile and tool state.", -32004)
-                    return await self.dispatch_request(method, params)
+                action = params.get("action")
+                selection_write = (live is not None and method == "_aelix/manage"
+                                   and isinstance(action, str) and action in SELECTION_MUTATIONS)
+                selection_operation = None
+                selection_admission = contextlib.nullcontext()
+                if selection_write:
+                    resources = live.studio_resources
+                    if live.mutation_lock.locked() or resources.waiting_operation is not None or live.stop_pending():
+                        raise ProtocolError("Session is busy", -32000)
+                    selection_operation = profile_reselection.Operation(resources)
+                    selection_admission = resources.selection_write(selection_operation)
+                async with selection_admission:
+                    # A prompt can be admitted while this writer waits. Never
+                    # wait for its mutation lock with the selection lock held.
+                    if selection_write and (live.mutation_lock.locked() or live.changing or live.stop_pending()):
+                        raise ProtocolError("Session is busy", -32000)
+                    with acquire_lease(self.args.state_dir, session_id, purpose="activity"):
+                        readback = method == "_aelix/manage" and action in (
+                            "resources/list", "agents/list", "agents/show", "mcp/status", "permissions/get",
+                        )
+                        if (live is not None and live.studio_resources.uncertain and not readback
+                                and method not in {"session/load", "session/close", "session/delete"}):
+                            raise ProtocolError("Reopen the session to recover its profile and tool state.", -32004)
+                        if selection_operation is not None:
+                            return await self.dispatch_request(method, params, selection_operation=selection_operation)
+                        return await self.dispatch_request(method, params)
             if method == "session/fork":
                 raise ProtocolError("Saved session does not match this workspace and profile")
         return await self.dispatch_request(method, params)
@@ -617,7 +650,7 @@ class Server:
             raise ProtocolError("Unsupported management action")
         return await session.intervene(params["action"], arguments)
 
-    async def dispatch_request(self, method, params):
+    async def dispatch_request(self, method, params, *, selection_operation=None):
         if method == "initialize":
             if self.initialized:
                 raise ProtocolError("Already initialized", -32600)
@@ -690,9 +723,9 @@ class Server:
                 session.client_mcp = params.get("mcpServers", [])
                 if method == "session/load":
                     self.pending_stop_sessions[session_id] = session
-                    session.studio_resources.starting_binding = binding_id
                     if transcript.offered(getattr(self, "client_capabilities", {})):
                         session.load_display_frames = {"totalFrames": 0}
+                session.studio_resources.starting_binding = binding_id
                 if previous:
                     self.sessions.pop(session_id, None)
                     await previous.close()
@@ -830,9 +863,13 @@ class Server:
                 return await self.close_session(session)
             if session.mutation_lock.locked():
                 raise ProtocolError("Session is busy", -32000)
+            already_cancelled = session.cancelled
             async with session.mutation_lock:
                 if not session.studio_resources.uncertain:
-                    await session.recover_after_compaction()
+                    if selection_operation is not None:
+                        await session.studio_resources.recover_selection_write(selection_operation)
+                    else:
+                        await session.recover_after_compaction()
                 if action == "sessions/branch":
                     return await self.branch_session(session, arguments)
                 if action == "workspace/trust":
@@ -864,10 +901,9 @@ class Server:
                     raise ProtocolError("Unsupported management action")
                 if action == "children/notices":
                     return await session.notice_turn()
-                if action == "mcp/configure":
-                    result = await session.configure_mcp(arguments.get("servers"))
-                elif action == "resources/reload":
-                    result = await session.reload_resources(arguments, timeout=60)
+                if action in SELECTION_MUTATIONS:
+                    result = await self.legacy_selection_write(
+                        session, action, arguments, already_cancelled, selection_operation)
                 else:
                     result = await session.rpc("aelix_control", method=action, params=arguments,
                         _timeout=(getattr(self.args, "command_timeout", 600) or None) if action in LONG_CONTROLS else 60)
@@ -885,10 +921,36 @@ class Server:
                         await session.sync_profile_tools()
                     await session.save()
                     await session.update({"sessionUpdate": "config_option_update", "configOptions": session.controls.options()})
+                if action in {"resources/list", "tools/set_active", "mcp/status", "mcp/configure"}:
+                    return session.studio_resources.public_inventory(result)
+                if action == "agents/show":
+                    return session.studio_resources.public_native_profile(result)
                 return result
         if method == "authenticate":
             raise ProtocolError("Configure provider authentication using the existing Aelix CLI first")
         raise ProtocolError(f"Method not supported: {method}", -32601)
+
+    async def legacy_selection_write(self, session, action, arguments, already_cancelled, operation):
+        resources = session.studio_resources
+        operation = operation or profile_reselection.Operation(resources)
+
+        def before_write():
+            if session.stop_pending():
+                raise profile_reselection.Stopped()
+            operation.before_write(allow_cancelled=already_cancelled)
+
+        resources.legacy_operation = operation
+        try:
+            if action == "mcp/configure":
+                return await session.configure_mcp(arguments.get("servers"), before_write=before_write)
+            if action == "resources/reload":
+                return await session.reload_resources(arguments, timeout=60, before_write=before_write)
+            if action == "tools/set_active":
+                return await resources.legacy_tools(arguments, timeout=60, before_write=before_write)
+            return await session.rpc("aelix_control", method=action, params=arguments, _timeout=60,
+                                     _before_native_write=before_write)
+        finally:
+            resources.legacy_operation = None
 
     async def handle(self, message):
         request_id = message.get("id")
@@ -941,6 +1003,10 @@ class Server:
                     error["message"] = "Outcome unknown." if error["code"] == -33100 else "Request refused."
                 elif isinstance(exc, ProtocolError) and exc.data is not None:
                     error["data"] = exc.data
+                params = message.get("params")
+                if (method == "_aelix/manage" and isinstance(params, dict) and params.get("action") in (
+                        "resources/list", "tools/set_active", "agents/show", "mcp/status", "mcp/configure")):
+                    error = public_text_fields(error, "message")
                 await self.send({"jsonrpc": "2.0", "id": request_id, "error": error})
             else:
                 detail = type(exc).__name__ if self.host_bytes else str(exc)

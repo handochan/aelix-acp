@@ -1,0 +1,355 @@
+"""D16 project selections against the pinned native worker."""
+import asyncio
+from contextlib import closing
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import tempfile
+import unittest
+
+from support import AcpClient
+from test_session_relay import META, initialize_offer, request_id
+
+EXECUTABLE = os.environ.get("AELIX_ACP_TEST_AELIX")
+VERIFIED_APPROVAL = """
+from aelix_acp.runtime import profile_reselection
+from aelix_acp.server import main
+profile_reselection.host_verified_manual_approval = lambda operation: True
+profile_reselection.APPROVAL_SECONDS = {seconds}
+main()
+"""
+PATH_NAMED_TOOL = """
+from aelix_agent_core.types import AgentTool
+from aelix_ai.tools import ToolResult
+
+def setup(api):
+    async def execute(*_args):
+        return ToolResult(content=[])
+
+    api.register_tool(AgentTool(name={name!r}, description="Path-named test tool",
+                                parameters={{"type": "object", "properties": {{}}}}, execute=execute))
+"""
+PROMPT_TOOL_SWITCH = """
+import asyncio
+from aelix_agent_core.harness.hooks import InputHandled
+
+def setup(api):
+    async def intercept(event, ctx):
+        api.set_active_tools(["write"])
+        reader, writer = await asyncio.open_connection("127.0.0.1", {port})
+        try:
+            await reader.readline()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        return InputHandled()
+
+    api.on("input", intercept)
+"""
+
+
+@unittest.skipUnless(EXECUTABLE, "Set AELIX_ACP_TEST_AELIX to the pinned native executable")
+class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="acp-selection-", dir="/tmp" if os.name != "nt" else None)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.agent = self.root / "agent"
+        self.agent.mkdir()
+        (self.root / "home").mkdir()
+        self.project = self.root / ".aelix"
+        self.global_settings = self.agent / "settings.json"
+        self.global_settings.write_text('{"defaultTools":["-read"]}\n', encoding="utf-8")
+        self.binding = "selection-first"
+
+    async def start(self, *, verified=False, expiry=False, trusted=False, extensions=(), prefix=()):
+        kwargs = {"entry": ("-c", VERIFIED_APPROVAL.format(seconds=2 if expiry else 45))} if verified else {}
+        self.client = await AcpClient.start(
+            self.root, EXECUTABLE, capabilities=initialize_offer()["clientCapabilities"],
+            prefix=(("--approve",) if trusted else ()) + prefix, extensions=extensions, **kwargs)
+        self.addAsyncCleanup(self.client.close)
+        created = await self.client.request("session/new", self.open_params(), timeout=120)
+        self.session_id = created["sessionId"]
+
+    def open_params(self):
+        return {"cwd": str(self.root), "mcpServers": [], "_meta": {META: {"bindingId": self.binding}}}
+
+    async def restart_worker(self):
+        await self.client.request("session/close", {"sessionId": self.session_id})
+        self.binding = "selection-restarted"
+        await self.client.request("session/load", {**self.open_params(), "sessionId": self.session_id}, timeout=120)
+
+    async def relay(self, suffix, payload):
+        return await self.client.request("_aelix/session/" + suffix, {
+            "sessionId": self.session_id, "bindingId": self.binding, "payload": payload,
+        }, timeout=30)
+
+    async def set_selection(self, kind, key, on, number, **kwargs):
+        return await self.relay("selections/set", {"scope": "project", "kind": kind,
+                                  "changes": [{"key": key, "on": on}], "requestId": request_id(number), **kwargs})
+
+    async def listing(self, kind):
+        return await self.relay("selections/list", {"kind": kind, "limit": 100})
+
+    def permission_cards(self):
+        return [request for request in self.client.requests if request["method"] == "session/request_permission"]
+
+    def saved_preferences(self):
+        with closing(sqlite3.connect(self.root / "state/sessions.sqlite3")) as db:
+            row = db.execute("SELECT value FROM preferences WHERE session_id=?", (self.session_id,)).fetchone()
+            return json.loads(row[0])
+
+    async def test_refuse_then_approve_first_save_and_preserve_empty_override_across_restart(self):
+        global_bytes = self.global_settings.read_bytes()
+        await self.start(verified=True, trusted=True)
+        self.assertFalse((await self.listing("tool"))["scopes"]["project"]["exists"])
+        await self.relay("tools/set-active", {"names": [], "requestId": request_id(1)})
+        with self.assertRaisesRegex(RuntimeError, "-33102"):
+            await self.set_selection("tool", "read", True, 2, scope="global")
+        self.client.permission = "reject-once"
+        refusal = await self.set_selection("tool", "read", True, 3)
+        self.assertEqual(refusal, {"accepted": False, "reason": "consent-required", "cause": "declined",
+                                   "scope": "project", "written": []})
+        self.assertFalse((self.project / "settings.json").exists())
+        self.client.permission = "allow-once"
+        result = await self.set_selection("tool", "read", True, 4)
+        self.assertTrue(result["accepted"], result)
+        self.assertTrue(result["apply"]["applied"], result)
+        self.assertEqual(result["written"], [".aelix/settings.json"])
+        self.assertEqual(result["changed"], [{"key": "read", "saved": True}])
+        self.assertEqual(len(self.permission_cards()), 2)
+        self.assertEqual(self.global_settings.read_bytes(), global_bytes)
+        self.assertEqual(self.saved_preferences()["activeTools"], [])
+        for restart in (False, True):
+            if restart:
+                await self.restart_worker()
+            listing = await self.listing("tool")
+            selected = next(row for row in listing["items"] if row["key"] == "read")
+            self.assertEqual((selected["saved"], selected["decidedBy"], selected["live"]), (True, "project", False))
+            self.assertEqual((listing["activeTools"], listing["toolOverride"]), ([], []))
+
+    async def test_real_native_confirmation_expires_without_project_file(self):
+        global_bytes = self.global_settings.read_bytes()
+        await self.start(verified=True, expiry=True)
+        seen = asyncio.Event()
+
+        async def unanswered(_):
+            seen.set()
+            await asyncio.Future()
+
+        self.client.permission = unanswered
+        outcome = await self.set_selection("tool", "read", True, 5)
+        self.assertTrue(seen.is_set())
+        self.assertEqual(outcome, {"accepted": False, "reason": "consent-required", "cause": "unanswered",
+                                   "scope": "project", "written": []})
+        self.assertFalse((self.project / "settings.json").exists())
+        self.assertEqual(self.global_settings.read_bytes(), global_bytes)
+        self.assertEqual(len(self.permission_cards()), 1)
+
+    async def test_first_file_creation_is_disabled_on_the_current_host_contract(self):
+        await self.start()
+        self.assertEqual(await self.set_selection("tool", "read", True, 9),
+                         {"accepted": False, "reason": "consent-required", "cause": "unanswered",
+                          "scope": "project", "written": []})
+        self.assertFalse(self.permission_cards())
+        self.assertFalse((self.project / "settings.json").exists())
+
+    async def test_path_named_tool_uses_one_key_in_selection_state_and_writes(self):
+        raw = str(self.root / "private-tools" / "fixture-tool")
+        extension = self.root / "tool_fixture.py"
+        extension.write_text(PATH_NAMED_TOOL.format(name=raw), encoding="utf-8")
+        profile = self.agent / "agents/path-tool.md"
+        profile.parent.mkdir()
+        profile.write_text(f"---\nname: path-tool\ndescription: Path tool fixture\ntools: [{json.dumps(raw)}]\n"
+                           "---\nInspect the test resource.\n", encoding="utf-8")
+        self.project.mkdir()
+        (self.project / "settings.json").write_text("{}\n", encoding="utf-8")
+        await self.start(trusted=True, extensions=(extension,))
+        initial = await self.listing("tool")
+        key = next(row["key"] for row in initial["items"] if row["key"].startswith("selection:"))
+        self.assertIn(key, initial["activeTools"])
+        self.assertNotIn(raw, initial["activeTools"])
+        self.assertIn("read", [row["key"] for row in initial["items"]])
+        preview = await self.relay("profiles/show", {"name": "path-tool"})
+        self.assertEqual(preview["profile"]["tools"], [key])
+
+        saved = await self.set_selection("tool", key, False, 11)
+        self.assertTrue(saved["accepted"], saved)
+        self.assertEqual(saved["changed"], [{"key": key, "saved": False}])
+        self.assertEqual(saved["mismatches"], [])
+        self.assertEqual(saved["apply"]["turnedOff"], [key])
+
+        with self.assertRaisesRegex(RuntimeError, "-32602"):
+            await self.relay("tools/set-active", {"names": [raw], "requestId": request_id(12)})
+        applied = await self.relay("tools/set-active", {"names": [key], "requestId": request_id(13)})
+        self.assertEqual(applied, {"accepted": True, "activeTools": [key], "toolOverride": [key]})
+        self.assertEqual(self.saved_preferences()["activeTools"], [raw])
+        current = await self.listing("tool")
+        self.assertEqual((current["activeTools"], current["toolOverride"]), ([key], [key]))
+
+        inventory = await self.client.request("_aelix/manage", {"sessionId": self.session_id, "action": "resources/list"})
+        self.assertIn(key, [tool["name"] for tool in inventory["tools"]])
+        self.assertEqual(inventory["activeTools"], [key])
+        managed = await self.client.request("_aelix/manage", {
+            "sessionId": self.session_id, "action": "tools/set_active", "arguments": {"names": [key]},
+        })
+        self.assertEqual(managed["activeTools"], [key])
+        await self.restart_worker()
+        rebound = await self.listing("tool")
+        new_key = next(row["key"] for row in rebound["items"] if row["key"].startswith("selection:"))
+        self.assertNotEqual(new_key, key)
+        self.assertEqual((rebound["activeTools"], rebound["toolOverride"]), ([new_key], [new_key]))
+        self.assertEqual(await self.relay("tools/set-active", {"names": [key], "requestId": request_id(14)}),
+                         {"accepted": False, "reason": "tool-unavailable", "key": key})
+
+    async def test_skill_save_is_applied_without_restarting(self):
+        skill = self.agent / "skills/review/SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("---\nname: review\ndescription: Review changes\n---\nReview changes carefully.\n", encoding="utf-8")
+        self.project.mkdir()
+        (self.project / "settings.json").write_text("{}\n", encoding="utf-8")
+        await self.start(trusted=True)
+        before = await self.listing("skill")
+        self.assertTrue(next(row for row in before["items"] if row["key"] == "review")["loaded"])
+        result = await self.set_selection("skill", "review", False, 6)
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["effect"], "next_request")
+        self.assertEqual(result["apply"]["turnedOff"], ["review"])
+        self.assertTrue(result["apply"]["applied"])
+        after = next(row for row in (await self.listing("skill"))["items"] if row["key"] == "review")
+        self.assertEqual((after["saved"], after["applied"], after["live"], after["pending"]),
+                         (False, False, None, False))
+
+    def duplicate_skills(self):
+        for scope, root in (("user", self.agent), ("project", self.project)):
+            skill = root / "skills/review/SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(f"---\nname: review\ndescription: {scope} review\n---\nReview changes.\n",
+                             encoding="utf-8")
+        (self.project / "settings.json").write_text("{}\n", encoding="utf-8")
+
+    async def test_shadowed_native_skill_has_opaque_key_and_translates_for_write_validation(self):
+        self.duplicate_skills()
+        await self.start(trusted=True)
+        listing = await self.listing("skill")
+        self.assertNotIn(str(self.root), json.dumps(listing, ensure_ascii=False))
+        duplicates = [row for row in listing["items"] if row["label"] == "review"]
+        self.assertEqual(len(duplicates), 2)
+        shadowed = next(row for row in duplicates if row["lock"] and row["lock"]["kind"] == "shadowed")
+        key = shadowed["key"]
+        self.assertNotIn("/", key)
+        self.assertNotIn("\\", key)
+        self.assertNotEqual(key, "review")
+        self.assertIn(shadowed, (await self.listing("skill"))["items"])
+        result = await self.set_selection("skill", key, False, 8)
+        self.assertEqual(result, {"accepted": False, "reason": "selection-locked", "scope": "project",
+                                  "mismatches": [{"key": key, "reason": "locked"}], "written": []})
+
+    async def test_duplicate_skill_labels_do_not_hide_the_changed_key(self):
+        self.duplicate_skills()
+        await self.start(trusted=True)
+        result = await self.set_selection("skill", "review", False, 10)
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["changed"], [{"key": "review", "saved": False}])
+        self.assertEqual(result["mismatches"], [])
+
+    async def test_mcp_project_file_takes_effect_on_worker_restart(self):
+        script = self.root / "docs_server.py"
+        script.write_text(
+            'from mcp.server.fastmcp import FastMCP\ns = FastMCP("docs")\n@s.tool()\n'
+            'def echo(value: str) -> str: return value\ns.run()\n', encoding="utf-8")
+        entry = {"command": sys.executable, "args": [str(script)], "enabled": True}
+        global_file = self.agent / "mcp.json"
+        global_file.write_text(json.dumps({"mcpServers": {"global-docs": entry}}), encoding="utf-8")
+        before_global = global_file.read_bytes()
+        self.project.mkdir()
+        config = self.project / "mcp.json"
+        config.write_text(json.dumps({"mcpServers": {"local-docs": entry}}), encoding="utf-8")
+        await self.start(trusted=True)
+        before = await self.listing("mcp")
+        self.assertEqual([row["key"] for row in before["items"]], ["local-docs"])
+        self.assertTrue(before["items"][0]["live"])
+        result = await self.set_selection("mcp", "local-docs", False, 7)
+        self.assertEqual(result, {"accepted": True, "kind": "mcp", "scope": "project", "effect": "restart",
+                                  "written": [".aelix/mcp.json"], "changed": [{"key": "local-docs", "saved": False}],
+                                  "mismatches": [], "apply": None})
+        saved = (await self.listing("mcp"))["items"][0]
+        self.assertEqual((saved["saved"], saved["applied"], saved["live"], saved["pending"]),
+                         (False, True, True, True))
+        self.assertFalse(json.loads(config.read_bytes())["mcpServers"]["local-docs"]["enabled"])
+        self.assertEqual(global_file.read_bytes(), before_global)
+        self.assertFalse(self.permission_cards())
+        await self.restart_worker()
+        applied = (await self.listing("mcp"))["items"][0]
+        self.assertEqual((applied["saved"], applied["applied"], applied["live"], applied["pending"]),
+                         (False, False, False, False))
+
+    async def test_prefixed_native_mcp_row_never_displays_credential_shaped_label(self):
+        fictional = "FICTIONAL_NOT_A_SECRET_ACP71"
+        name = "extension:password=" + fictional
+        self.project.mkdir()
+        (self.project / "mcp.json").write_text(
+            json.dumps({"mcpServers": {name: {"command": sys.executable, "enabled": False}}}),
+            encoding="utf-8",
+        )
+        await self.start(trusted=True)
+        listing = await self.listing("mcp")
+        self.assertEqual(len(listing["items"]), 1)
+        row = listing["items"][0]
+        self.assertTrue(row["key"].startswith("selection:"))
+        self.assertNotIn(fictional, json.dumps(listing))
+        self.assertEqual(row["label"], "Selection item")
+
+    async def test_readonly_native_tool_key_cannot_encode_sensitive_text(self):
+        name = "password=FICTIONAL_NOT_A_SECRET_ACP71\udcff"
+        self.project.mkdir()
+        (self.project / "mcp.json").write_text(
+            json.dumps({"mcpServers": {name: {"command": sys.executable, "enabled": False}}}),
+            encoding="utf-8",
+        )
+        await self.start(trusted=True)
+        listing = await self.listing("tool")
+        placeholders = [row for row in listing["items"] if row["role"] == "placeholder"]
+        self.assertEqual(len(placeholders), 1, listing)
+        row = placeholders[0]
+        self.assertRegex(row["key"], r"^selection:[0-9a-f]{64}$")
+        self.assertEqual(row["label"], "Selection item")
+        self.assertEqual(row, next(item for item in (await self.listing("tool"))["items"]
+                                   if item["key"] == row["key"]))
+
+    async def test_tool_snapshot_completes_while_native_prompt_changes_active_tools(self):
+        connections = asyncio.Queue()
+        listener = await asyncio.start_server(lambda reader, writer: connections.put_nowait(writer), "127.0.0.1", 0)
+        self.addAsyncCleanup(listener.wait_closed)
+        self.addCleanup(listener.close)
+        # The input hook handles the prompt locally. The configured model is never called.
+        port = listener.sockets[0].getsockname()[1]
+        (self.agent / "models.json").write_text(json.dumps({"providers": {"fixture": {
+            "baseUrl": f"http://127.0.0.1:{port}/v1", "api": "openai-completions", "apiKey": "fixture",
+            "models": [{"id": "one", "name": "Fixture", "input": ["text"], "contextWindow": 32768, "maxTokens": 2048}],
+        }}}), encoding="utf-8")
+        self.global_settings.write_text('{"defaultProvider":"fixture","defaultModel":"one"}\n', encoding="utf-8")
+        extension = self.root / "tool_switch.py"
+        extension.write_text(PROMPT_TOOL_SWITCH.format(port=port), encoding="utf-8")
+        await self.start(extensions=(extension,), prefix=("--exclude-tools", "read"))
+        before = await self.listing("tool")
+        self.assertGreater(len(before["activeTools"]), 1)
+        prompt = asyncio.create_task(self.client.request("session/prompt", {
+            "sessionId": self.session_id, "prompt": [{"type": "text", "text": "Hold the turn"}],
+        }))
+        writer = await asyncio.wait_for(connections.get(), 10)
+        try:
+            snapshot = await self.listing("tool")
+            self.assertFalse(prompt.done())
+            self.assertEqual(snapshot.get("activeTools"), ["write"], snapshot)
+            self.assertEqual([item["key"] for item in snapshot["items"] if item["live"]], ["write"])
+            self.assertFalse(next(item for item in snapshot["items"] if item["key"] == "read")["loaded"])
+            self.assertIsNone(snapshot["toolOverride"])
+        finally:
+            writer.write(b"done\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            await prompt
