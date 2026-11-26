@@ -8,6 +8,8 @@ import secrets
 from .profile_refs import display_text, redact
 
 KEY_PREFIX = "selection:"
+# Native uses reversible hex for read-only row keys that are not valid UTF-8.
+RESERVED_PREFIXES = (KEY_PREFIX, "readonly:")
 OPAQUE_KEY = re.compile(r"selection:[0-9a-f]{64}")
 MAX_KEY_LENGTH = 8192
 
@@ -18,7 +20,7 @@ def ordinary_name(name):
 
 def safe_label(name):
     return (bool(name.strip())
-            and name not in (".", "..") and not name.startswith(KEY_PREFIX)
+            and name not in (".", "..") and not name.startswith(RESERVED_PREFIXES)
             and "/" not in name and "\\" not in name and not re.match(r"^[A-Za-z]:", name)
             and display_text(name) == name and redact(name) == name)
 

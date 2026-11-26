@@ -302,6 +302,23 @@ class NativeStudioSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(fictional, json.dumps(listing))
         self.assertEqual(row["label"], "Selection item")
 
+    async def test_readonly_native_tool_key_cannot_encode_sensitive_text(self):
+        name = "password=FICTIONAL_NOT_A_SECRET_ACP71\udcff"
+        self.project.mkdir()
+        (self.project / "mcp.json").write_text(
+            json.dumps({"mcpServers": {name: {"command": sys.executable, "enabled": False}}}),
+            encoding="utf-8",
+        )
+        await self.start(trusted=True)
+        listing = await self.listing("tool")
+        placeholders = [row for row in listing["items"] if row["role"] == "placeholder"]
+        self.assertEqual(len(placeholders), 1, listing)
+        row = placeholders[0]
+        self.assertRegex(row["key"], r"^selection:[0-9a-f]{64}$")
+        self.assertEqual(row["label"], "Selection item")
+        self.assertEqual(row, next(item for item in (await self.listing("tool"))["items"]
+                                   if item["key"] == row["key"]))
+
     async def test_tool_snapshot_completes_while_native_prompt_changes_active_tools(self):
         connections = asyncio.Queue()
         listener = await asyncio.start_server(lambda reader, writer: connections.put_nowait(writer), "127.0.0.1", 0)

@@ -467,8 +467,10 @@ which delays native handling of the Stop frames.
 Identifiers pass through unchanged when they are nonblank, at most 8,192
 Unicode characters, and contain no slash, backslash, leading drive prefix,
 non-displayable Unicode character, or text flagged by the existing sensitive
-text redaction. The names `.` and `..` and the `selection:` prefix are
-reserved. Every other native identifier becomes a binding-scoped
+text redaction. The names `.` and `..` and the prefixes `selection:` and
+`readonly:` are reserved. Native v0.1.0 uses reversible hex after
+`readonly:` for display-only keys containing invalid Unicode. Every native
+identifier outside the pass-through rules becomes a binding-scoped
 `selection:<hex>` key. The same key appears in rows, active tool and override
 lists, changes, apply deltas, and keyed refusals. Use it in `tools/set-active`
 and `selections/set` and refresh after rebinding. ACP resolves the key against
