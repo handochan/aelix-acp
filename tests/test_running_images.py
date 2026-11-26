@@ -22,6 +22,7 @@ import test_session_relay as text_relay
 
 from aelix_acp import image_policy
 from aelix_acp.runtime import host_bytes, native_frames, session_relay
+from aelix_acp.server import Server
 from aelix_acp.session import Session
 from aelix_acp.wire.errors import ProtocolError
 from aelix_acp.wire.transport import StdoutWriter
@@ -795,6 +796,13 @@ class HostFixtureTests(unittest.TestCase):
 
 
 class NativeFrameTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        server = Server(SimpleNamespace(state_dir=temporary.name))
+        self.addCleanup(server.db.close)
+        self.worker = Session(server, "native-frame-tests", temporary.name)
+
     async def assert_oversized_tools(self, body, cases):
         # Feed an actual subprocess pipe at the deployed reader limit. Build
         # the synthetic input outside the timing window.
@@ -825,20 +833,12 @@ class NativeFrameTests(unittest.IsolatedAsyncioTestCase):
 
         loop = asyncio.get_running_loop()
         pending = {f"{index:032x}": loop.create_future() for index in range(len(cases))}
-        worker = SimpleNamespace(
-            proc=process,
-            private_host=True,
-            pending=pending,
-            history_requests=set(),
-            rpc_closed=False,
-            tool_arrived=asyncio.Event(),
-            _close_task=True,
-            done=None,
-            failure=None,
-            invalidate_image_acceptance=lambda: None,
-            event=AsyncMock(),
-        )
-        worker.rpc_frames = Session.rpc_frames.__get__(worker)
+        worker = self.worker
+        worker.proc = process
+        worker.private_host = True
+        worker.pending = pending
+        worker._close_task = True
+        worker.event = AsyncMock()
         # Each timer is queued before a scan. Measure how many slices can
         # run before the loop services it, as well as its elapsed delay.
         ticks = []
@@ -865,7 +865,7 @@ class NativeFrameTests(unittest.IsolatedAsyncioTestCase):
         try:
             async with asyncio.timeout(60):
                 with patch.object(native_frames.ToolEnvelope, "feed", observe_scan):
-                    await Session.read_rpc(worker)
+                    await worker.read_rpc()
                 self.assertEqual(await process.wait(), 0)
                 await timer_idle.wait()
         finally:
@@ -943,25 +943,20 @@ class NativeFrameTests(unittest.IsolatedAsyncioTestCase):
             worker.pending[json.loads(raw)["id"]].set_result({})
 
         pipe = SimpleNamespace(write=write, drain=AsyncMock())
-        worker = SimpleNamespace(
-            proc=SimpleNamespace(stdin=pipe, returncode=None),
-            pending={},
-            interventions={},
-            rpc_closed=False,
-            turn_active=False,
-        )
+        worker = self.worker
+        worker.proc = SimpleNamespace(stdin=pipe, returncode=None)
         handlers = (lambda: True, lambda: None)
         message = '한\n"\\'
-        await Session.rpc(worker, "steer", message=message, _image_write=handlers)
+        await worker.rpc("steer", message=message, _image_write=handlers)
         actual = written.pop()
         with patch.object(image_policy, "MAX_NATIVE_LINE", len(actual)):
-            await Session.rpc(worker, "steer", message=message, _image_write=handlers)
+            await worker.rpc("steer", message=message, _image_write=handlers)
         written.clear()
         with (
             patch.object(image_policy, "MAX_NATIVE_LINE", len(actual) - 1),
             self.assertRaisesRegex(image_policy.ImageRejected, "native-line-limit"),
         ):
-            await Session.rpc(worker, "steer", message=message, _image_write=handlers)
+            await worker.rpc("steer", message=message, _image_write=handlers)
         with self.assertRaisesRegex(image_policy.ImageRejected, "stale-turn"):
-            await Session.rpc(worker, "steer", message=message, _image_write=(lambda: False, lambda: None))
+            await worker.rpc("steer", message=message, _image_write=(lambda: False, lambda: None))
         self.assertEqual(written, [])
