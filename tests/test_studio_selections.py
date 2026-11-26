@@ -1,6 +1,6 @@
 """D16 v1 selection vectors over the ACP relay and native JSONL boundary."""
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
 import json
 import os
@@ -99,7 +99,9 @@ class SelectionShutdownTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await asyncio.wait_for(process.wait(), 3), 0)
             finally:
                 writer.close()
-                await writer.wait_closed()
+                # Process exit can reset this fixture's blocked TCP connection on Windows.
+                with suppress(ConnectionResetError):
+                    await writer.wait_closed()
         finally:
             if process.returncode is None:
                 process.stdin.close()
