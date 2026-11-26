@@ -830,10 +830,11 @@ class Session:
                   _before_native_write=None, **kwargs):
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future() if _await_response else None
+        pending_commands = self.pending_commands if getattr(self, "studio_writer", False) else None
         if future is not None:
             self.pending[request_id] = future
-            if self.studio_writer:
-                self.pending_commands[request_id] = (command, kwargs.get("method"))
+            if pending_commands is not None:
+                pending_commands[request_id] = (command, kwargs.get("method"))
         if _project_history:
             self.history_requests.add(request_id)
         if (task := asyncio.current_task()) in self.interventions:
@@ -880,7 +881,8 @@ class Session:
                 raise ProtocolError(f"Aelix RPC {command} timed out", -32007, {"kind": "timeout", "command": command}) from None
         finally:
             self.pending.pop(request_id, None)
-            self.pending_commands.pop(request_id, None)
+            if pending_commands is not None:
+                pending_commands.pop(request_id, None)
             if _project_history:
                 self.history_requests.discard(request_id)
 

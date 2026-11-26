@@ -728,8 +728,6 @@ class ImageRelayTests(unittest.IsolatedAsyncioTestCase):
         self.session.rpc.assert_not_awaited()
 
     async def test_default_policy_allows_only_the_verified_codex_route(self):
-        from aelix_acp.server import Server
-
         default = Server(SimpleNamespace(state_dir=self.session.socket_dir))
         self.addCleanup(default.db.close)
         self.server.image_policies = default.image_policies
